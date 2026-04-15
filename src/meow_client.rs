@@ -42,6 +42,31 @@ impl MeowClient {
         }
     }
 
+    /// 获取与当前 [`MeowClient`] 配置一致的 `reqwest::Client`（可用于复用同一套 timeout/keepalive 配置）。
+    ///
+    /// - 若 [`MeowConfig::with_http_client`] 曾注入自定义 client，则返回其 clone
+    /// - 否则按 `http_timeout/tcp_keepalive` 构建一个新 client
+    pub fn http_client(&self) -> Result<reqwest::Client, MeowError> {
+        if let Some(c) = self.config.http_client_ref() {
+            return Ok(c.clone());
+        }
+        reqwest::Client::builder()
+            .timeout(self.config.http_timeout())
+            .tcp_keepalive(self.config.tcp_keepalive())
+            .build()
+            .map_err(|e| {
+                MeowError::from_source(
+                    InnerErrorCode::HttpClientBuildFailed,
+                    format!(
+                        "build reqwest client failed (timeout={:?}, keepalive={:?})",
+                        self.config.http_timeout(),
+                        self.config.tcp_keepalive()
+                    ),
+                    e,
+                )
+            })
+    }
+
     fn get_exec(&self) -> Result<&Executor, MeowError> {
         if let Some(exec) = self.executor.get() {
             crate::meow_flow_log!("executor", "reuse existing executor");

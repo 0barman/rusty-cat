@@ -1,6 +1,19 @@
 use reqwest::header::HeaderMap;
 use crate::{InnerErrorCode, MeowError, TransferTask};
 
+/// 下载 HEAD 阶段请求头合并上下文。
+pub struct DownloadHeadCtx<'a> {
+    pub task: &'a TransferTask,
+    pub base: &'a mut HeaderMap,
+}
+
+/// 下载 Range GET 阶段请求头合并上下文。
+pub struct DownloadRangeGetCtx<'a> {
+    pub task: &'a TransferTask,
+    pub range_value: &'a str,
+    pub base: &'a mut HeaderMap,
+}
+
 /// 自定义断点下载协议。
 ///
 /// 实现方负责：HEAD 与分片 GET 的 URL/请求头语义，以及从 HEAD 响应中解析远端资源总长度。
@@ -50,7 +63,14 @@ pub trait BreakpointDownload: Send + Sync {
     /// - `self`：协议实现。
     /// - `task`：当前任务；若 HEAD 需要与 GET 不同的业务参数（如版本号、桶名），可从此处读取并写入 `base`。
     /// - `base`：即将用于 `HEAD` 请求的 [`HeaderMap`]，可变引用；实现应只追加/覆盖与本协议相关的项。
-    fn merge_head_headers(&self, _task: &TransferTask, _base: &mut HeaderMap) {}
+    ///
+    /// # 返回值
+    ///
+    /// - `Ok(())`：头部合并成功；
+    /// - `Err`：准备 HEAD 头失败（例如签名失败/非法头值），执行器将终止准备阶段并返回该错误。
+    fn merge_head_headers(&self, _ctx: DownloadHeadCtx<'_>) -> Result<(), MeowError> {
+        Ok(())
+    }
 
     /// 在发送 **带 Range 的分片 GET** 之前，将本协议需要的专用请求头合并进 `base`。
     ///
@@ -72,19 +92,21 @@ pub trait BreakpointDownload: Send + Sync {
     ///   形如 `bytes=<first>-<last>` 或 `bytes=<first>-`（例如 `bytes=0-1048575`）；实现应将其原样写入（或通过网关翻译为协议等价头），
     ///   除非文档明确说明与标准 Range 语义不同。
     /// - `base`：即将用于本次 `GET` 的 [`HeaderMap`]，由任务头克隆而来；在此追加 `Range`、`Accept` 等分片下载专用头。
-    fn merge_range_get_headers(
-        &self,
-        task: &TransferTask,
-        range_value: &str,
-        base: &mut HeaderMap,
-    ) {
+    ///
+    /// # 返回值
+    ///
+    /// - `Ok(())`：头部合并成功；
+    /// - `Err`：构造分片请求头失败（例如非法 Range/签名失败），执行器将终止当前分片并进入错误处理。
+    fn merge_range_get_headers(&self, ctx: DownloadRangeGetCtx<'_>) -> Result<(), MeowError> {
         let _ = self;
-        crate::http_breakpoint::insert_header(base, "Range", range_value);
-        let accept = task
+        crate::http_breakpoint::insert_header(ctx.base, "Range", ctx.range_value);
+        let accept = ctx
+            .task
             .breakpoint_download_http()
             .map(|c| c.range_accept.as_str())
             .unwrap_or(crate::http_breakpoint::DEFAULT_RANGE_ACCEPT);
-        crate::http_breakpoint::insert_header(base, "Accept", accept);
+        crate::http_breakpoint::insert_header(ctx.base, "Accept", accept);
+        Ok(())
     }
 
     /// 从 **HEAD** 成功响应的头字段中解析远端资源的总字节数。

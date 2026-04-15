@@ -108,7 +108,9 @@ impl TransferTask {
         &self.headers
     }
 
-    pub(crate) fn breakpoint_download_http(&self) -> Option<&BreakpointDownloadHttpConfig> {
+    /// 返回任务级断点下载 HTTP 配置，供自定义 [`crate::download_trait::BreakpointDownload`]
+    /// 实现读取（例如 `range_accept` 语义）。
+    pub fn breakpoint_download_http(&self) -> Option<&BreakpointDownloadHttpConfig> {
         Some(&self.breakpoint_download_http)
     }
 

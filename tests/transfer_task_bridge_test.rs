@@ -15,7 +15,8 @@ use rusty_cat::down_pounce_builder::DownloadPounceBuilder;
 use rusty_cat::error::{InnerErrorCode, MeowError};
 use rusty_cat::file_transfer_record::FileTransferRecord;
 use rusty_cat::http_breakpoint::{
-    BreakpointDownload, BreakpointUpload, UploadBody, UploadRequest, UploadResumeInfo,
+    BreakpointDownload, BreakpointUpload, DownloadHeadCtx, DownloadRangeGetCtx, UploadBody,
+    UploadChunkCtx, UploadPrepareCtx, UploadRequest, UploadResumeInfo,
 };
 use rusty_cat::meow_config::MeowConfig;
 use rusty_cat::transfer_status::TransferStatus;
@@ -102,12 +103,9 @@ impl InspectUploadProtocol {
 
 #[async_trait]
 impl BreakpointUpload for InspectUploadProtocol {
-    async fn prepare(
-        &self,
-        client: &reqwest::Client,
-        task: &TransferTask,
-        _local_offset: u64,
-    ) -> Result<UploadResumeInfo, MeowError> {
+    async fn prepare(&self, ctx: UploadPrepareCtx<'_>) -> Result<UploadResumeInfo, MeowError> {
+        let client = ctx.client;
+        let task = ctx.task;
         self.prepare_calls.fetch_add(1, Ordering::Relaxed);
         // 覆盖 TransferTask 公共 getter：上传场景。
         assert_eq!(task.direction().as_ref(), "Upload");
@@ -126,13 +124,11 @@ impl BreakpointUpload for InspectUploadProtocol {
         self.parse_upload_response(&body)
     }
 
-    async fn upload_chunk(
-        &self,
-        client: &reqwest::Client,
-        task: &TransferTask,
-        chunk: &[u8],
-        offset: u64,
-    ) -> Result<UploadResumeInfo, MeowError> {
+    async fn upload_chunk(&self, ctx: UploadChunkCtx<'_>) -> Result<UploadResumeInfo, MeowError> {
+        let client = ctx.client;
+        let task = ctx.task;
+        let chunk = ctx.chunk;
+        let offset = ctx.offset;
         self.chunk_calls.fetch_add(1, Ordering::Relaxed);
         assert!(offset <= task.total_size());
         let part = multipart::Part::bytes(chunk.to_vec())
@@ -156,20 +152,17 @@ struct InspectDownloadProtocol {
 }
 
 impl BreakpointDownload for InspectDownloadProtocol {
-    fn merge_head_headers(&self, _task: &TransferTask, base: &mut HeaderMap) {
+    fn merge_head_headers(&self, ctx: DownloadHeadCtx<'_>) -> Result<(), MeowError> {
         self.merge_head_calls.fetch_add(1, Ordering::Relaxed);
-        base.insert(
+        ctx.base.insert(
             HeaderName::from_static("x-download-case"),
             HeaderValue::from_static("head-merged"),
         );
+        Ok(())
     }
 
-    fn merge_range_get_headers(
-        &self,
-        task: &TransferTask,
-        range_value: &str,
-        base: &mut HeaderMap,
-    ) {
+    fn merge_range_get_headers(&self, ctx: DownloadRangeGetCtx<'_>) -> Result<(), MeowError> {
+        let task = ctx.task;
         self.merge_get_calls.fetch_add(1, Ordering::Relaxed);
         // 覆盖 TransferTask 公共 getter：下载场景。
         assert_eq!(task.direction().as_ref(), "Download");
@@ -178,14 +171,15 @@ impl BreakpointDownload for InspectDownloadProtocol {
         assert!(!task.file_path().as_os_str().is_empty());
         assert!(!task.url().is_empty());
         assert_eq!(task.method(), Method::GET);
-        base.insert(
+        ctx.base.insert(
             HeaderName::from_static("range"),
-            HeaderValue::from_str(range_value).expect("valid range header"),
+            HeaderValue::from_str(ctx.range_value).expect("valid range header"),
         );
-        base.insert(
+        ctx.base.insert(
             HeaderName::from_static("accept"),
             HeaderValue::from_static("application/octet-stream"),
         );
+        Ok(())
     }
 
     fn total_size_from_head(&self, headers: &HeaderMap) -> Result<u64, MeowError> {

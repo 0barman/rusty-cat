@@ -65,13 +65,17 @@ pub(crate) async fn try_start_next(
 
             let inner = group.leader_inner().clone();
             let current = state.offsets().get(&key).copied().unwrap_or(0);
-            crate::inner::exec_impl::emit::emit_status(
-                state,
-                group.entry(),
-                TransferStatus::Transmission,
-                current,
-                group.entry().inner().total_size(),
-            );
+            // 下载任务在 prepare 之前可能还不知道远端 total（inner.total_size()==0）；
+            // 这时先不发送 Transmission，避免对外看到 total=0 的误导进度。
+            if !(direction == Direction::Download && group.entry().inner().total_size() == 0) {
+                crate::inner::exec_impl::emit::emit_status(
+                    state,
+                    group.entry(),
+                    TransferStatus::Transmission,
+                    current,
+                    group.entry().inner().total_size(),
+                );
+            }
 
             let cancel = CancellationToken::new();
             state
@@ -180,6 +184,15 @@ async fn run_group(
     } else {
         inner.total_size()
     };
+    // prepare 成功后先回报一次当前进度（通常是 0%，但 total 已准确），
+    // 让回调层尽早拿到真实总大小，而不是等首个分片完成后才更新。
+    let _ = worker_tx
+        .send(WorkerEvent::Progress {
+            key: key.clone(),
+            next_offset: offset,
+            total_size: known_total,
+        })
+        .await;
     loop {
         if cancel.is_cancelled() {
             crate::meow_flow_log!(

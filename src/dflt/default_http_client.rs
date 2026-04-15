@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use reqwest::header::CONTENT_RANGE;
+use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, ETAG};
 use reqwest::{Client, Method};
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +10,8 @@ use crate::chunk_outcome::ChunkOutcome;
 use crate::direction::Direction;
 use crate::error::{InnerErrorCode, MeowError};
 use crate::http_breakpoint::{
-    BreakpointDownload, BreakpointUpload, DefaultStyleUpload, StandardRangeDownload,
+    BreakpointDownload, BreakpointUpload, DefaultStyleUpload, DownloadHeadCtx, DownloadRangeGetCtx,
+    StandardRangeDownload, UploadChunkCtx, UploadPrepareCtx,
 };
 use crate::prepare_outcome::PrepareOutcome;
 use crate::transfer_executor_trait::TransferTrait;
@@ -150,7 +151,13 @@ async fn upload_prepare(
         local_offset,
         task.total_size()
     );
-    let info = upload.prepare(client, task, local_offset).await?;
+    let info = upload
+        .prepare(UploadPrepareCtx {
+            client,
+            task,
+            local_offset,
+        })
+        .await?;
     if info.completed_file_id.is_some() {
         let total = task.total_size();
         crate::meow_flow_log!(
@@ -208,7 +215,10 @@ async fn download_prepare(
     let start = local_len;
     let head_url = download.head_url(task);
     let mut head_headers = task.headers().clone();
-    download.merge_head_headers(task, &mut head_headers);
+    download.merge_head_headers(DownloadHeadCtx {
+        task,
+        base: &mut head_headers,
+    })?;
     let head_resp = client
         .request(Method::HEAD, &head_url)
         .headers(head_headers)
@@ -226,6 +236,27 @@ async fn download_prepare(
             format!("download_prepare HEAD failed: {}", head_resp.status()),
         ));
     }
+    let head_content_length = head_resp
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("<missing>");
+    let head_etag = head_resp
+        .headers()
+        .get(ETAG)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("<missing>");
+    println!(
+        "[download-head] url={} content-length={} etag={}",
+        head_url, head_content_length, head_etag
+    );
+    crate::meow_flow_log!(
+        "download_prepare",
+        "head metadata: url={} content_length={} etag={}",
+        head_url,
+        head_content_length,
+        head_etag
+    );
     let total = download.total_size_from_head(head_resp.headers())?;
     if start > total {
         crate::meow_flow_log!(
@@ -327,7 +358,14 @@ async fn upload_one_chunk(
     })?;
     drop(slot);
 
-    let info = upload.upload_chunk(client, task, &buf, offset).await?;
+    let info = upload
+        .upload_chunk(UploadChunkCtx {
+            client,
+            task,
+            chunk: &buf,
+            offset,
+        })
+        .await?;
     if info.completed_file_id.is_some() {
         return Ok(ChunkOutcome {
             next_offset: total,
@@ -447,7 +485,11 @@ async fn download_one_chunk(
 
     let spec = range_spec(offset, chunk_size, total);
     let mut headers = task.headers().clone();
-    download.merge_range_get_headers(task, &spec, &mut headers);
+    download.merge_range_get_headers(DownloadRangeGetCtx {
+        task,
+        range_value: &spec,
+        base: &mut headers,
+    })?;
 
     let resp = client
         .get(task.url())

@@ -10,6 +10,8 @@ pub struct MeowConfig {
     http_client: Option<reqwest::Client>,
     http_timeout: Duration,
     tcp_keepalive: Duration,
+    command_queue_capacity: usize,
+    worker_event_queue_capacity: usize,
 }
 
 impl Default for MeowConfig {
@@ -21,6 +23,8 @@ impl Default for MeowConfig {
             http_client: None,
             http_timeout: Duration::from_secs(5),
             tcp_keepalive: Duration::from_secs(30),
+            command_queue_capacity: 128,
+            worker_event_queue_capacity: 256,
         }
     }
 }
@@ -34,6 +38,8 @@ impl MeowConfig {
             http_client: None,
             http_timeout: Duration::from_secs(5),
             tcp_keepalive: Duration::from_secs(30),
+            command_queue_capacity: 128,
+            worker_event_queue_capacity: 256,
         }
     }
 
@@ -49,6 +55,20 @@ impl MeowConfig {
 
     pub fn with_tcp_keepalive(mut self, keepalive: Duration) -> Self {
         self.tcp_keepalive = keepalive;
+        self
+    }
+
+    /// 这是“控制平面”的命令队列——你往里塞控制命令，worker 收到后改变调度状态。
+    /// 控制/管理命令 TransferCmd 的通道数量。包括 Enqueue/Pause/Resume/Cancel/Snapshot/Close（而且 Pause/Resume/Cancel/Close/Snapshot 还带 oneshot 回执，保证调用方拿到最终结果）。
+    pub fn with_command_queue_capacity(mut self, command_queue_capacity: usize) -> Self {
+        self.command_queue_capacity = command_queue_capacity;
+        self
+    }
+
+    /// 传输执行过程事件的通道数量
+    /// 任务跑着跑着不断上报进度/完成/失败等事件WorkerEvent::{Progress, Completed, Failed, Canceled}
+    pub fn with_worker_event_queue_capacity(mut self, worker_event_queue_capacity: usize) -> Self {
+        self.worker_event_queue_capacity = worker_event_queue_capacity;
         self
     }
 
@@ -80,4 +100,14 @@ impl MeowConfig {
     pub(crate) fn http_client_ref(&self) -> Option<&reqwest::Client> {
         self.http_client.as_ref()
     }
+
+    pub fn command_queue_capacity(&self) -> usize {
+        self.command_queue_capacity
+    }
+
+    pub fn worker_event_queue_capacity(&self) -> usize {
+        self.worker_event_queue_capacity
+    }
+
+
 }
