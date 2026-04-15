@@ -1,3 +1,4 @@
+pub mod api;
 pub mod chunk_outcome;
 pub(crate) mod dflt;
 pub mod direction;
@@ -17,9 +18,7 @@ pub mod transfer_snapshot;
 pub mod transfer_status;
 pub mod transfer_task;
 pub mod up_pounce_builder;
-pub use crate::log::{
-    debug_log_listener_active, set_debug_log_listener, try_set_debug_log_listener,
-    DebugLogListener, DebugLogListenerError, Log, LogLevel,
-};
-pub use ids::{GlobalProgressListenerId, TaskId};
-pub use meow_client::MeowClient;
+pub mod upload_trait;
+mod download_trait;
+
+pub use api::*;

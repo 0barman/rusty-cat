@@ -7,13 +7,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_LENGTH};
 use reqwest::multipart;
 use reqwest::Method;
 use rusty_cat::down_pounce_builder::DownloadPounceBuilder;
 use rusty_cat::error::{InnerErrorCode, MeowError};
 use rusty_cat::file_transfer_record::FileTransferRecord;
-use rusty_cat::http_breakpoint::{BreakpointDownload, BreakpointUpload, UploadResumeInfo};
+use rusty_cat::http_breakpoint::{
+    BreakpointDownload, BreakpointUpload, UploadBody, UploadRequest, UploadResumeInfo,
+};
 use rusty_cat::meow_config::MeowConfig;
 use rusty_cat::transfer_status::TransferStatus;
 use rusty_cat::transfer_task::TransferTask;
@@ -45,47 +48,39 @@ async fn wait_terminal_status(statuses: Arc<Mutex<Vec<TransferStatus>>>) -> Tran
     panic!("did not receive terminal status in time");
 }
 
+async fn bridge_send_upload_request(
+    client: &reqwest::Client,
+    req: UploadRequest,
+) -> Result<String, MeowError> {
+    let mut builder = client.request(req.method, req.url).headers(req.headers);
+    builder = match req.body {
+        UploadBody::Multipart(form) => builder.multipart(form),
+        UploadBody::Binary(bytes) => builder.body(bytes),
+    };
+    let resp = builder
+        .send()
+        .await
+        .map_err(|e| MeowError::from_source(InnerErrorCode::HttpError, e.to_string(), e))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| MeowError::from_source(InnerErrorCode::HttpError, e.to_string(), e))?;
+    if !status.is_success() {
+        return Err(MeowError::from_code(
+            InnerErrorCode::ResponseStatusError,
+            format!("upload HTTP {status}: {body}"),
+        ));
+    }
+    Ok(body)
+}
+
 struct InspectUploadProtocol {
     prepare_calls: Arc<AtomicUsize>,
     chunk_calls: Arc<AtomicUsize>,
 }
 
-impl BreakpointUpload for InspectUploadProtocol {
-    fn prepare_multipart(&self, task: &TransferTask) -> multipart::Form {
-        self.prepare_calls.fetch_add(1, Ordering::Relaxed);
-        // 覆盖 TransferTask 公共 getter：上传场景。
-        assert_eq!(task.direction().as_ref(), "Upload");
-        assert!(task.total_size() > 0);
-        assert!(task.chunk_size() > 0);
-        assert!(!task.file_name().is_empty());
-        assert!(!task.file_path().as_os_str().is_empty());
-        assert!(!task.url().is_empty());
-        assert_eq!(task.method(), Method::POST);
-        assert!(task.headers().contains_key("x-upload-case"));
-        multipart::Form::new()
-            .text("fileName", task.file_name().to_string())
-            .text("totalSize", task.total_size().to_string())
-    }
-
-    fn chunk_multipart(
-        &self,
-        task: &TransferTask,
-        chunk: &[u8],
-        offset: u64,
-    ) -> Result<multipart::Form, MeowError> {
-        self.chunk_calls.fetch_add(1, Ordering::Relaxed);
-        assert!(offset <= task.total_size());
-        let part = multipart::Part::bytes(chunk.to_vec())
-            .file_name("chunk.bin")
-            .mime_str("application/octet-stream")
-            .map_err(|e| MeowError::from_code(InnerErrorCode::HttpError, e.to_string()))?;
-        Ok(multipart::Form::new()
-            .part("file", part)
-            .text("offset", offset.to_string())
-            .text("partSize", chunk.len().to_string())
-            .text("totalSize", task.total_size().to_string()))
-    }
-
+impl InspectUploadProtocol {
     fn parse_upload_response(&self, body: &str) -> Result<UploadResumeInfo, MeowError> {
         let v: serde_json::Value = serde_json::from_str(body).map_err(|e| {
             MeowError::from_code(
@@ -102,6 +97,56 @@ impl BreakpointUpload for InspectUploadProtocol {
             completed_file_id: file_id,
             next_byte,
         })
+    }
+}
+
+#[async_trait]
+impl BreakpointUpload for InspectUploadProtocol {
+    async fn prepare(
+        &self,
+        client: &reqwest::Client,
+        task: &TransferTask,
+        _local_offset: u64,
+    ) -> Result<UploadResumeInfo, MeowError> {
+        self.prepare_calls.fetch_add(1, Ordering::Relaxed);
+        // 覆盖 TransferTask 公共 getter：上传场景。
+        assert_eq!(task.direction().as_ref(), "Upload");
+        assert!(task.total_size() > 0);
+        assert!(task.chunk_size() > 0);
+        assert!(!task.file_name().is_empty());
+        assert!(!task.file_path().as_os_str().is_empty());
+        assert!(!task.url().is_empty());
+        assert_eq!(task.method(), Method::POST);
+        assert!(task.headers().contains_key("x-upload-case"));
+        let form = multipart::Form::new()
+            .text("fileName", task.file_name().to_string())
+            .text("totalSize", task.total_size().to_string());
+        let req = UploadRequest::from_task(task, UploadBody::Multipart(form));
+        let body = bridge_send_upload_request(client, req).await?;
+        self.parse_upload_response(&body)
+    }
+
+    async fn upload_chunk(
+        &self,
+        client: &reqwest::Client,
+        task: &TransferTask,
+        chunk: &[u8],
+        offset: u64,
+    ) -> Result<UploadResumeInfo, MeowError> {
+        self.chunk_calls.fetch_add(1, Ordering::Relaxed);
+        assert!(offset <= task.total_size());
+        let part = multipart::Part::bytes(chunk.to_vec())
+            .file_name("chunk.bin")
+            .mime_str("application/octet-stream")
+            .map_err(|e| MeowError::from_code(InnerErrorCode::HttpError, e.to_string()))?;
+        let form = multipart::Form::new()
+            .part("file", part)
+            .text("offset", offset.to_string())
+            .text("partSize", chunk.len().to_string())
+            .text("totalSize", task.total_size().to_string());
+        let req = UploadRequest::from_task(task, UploadBody::Multipart(form));
+        let body = bridge_send_upload_request(client, req).await?;
+        self.parse_upload_response(&body)
     }
 }
 
