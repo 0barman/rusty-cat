@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use crate::error::{InnerErrorCode, MeowError};
 use crate::transfer_task::TransferTask;
 
-pub use crate::download_trait::BreakpointDownload;
-pub use crate::upload_trait::BreakpointUpload;
+pub use crate::download_trait::{BreakpointDownload, DownloadHeadCtx, DownloadRangeGetCtx};
+pub use crate::upload_trait::{BreakpointUpload, UploadChunkCtx, UploadPrepareCtx};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::multipart;
 use reqwest::Method;
@@ -137,44 +137,33 @@ struct DefaultUploadResp {
 
 #[async_trait]
 impl BreakpointUpload for DefaultStyleUpload {
-    async fn prepare(
-        &self,
-        client: &reqwest::Client,
-        task: &TransferTask,
-        _local_offset: u64,
-    ) -> Result<UploadResumeInfo, MeowError> {
+    async fn prepare(&self, ctx: UploadPrepareCtx<'_>) -> Result<UploadResumeInfo, MeowError> {
         let form = multipart::Form::new()
-            .text(KEY_FILE_MD5, task.file_sign().to_string())
-            .text(KEY_FILE_NAME, task.file_name().to_string())
+            .text(KEY_FILE_MD5, ctx.task.file_sign().to_string())
+            .text(KEY_FILE_NAME, ctx.task.file_name().to_string())
             .text(KEY_CATEGORY, self.category.clone())
-            .text(KEY_TOTAL_SIZE, task.total_size().to_string());
-        let req = UploadRequest::from_task(task, UploadBody::Multipart(form));
-        let body = send_upload_request(client, req).await?;
+            .text(KEY_TOTAL_SIZE, ctx.task.total_size().to_string());
+        let req = UploadRequest::from_task(ctx.task, UploadBody::Multipart(form));
+        let body = send_upload_request(ctx.client, req).await?;
         parse_default_upload_response(&body)
     }
 
-    async fn upload_chunk(
-        &self,
-        client: &reqwest::Client,
-        task: &TransferTask,
-        chunk: &[u8],
-        offset: u64,
-    ) -> Result<UploadResumeInfo, MeowError> {
-        let part = multipart::Part::bytes(chunk.to_vec())
+    async fn upload_chunk(&self, ctx: UploadChunkCtx<'_>) -> Result<UploadResumeInfo, MeowError> {
+        let part = multipart::Part::bytes(ctx.chunk.to_vec())
             .file_name(KEY_UPLOAD_CHUNK_DATA)
             .mime_str("application/octet-stream")
             .map_err(|e| MeowError::from_code(InnerErrorCode::HttpError, e.to_string()))?;
 
         let form = multipart::Form::new()
             .part(KEY_FILE, part)
-            .text(KEY_FILE_MD5, task.file_sign().to_string())
-            .text(KEY_FILE_NAME, task.file_name().to_string())
+            .text(KEY_FILE_MD5, ctx.task.file_sign().to_string())
+            .text(KEY_FILE_NAME, ctx.task.file_name().to_string())
             .text(KEY_CATEGORY, self.category.clone())
-            .text(KEY_OFFSET, offset.to_string())
-            .text(KEY_PART_SIZE, chunk.len().to_string())
-            .text(KEY_TOTAL_SIZE, task.total_size().to_string());
-        let req = UploadRequest::from_task(task, UploadBody::Multipart(form));
-        let body = send_upload_request(client, req).await?;
+            .text(KEY_OFFSET, ctx.offset.to_string())
+            .text(KEY_PART_SIZE, ctx.chunk.len().to_string())
+            .text(KEY_TOTAL_SIZE, ctx.task.total_size().to_string());
+        let req = UploadRequest::from_task(ctx.task, UploadBody::Multipart(form));
+        let body = send_upload_request(ctx.client, req).await?;
         parse_default_upload_response(&body)
     }
 }

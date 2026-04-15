@@ -531,8 +531,10 @@ impl Executor {
             config.max_upload_concurrency(),
             config.max_download_concurrency()
         );
-        let (cmd_tx, cmd_rx) = mpsc::channel::<TransferCmd>(256);
-        let (worker_tx, worker_rx) = mpsc::channel::<WorkerEvent>(1024);
+        let command_queue_capacity = config.command_queue_capacity();
+        let worker_event_queue_capacity = config.worker_event_queue_capacity();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<TransferCmd>(command_queue_capacity);
+        let (worker_tx, worker_rx) = mpsc::channel::<WorkerEvent>(worker_event_queue_capacity);
         worker_loop(
             cmd_rx,
             worker_rx,

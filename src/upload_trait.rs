@@ -2,6 +2,23 @@ use async_trait::async_trait;
 use crate::http_breakpoint::UploadResumeInfo;
 use crate::{MeowError, TransferTask};
 
+/// 上传准备阶段上下文。
+#[derive(Debug, Clone, Copy)]
+pub struct UploadPrepareCtx<'a> {
+    pub client: &'a reqwest::Client,
+    pub task: &'a TransferTask,
+    pub local_offset: u64,
+}
+
+/// 上传分片阶段上下文。
+#[derive(Debug, Clone, Copy)]
+pub struct UploadChunkCtx<'a> {
+    pub client: &'a reqwest::Client,
+    pub task: &'a TransferTask,
+    pub chunk: &'a [u8],
+    pub offset: u64,
+}
+
 /// 自定义断点上传协议。
 ///
 /// 实现方负责：按业务约定构造 HTTP 请求（multipart 或二进制体）、解析响应体为 [`UploadResumeInfo`]。
@@ -35,12 +52,7 @@ pub trait BreakpointUpload: Send + Sync {
     ///   否则执行器取 `info.next_byte.unwrap_or(0)`，与 `local_offset` 取较大值后再与 `task.total_size()` 取较小值，
     ///   作为下一分片的起始偏移。
     /// - `Err`：准备失败，任务进入失败状态（可能触发重试策略，取决于上层配置）。
-    async fn prepare(
-        &self,
-        client: &reqwest::Client,
-        task: &TransferTask,
-        local_offset: u64,
-    ) -> Result<UploadResumeInfo, MeowError>;
+    async fn prepare(&self, ctx: UploadPrepareCtx<'_>) -> Result<UploadResumeInfo, MeowError>;
 
     /// 上传单个分片：从本地文件读出的一段字节，由实现封装为 HTTP 请求并发送。
     ///
@@ -60,13 +72,7 @@ pub trait BreakpointUpload: Send + Sync {
     ///   下一偏移为 `info.next_byte.unwrap_or(offset + chunk.len() as u64)`，再与 `task.total_size()` 取最小值。
     ///   若该下一偏移已达到或超过文件总大小，执行器随后调用 [`BreakpointUpload::complete_upload`]。
     /// - `Err`：本分片失败，由执行器按重试/失败策略处理。
-    async fn upload_chunk(
-        &self,
-        client: &reqwest::Client,
-        task: &TransferTask,
-        chunk: &[u8],
-        offset: u64,
-    ) -> Result<UploadResumeInfo, MeowError>;
+    async fn upload_chunk(&self, ctx: UploadChunkCtx<'_>) -> Result<UploadResumeInfo, MeowError>;
 
     /// 所有分片字节已按协议上传完毕后，由执行器调用的收尾步骤。
     ///

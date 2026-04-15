@@ -18,6 +18,12 @@ impl fmt::Debug for TaskId {
     }
 }
 
+impl fmt::Display for TaskId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
 /// 通过 [`crate::MeowClient::register_global_progress_listener`] 注册后返回，用于 [`crate::MeowClient::unregister_global_progress_listener`]。
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GlobalProgressListenerId(Uuid);
