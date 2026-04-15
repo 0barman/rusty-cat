@@ -9,6 +9,7 @@ use crate::inner::worker_event::WorkerEvent;
 use crate::inner::UniqueId;
 use crate::meow_config::MeowConfig;
 use crate::transfer_executor_trait::TransferTrait;
+use crate::transfer_task::TransferTask;
 use crate::transfer_snapshot::TransferSnapshot;
 use crate::transfer_status::TransferStatus;
 use std::sync::{Arc, RwLock};
@@ -234,7 +235,7 @@ fn worker_loop(
                                         );
                                         if let Some(key) = state.task_id_to_dedupe().get(&task_id).cloned()
                                         {
-                                            cancel_group(&mut state, &key).await;
+                                            cancel_group(&mut state, &key, &executor).await;
                                             let _ = respond_to.send(Ok(()));
                                             crate::meow_flow_log!(
                                                 "cmd_cancel",
@@ -451,7 +452,11 @@ async fn resume_group(state: &mut SchedulerState, key: &UniqueId) -> Result<(), 
     Ok(())
 }
 
-async fn cancel_group(state: &mut SchedulerState, key: &UniqueId) {
+async fn cancel_group(
+    state: &mut SchedulerState,
+    key: &UniqueId,
+    executor: &Arc<dyn TransferTrait>,
+) {
     crate::meow_flow_log!(
         "cancel_group",
         "cancel begin: key={:?} active={} queued={} paused={}",
@@ -470,6 +475,16 @@ async fn cancel_group(state: &mut SchedulerState, key: &UniqueId) {
     // 取消语义会彻底结束任务，因此需要清掉 paused 标记。
     state.paused_set_mut().remove(key);
     if let Some(group) = state.groups_mut().remove(key) {
+        // 对上传协议触发可选的远端取消语义（例如 OSS AbortMultipartUpload）。
+        let task_view = TransferTask::from_inner(group.leader_inner());
+        if let Err(err) = executor.cancel(&task_view).await {
+            crate::meow_flow_log!(
+                "cancel_group",
+                "protocol abort failed but continue cleanup: key={:?} err={}",
+                key,
+                err
+            );
+        }
         // 取消后删除 task_id 映射，防止继续通过旧 id 控制。
         state
             .task_id_to_dedupe_mut()

@@ -21,4 +21,8 @@ pub trait TransferTrait: Send + Sync {
         chunk_size: u64,
         remote_total_size: u64,
     ) -> Result<ChunkOutcome, MeowError>;
+
+    async fn cancel(&self, _task: &TransferTask) -> Result<(), MeowError> {
+        Ok(())
+    }
 }

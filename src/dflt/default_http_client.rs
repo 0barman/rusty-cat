@@ -150,29 +150,7 @@ async fn upload_prepare(
         local_offset,
         task.total_size()
     );
-    let form = upload.prepare_multipart(task);
-    let method = task.method();
-    let headers = task.headers().clone();
-    let req = client
-        .request(method.clone(), task.url())
-        .headers(headers)
-        .multipart(form);
-    let resp = req.send().await.map_err(map_reqwest)?;
-    let status = resp.status();
-    let body = resp.text().await.map_err(map_reqwest)?;
-    if !status.is_success() {
-        crate::meow_flow_log!(
-            "upload_prepare",
-            "http status failed: status={} body_len={}",
-            status,
-            body.len()
-        );
-        return Err(MeowError::from_code(
-            InnerErrorCode::ResponseStatusError,
-            format!("upload prepare HTTP {status}: {body}"),
-        ));
-    }
-    let info = upload.parse_upload_response(&body)?;
+    let info = upload.prepare(client, task, local_offset).await?;
     if info.completed_file_id.is_some() {
         let total = task.total_size();
         crate::meow_flow_log!(
@@ -349,24 +327,7 @@ async fn upload_one_chunk(
     })?;
     drop(slot);
 
-    let form = upload.chunk_multipart(task, &buf, offset)?;
-    let headers = task.headers().clone();
-    let resp = client
-        .request(task.method(), task.url())
-        .headers(headers)
-        .multipart(form)
-        .send()
-        .await
-        .map_err(map_reqwest)?;
-    let status = resp.status();
-    let body = resp.text().await.map_err(map_reqwest)?;
-    if !status.is_success() {
-        return Err(MeowError::from_code(
-            InnerErrorCode::HttpError,
-            format!("upload chunk HTTP {status}: {body}"),
-        ));
-    }
-    let info = upload.parse_upload_response(&body)?;
+    let info = upload.upload_chunk(client, task, &buf, offset).await?;
     if info.completed_file_id.is_some() {
         return Ok(ChunkOutcome {
             next_offset: total,
@@ -374,7 +335,10 @@ async fn upload_one_chunk(
             done: true,
         });
     }
-    let next = offset + buf.len() as u64;
+    let next = info.next_byte.unwrap_or(offset + buf.len() as u64).min(total);
+    if next >= total {
+        upload.complete_upload(client, task).await?;
+    }
     Ok(ChunkOutcome {
         next_offset: next,
         total_size: total,
@@ -738,6 +702,14 @@ impl TransferTrait for DefaultHttpClient {
                 .await
             }
         }
+    }
+
+    async fn cancel(&self, task: &TransferTask) -> Result<(), MeowError> {
+        if task.direction() != Direction::Upload {
+            return Ok(());
+        }
+        let client = self.client_for(task);
+        self.upload_arc(task).abort_upload(&client, task).await
     }
 }
 
