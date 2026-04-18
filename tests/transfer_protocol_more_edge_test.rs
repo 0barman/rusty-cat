@@ -51,7 +51,7 @@ async fn run_download_case_with_responses(
                 .lock()
                 .expect("lock statuses")
                 .push(record.status().clone());
-        })
+        }, Some(|_, _| {}))
         .await
         .expect("enqueue edge task");
 

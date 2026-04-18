@@ -49,7 +49,7 @@ async fn test_download() {
                 .lock()
                 .expect("lock statuses")
                 .push(record.status().clone());
-        })
+        }, Some(|_, _| {}))
         .await
         .expect("enqueue download task");
 

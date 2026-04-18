@@ -66,7 +66,7 @@ async fn upload_prepare_http_non_success_hits_response_status_error() {
                 .lock()
                 .expect("lock statuses")
                 .push(record.status().clone());
-        })
+        }, Some(|_, _| {}))
         .await
         .expect("enqueue upload task");
 
@@ -108,7 +108,7 @@ async fn upload_prepare_invalid_json_hits_response_parse_error() {
                 .lock()
                 .expect("lock statuses")
                 .push(record.status().clone());
-        })
+        }, Some(|_, _| {}))
         .await
         .expect("enqueue upload task");
 
@@ -154,7 +154,7 @@ async fn upload_prepare_completed_file_id_branch_finishes_without_chunk_http() {
                 .lock()
                 .expect("lock statuses")
                 .push(record.status().clone());
-        })
+        }, Some(|_, _| {}))
         .await
         .expect("enqueue upload task");
 
@@ -196,7 +196,7 @@ async fn download_prepare_missing_content_length_hits_error_branch() {
                 .lock()
                 .expect("lock statuses")
                 .push(record.status().clone());
-        })
+        }, Some(|_, _| {}))
         .await
         .expect("enqueue download task");
 
@@ -245,7 +245,7 @@ async fn download_prepare_local_larger_than_remote_hits_invalid_range_branch() {
                 .lock()
                 .expect("lock statuses")
                 .push(record.status().clone());
-        })
+        }, Some(|_, _| {}))
         .await
         .expect("enqueue download task");
 
@@ -292,7 +292,7 @@ async fn download_chunk_total_changed_and_empty_body_error_branches() {
                 .lock()
                 .expect("lock statuses a")
                 .push(record.status().clone());
-        })
+        }, Some(|_, _| {}))
         .await
         .expect("enqueue task a");
     let terminal_a = wait_terminal_status(statuses_a).await;
@@ -327,7 +327,7 @@ async fn download_chunk_total_changed_and_empty_body_error_branches() {
                 .lock()
                 .expect("lock statuses b")
                 .push(record.status().clone());
-        })
+        }, Some(|_, _| {}))
         .await
         .expect("enqueue task b");
     let terminal_b = wait_terminal_status(statuses_b).await;

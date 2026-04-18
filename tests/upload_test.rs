@@ -44,7 +44,7 @@ async fn test_upload() {
                 .lock()
                 .expect("lock statuses")
                 .push(record.status().clone());
-        })
+        }, Some(|_, _| {}))
         .await
         .expect("enqueue upload task");
 

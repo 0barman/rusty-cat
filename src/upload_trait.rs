@@ -2,113 +2,160 @@ use async_trait::async_trait;
 use crate::http_breakpoint::UploadResumeInfo;
 use crate::{MeowError, TransferTask};
 
-/// 上传准备阶段上下文。
+/// Context for upload prepare stage.
 #[derive(Debug, Clone, Copy)]
 pub struct UploadPrepareCtx<'a> {
+    /// HTTP client used for requests.
     pub client: &'a reqwest::Client,
+    /// Immutable task snapshot.
     pub task: &'a TransferTask,
+    /// Locally confirmed uploaded offset in bytes.
+    ///
+    /// Range: `>= 0`.
     pub local_offset: u64,
 }
 
-/// 上传分片阶段上下文。
+/// Context for upload chunk stage.
 #[derive(Debug, Clone, Copy)]
 pub struct UploadChunkCtx<'a> {
+    /// HTTP client used for requests.
     pub client: &'a reqwest::Client,
+    /// Immutable task snapshot.
     pub task: &'a TransferTask,
+    /// Raw bytes for the current chunk.
     pub chunk: &'a [u8],
+    /// Start offset of this chunk in the full file.
+    ///
+    /// Range: `>= 0`.
     pub offset: u64,
 }
 
-/// 自定义断点上传协议。
+/// Custom breakpoint upload protocol.
 ///
-/// 实现方负责：按业务约定构造 HTTP 请求（multipart 或二进制体）、解析响应体为 [`UploadResumeInfo`]。
-/// 执行器负责：打开本地文件、按 [`TransferTask`] 的 `chunk_size` 读分片、并发/重试/进度/暂停恢复；
-/// 每次上传前会调用 [`BreakpointUpload::prepare`]，随后对每个分片调用 [`BreakpointUpload::upload_chunk`]。
+/// Implementors are responsible for request construction and response parsing.
+/// The executor handles file I/O, chunking, retries, progress, and scheduling.
 ///
-/// # 与执行器协作的约定
+/// # Examples
 ///
-/// - 若返回的 [`UploadResumeInfo::completed_file_id`] 为 `Some`，执行器认为该次 HTTP 已表示**整文件上传结束**，
-///   会直接将进度推到文件末尾并结束任务（不再继续分片，也不再调用 [`BreakpointUpload::complete_upload`]）。
-/// - [`UploadResumeInfo::next_byte`] 表示服务端建议的下一字节偏移；执行器会将其与本地已传偏移合并后再继续。
-/// - 当某次分片后计算得到的下一偏移已到达或超过 `task.total_size()` 时，执行器会调用
-///   [`BreakpointUpload::complete_upload`]（若该分片响应未通过 `completed_file_id` 提前结束）。
-/// - 用户取消上传任务时，执行器对上传方向会调用 [`BreakpointUpload::abort_upload`]。
+/// ```no_run
+/// use async_trait::async_trait;
+/// use rusty_cat::api::{
+///     BreakpointUpload, MeowError, UploadChunkCtx, UploadPrepareCtx, UploadResumeInfo,
+/// };
+///
+/// struct MyUploadProtocol;
+///
+/// #[async_trait]
+/// impl BreakpointUpload for MyUploadProtocol {
+///     async fn prepare(&self, _ctx: UploadPrepareCtx<'_>) -> Result<UploadResumeInfo, MeowError> {
+///         Ok(UploadResumeInfo::default())
+///     }
+///
+///     async fn upload_chunk(&self, ctx: UploadChunkCtx<'_>) -> Result<UploadResumeInfo, MeowError> {
+///         let _ = (ctx.task.file_name(), ctx.offset);
+///         Ok(UploadResumeInfo {
+///             completed_file_id: None,
+///             next_byte: Some(ctx.offset + ctx.chunk.len() as u64),
+///         })
+///     }
+/// }
+/// ```
+///
+/// # Executor integration contract
+///
+/// - If [`UploadResumeInfo::completed_file_id`] is `Some`, the executor treats
+///   the upload as fully completed and stops sending further chunks.
+/// - [`UploadResumeInfo::next_byte`] is a server-suggested next offset; the
+///   executor merges it with local offset before continuing.
+/// - When computed next offset reaches `task.total_size()`, the executor calls
+///   [`BreakpointUpload::complete_upload`] unless completion was already
+///   indicated by `completed_file_id`.
+/// - When user cancels an upload task, executor calls
+///   [`BreakpointUpload::abort_upload`].
 #[async_trait]
 pub trait BreakpointUpload: Send + Sync {
-    /// 传输开始前的准备阶段：通常对应「初始化会话 / 查询已传进度」等一次或多次 HTTP 调用。
+    /// Prepare stage before first chunk upload.
     ///
-    /// 在首个分片上传之前由执行器调用一次，用于与服务端对齐续传点或创建分片上传会话。
+    /// Typical responsibilities include creating upload session and querying
+    /// already uploaded offset on remote side.
     ///
-    /// # 参数
+    /// # Parameters
     ///
-    /// - `client`：执行器持有的 [`reqwest::Client`]，应用与分片阶段使用同一客户端配置（代理、TLS、超时等）。
-    /// - `task`：当前上传任务快照，含 URL、方法、请求头、本地路径、文件签名、总分片大小等；请求 URL/方法/头
-    ///   一般应与此保持一致，除非协议明确要求单独的 prepare 端点（此时由实现自行决定 URL）。
-    /// - `local_offset`：本地已确认写入的字节偏移（断点续传时非零）；实现可据此与服务端 `nextByte` 等字段对齐。
+    /// - `client`: Shared HTTP client used by executor.
+    /// - `task`: Upload task snapshot with URL/method/headers/file metadata.
+    /// - `local_offset`: Locally confirmed uploaded offset.
     ///
-    /// # 返回值
+    /// # Returns
     ///
-    /// - `Ok(info)`：见 [`UploadResumeInfo`]。若 `completed_file_id` 为 `Some`，执行器**立即**结束上传成功路径。
-    ///   否则执行器取 `info.next_byte.unwrap_or(0)`，与 `local_offset` 取较大值后再与 `task.total_size()` 取较小值，
-    ///   作为下一分片的起始偏移。
-    /// - `Err`：准备失败，任务进入失败状态（可能触发重试策略，取决于上层配置）。
+    /// - `Ok(info)`: Server resume info used by executor to compute next offset.
+    /// - `Err`: Prepare failed and task enters error path.
+    ///
+    /// # Errors
+    ///
+    /// Return [`MeowError`] when remote session creation/checkpoint probing
+    /// fails, request signing fails, or protocol payload parsing fails.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rusty_cat::api::UploadPrepareCtx;
+    ///
+    /// fn read_prepare_ctx(ctx: UploadPrepareCtx<'_>) {
+    ///     let _ = (ctx.task.url(), ctx.local_offset);
+    /// }
+    /// ```
     async fn prepare(&self, ctx: UploadPrepareCtx<'_>) -> Result<UploadResumeInfo, MeowError>;
 
-    /// 上传单个分片：从本地文件读出的一段字节，由实现封装为 HTTP 请求并发送。
+    /// Uploads a single chunk.
     ///
-    /// 执行器保证：`chunk` 长度与当前分片一致（最后一片可能更短），`offset` 为该分片在文件中的起始字节偏移，
-    /// 且 `offset + chunk.len() <= task.total_size()`（除边界情况外由执行器保证顺序与范围）。
+    /// Executor guarantees chunk bounds are valid and chunk bytes match the
+    /// provided `offset`.
     ///
-    /// # 参数
+    /// # Errors
     ///
-    /// - `client`：同上，用于发送本分片的 HTTP 请求。
-    /// - `task`：当前任务；实现从中读取 URL、方法、头、文件名、总大小、签名等元数据以拼请求体或查询参数。
-    /// - `chunk`：本分片原始字节，只读；不应假设跨调用缓存，每次调用对应独立一次 HTTP。
-    /// - `offset`：本分片在整文件中的起始偏移（从 0 开始），与 `chunk` 内容一一对应。
+    /// Return [`MeowError`] when chunk request fails, server rejects the chunk,
+    /// or protocol response parsing fails.
     ///
-    /// # 返回值
+    /// # Examples
     ///
-    /// - `Ok(info)`：若 `completed_file_id` 为 `Some`，执行器认为上传已完成。否则根据 `next_byte` 更新进度：
-    ///   下一偏移为 `info.next_byte.unwrap_or(offset + chunk.len() as u64)`，再与 `task.total_size()` 取最小值。
-    ///   若该下一偏移已达到或超过文件总大小，执行器随后调用 [`BreakpointUpload::complete_upload`]。
-    /// - `Err`：本分片失败，由执行器按重试/失败策略处理。
+    /// ```no_run
+    /// use rusty_cat::api::UploadChunkCtx;
+    ///
+    /// fn read_chunk_ctx(ctx: UploadChunkCtx<'_>) {
+    ///     let _ = (ctx.offset, ctx.chunk.len(), ctx.task.total_size());
+    /// }
+    /// ```
     async fn upload_chunk(&self, ctx: UploadChunkCtx<'_>) -> Result<UploadResumeInfo, MeowError>;
 
-    /// 所有分片字节已按协议上传完毕后，由执行器调用的收尾步骤。
+    /// Finalization step after all chunk bytes are uploaded.
     ///
-    /// 典型场景：对象存储的 `CompleteMultipartUpload`、合并块列表、通知业务侧落库等。默认实现为空操作（`Ok(())`），
-    /// 适用于服务端在最后一个分片响应中即视为完成、无需额外 HTTP 的协议。
+    /// Typical use case: multipart-complete API calls. Return value is an
+    /// optional provider-defined payload that will be forwarded to
+    /// `MeowClient::enqueue` complete callback.
     ///
-    /// # 参数
+    /// Default implementation is a no-op (`Ok(None)`).
     ///
-    /// - `client`：用于发送完成/提交类请求（若需要）。
-    /// - `task`：当前任务，用于 URL、头及协议所需的业务标识。
+    /// # Errors
     ///
-    /// # 返回值
-    ///
-    /// - `Ok(())`：收尾成功，执行器将任务标为完成。
-    /// - `Err`：收尾失败，任务失败（可能经重试，取决于上层）。
+    /// Implementations should return [`MeowError`] if final commit/merge API
+    /// fails.
     async fn complete_upload(
         &self,
         _client: &reqwest::Client,
         _task: &TransferTask,
-    ) -> Result<(), MeowError> {
-        Ok(())
+    ) -> Result<Option<String>, MeowError> {
+        Ok(None)
     }
 
-    /// 用户取消上传任务时，由执行器调用，用于协议层的清理或中止语义。
+    /// Abort/cleanup hook called when user cancels an upload task.
     ///
-    /// 例如：中止分片上传会话、删除未合并的临时对象。默认实现为空操作。仅在上传方向的任务取消路径中调用。
+    /// Typical use case: abort multipart session or remove temporary objects.
+    /// Default implementation is a no-op.
     ///
-    /// # 参数
+    /// # Errors
     ///
-    /// - `client`：用于发送中止/删除类请求（若需要）。
-    /// - `task`：被取消的任务，用于定位远端资源或会话 ID。
-    ///
-    /// # 返回值
-    ///
-    /// - `Ok(())`：取消侧协议处理成功（或无可执行操作）。
-    /// - `Err`：中止请求失败；是否影响任务已处于取消状态由上层决定，但实现应尽量返回明确错误信息。
+    /// Implementations should return [`MeowError`] when cleanup or abort API
+    /// calls fail.
     async fn abort_upload(
         &self,
         _client: &reqwest::Client,

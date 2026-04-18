@@ -1,3 +1,10 @@
+//! `rusty-cat` public SDK crate.
+//!
+//! This crate exposes high-level APIs to enqueue and control upload/download
+//! tasks with breakpoint resume support.
+//!
+//! For beginners, start from [`api`] or directly use [`meow_client::MeowClient`]
+//! and [`meow_config::MeowConfig`].
 pub mod api;
 pub mod chunk_outcome;
 pub(crate) mod dflt;

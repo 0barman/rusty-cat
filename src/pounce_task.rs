@@ -8,23 +8,41 @@ use reqwest::Method;
 use crate::direction::Direction;
 use crate::http_breakpoint::{BreakpointDownload, BreakpointDownloadHttpConfig, BreakpointUpload};
 
-/// 仅承载调用方入参，由 [`UploadPounceBuilder`] / [`DownloadPounceBuilder`] 构造
+/// User-facing task input built by upload/download builders.
+///
+/// This type only carries request parameters. Internal runtime state is created
+/// later when the task is enqueued.
 #[derive(Clone)]
 pub struct PounceTask {
+    /// Transfer direction.
     pub(crate) direction: Direction,
+    /// Display file name.
     pub(crate) file_name: String,
+    /// Local source/target path.
     pub(crate) file_path: PathBuf,
+    /// Total file size in bytes (upload only at build time).
     pub(crate) total_size: u64,
+    /// Chunk size in bytes.
     pub(crate) chunk_size: u64,
+    /// Request URL.
     pub(crate) url: String,
+    /// Request HTTP method.
     pub(crate) method: Method,
+    /// Base request headers.
     pub(crate) headers: HeaderMap,
-    /// 下载任务在进度回调里展示的标识；上传任务忽略，由内部 MD5 填充。
+    /// Download-only signature shown in callbacks.
+    ///
+    /// Upload tasks ignore this value and use internal signature generation.
     pub(crate) client_file_sign: Option<String>,
+    /// Optional custom upload breakpoint protocol.
     pub(crate) breakpoint_upload: Option<Arc<dyn BreakpointUpload + Send + Sync>>,
+    /// Optional custom download breakpoint protocol.
     pub(crate) breakpoint_download: Option<Arc<dyn BreakpointDownload + Send + Sync>>,
+    /// Optional HTTP configuration for breakpoint download.
     pub(crate) breakpoint_download_http: Option<BreakpointDownloadHttpConfig>,
-    /// 每个分片的最大重试次数（仅在分片传输失败时生效，不包含 prepare 阶段）。
+    /// Maximum retry count per chunk transfer.
+    ///
+    /// Applies only to chunk transfer stage, not prepare stage.
     pub(crate) max_chunk_retries: u32,
 }
 
@@ -61,9 +79,12 @@ impl fmt::Debug for PounceTask {
 }
 
 impl PounceTask {
-    /// 分片重试的默认最大次数：失败后最多再尝试 3 次。
+    /// Default maximum retry count per chunk transfer.
     pub const DEFAULT_MAX_CHUNK_RETRIES: u32 = 3;
 
+    /// Normalizes chunk size input.
+    ///
+    /// `0` is converted to `1 MiB`; other values are kept unchanged.
     pub(crate) fn normalized_chunk_size(chunk_size: u64) -> u64 {
         if chunk_size == 0 {
             1024 * 1024
@@ -72,13 +93,17 @@ impl PounceTask {
         }
     }
 
-    /// 规范化重试次数：
-    /// - 0 表示“禁用重试”（仅执行一次）；
-    /// - 其余值按调用方配置使用。
+    /// Normalizes retry count input.
+    ///
+    /// - `0` means "disable retry".
+    /// - Other values are used as-is.
     pub(crate) fn normalized_max_chunk_retries(max_chunk_retries: u32) -> u32 {
         max_chunk_retries
     }
 
+    /// Checks whether required task fields are missing/invalid.
+    ///
+    /// For upload, `total_size` must be greater than `0`.
     pub(crate) fn is_empty(&self) -> bool {
         self.file_path.as_os_str().is_empty()
             || self.file_name.is_empty()

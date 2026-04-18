@@ -1,4 +1,7 @@
-//! 对外 API 统一导出入口。
+//! Public API export hub for `rusty-cat`.
+//!
+//! Import from this module when you want a stable, single entry point for the
+//! most commonly used SDK types.
 pub use crate::chunk_outcome::ChunkOutcome;
 pub use crate::direction::Direction;
 pub use crate::down_pounce_builder::DownloadPounceBuilder;

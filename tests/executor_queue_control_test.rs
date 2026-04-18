@@ -43,7 +43,7 @@ async fn zero_concurrency_queue_pause_resume_cancel_flow() {
     )
     .build();
     let task_id = client
-        .enqueue(task, |_record: FileTransferRecord| {})
+        .enqueue(task, |_record: FileTransferRecord| {}, Some(|_, _| {}))
         .await
         .expect("enqueue queued task");
 

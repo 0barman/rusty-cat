@@ -76,7 +76,7 @@ async fn file_transfer_record_getters_return_expected_values_from_callback() {
             ) {
                 *latest_for_cb.lock().expect("lock latest record") = Some(record);
             }
-        })
+        }, Some(|_, _| {}))
         .await
         .expect("enqueue getter task");
 

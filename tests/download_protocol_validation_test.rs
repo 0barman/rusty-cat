@@ -71,7 +71,7 @@ async fn run_download_case(
                 .lock()
                 .expect("lock statuses in callback")
                 .push(record.status().clone());
-        })
+        }, Some(|_, _| {}))
         .await
         .expect("enqueue download task");
 

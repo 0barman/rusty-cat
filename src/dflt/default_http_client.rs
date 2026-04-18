@@ -17,6 +17,7 @@ use crate::prepare_outcome::PrepareOutcome;
 use crate::transfer_executor_trait::TransferTrait;
 use crate::transfer_task::TransferTask;
 
+/// Creates default breakpoint protocol instances.
 pub(crate) fn default_breakpoint_arcs() -> (
     Arc<dyn BreakpointUpload + Send + Sync>,
     Arc<dyn BreakpointDownload + Send + Sync>,
@@ -27,21 +28,53 @@ pub(crate) fn default_breakpoint_arcs() -> (
     )
 }
 
+/// Built-in transfer backend based on `reqwest` and async file I/O.
 pub struct DefaultHttpClient {
+    /// Default shared HTTP client.
     client: reqwest::Client,
+    /// Fallback upload protocol when task does not provide one.
     fallback_upload: Arc<dyn BreakpointUpload + Send + Sync>,
+    /// Fallback download protocol when task does not provide one.
     fallback_download: Arc<dyn BreakpointDownload + Send + Sync>,
 }
 
 impl DefaultHttpClient {
+    /// Creates a client with default HTTP timeout and keepalive values.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use rusty_cat::dflt::default_http_client::DefaultHttpClient;
+    ///
+    /// let client = DefaultHttpClient::new();
+    /// let _ = client;
+    /// ```
     pub fn new() -> Self {
         Self::with_http_timeouts(Duration::from_secs(5), Duration::from_secs(30))
     }
 
-    /// 使用与 [`crate::meow_config::MeowConfig`] 一致的 HTTP 超时与 TCP keepalive 构建内置 `reqwest::Client`。
+    /// Creates built-in client with explicit timeout and keepalive values.
+    ///
+    /// # Range guidance
+    ///
+    /// - `http_timeout`: recommended `1s..=120s`
+    /// - `tcp_keepalive`: recommended `10s..=300s`
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use std::time::Duration;
+    /// use rusty_cat::dflt::default_http_client::DefaultHttpClient;
+    ///
+    /// let client = DefaultHttpClient::with_http_timeouts(
+    ///     Duration::from_secs(15),
+    ///     Duration::from_secs(60),
+    /// );
+    /// let _ = client;
+    /// ```
     pub fn with_http_timeouts(http_timeout: Duration, tcp_keepalive: Duration) -> Self {
-        // 为保持向后兼容，保留非 fallible 构造；若 build 失败则记录日志并退化为 `Client::new()`。
-        // 建议新代码使用 `try_with_http_timeouts`，可将错误显式返回给调用方。
+        // Keep non-fallible constructor for compatibility.
+        // Prefer `try_with_http_timeouts` in new code for explicit errors.
         let client = match Client::builder()
             .timeout(http_timeout)
             .tcp_keepalive(tcp_keepalive)
@@ -64,7 +97,26 @@ impl DefaultHttpClient {
         }
     }
 
-    /// 推荐的 fallible 构造：构建失败时返回明确错误，交由调用方决策。
+    /// Preferred fallible constructor with explicit error propagation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `HttpClientBuildFailed` when `reqwest::Client` cannot be
+    /// constructed with the provided timeout/keepalive values.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use std::time::Duration;
+    /// use rusty_cat::dflt::default_http_client::DefaultHttpClient;
+    ///
+    /// let client = DefaultHttpClient::try_with_http_timeouts(
+    ///     Duration::from_secs(10),
+    ///     Duration::from_secs(30),
+    /// )?;
+    /// let _ = client;
+    /// # Ok::<(), rusty_cat::api::MeowError>(())
+    /// ```
     pub fn try_with_http_timeouts(
         http_timeout: Duration,
         tcp_keepalive: Duration,
@@ -90,6 +142,17 @@ impl DefaultHttpClient {
         })
     }
 
+    /// Creates backend with an externally provided `reqwest::Client`.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use rusty_cat::dflt::default_http_client::DefaultHttpClient;
+    ///
+    /// let reqwest_client = reqwest::Client::new();
+    /// let backend = DefaultHttpClient::with_client(reqwest_client);
+    /// let _ = backend;
+    /// ```
     pub fn with_client(client: reqwest::Client) -> Self {
         Self {
             client,
@@ -98,7 +161,24 @@ impl DefaultHttpClient {
         }
     }
 
-    /// 自定义全局默认的断点协议（任务级 [`TransferTask::with_breakpoint_upload`] 仍可覆盖）。
+    /// Creates backend with explicit fallback upload/download protocol plugins.
+    ///
+    /// Task-level protocol instances still take precedence when present.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use std::sync::Arc;
+    /// use rusty_cat::api::{DefaultStyleUpload, StandardRangeDownload};
+    /// use rusty_cat::dflt::default_http_client::DefaultHttpClient;
+    ///
+    /// let backend = DefaultHttpClient::with_fallbacks(
+    ///     reqwest::Client::new(),
+    ///     Arc::new(DefaultStyleUpload::default()),
+    ///     Arc::new(StandardRangeDownload),
+    /// );
+    /// let _ = backend;
+    /// ```
     pub fn with_fallbacks(
         client: reqwest::Client,
         upload: Arc<dyn BreakpointUpload + Send + Sync>,
@@ -111,12 +191,14 @@ impl DefaultHttpClient {
         }
     }
 
+    /// Selects HTTP client for a task.
     fn client_for(&self, task: &TransferTask) -> reqwest::Client {
         task.http_client_ref()
             .cloned()
             .unwrap_or_else(|| self.client.clone())
     }
 
+    /// Selects upload protocol implementation for a task.
     fn upload_arc(&self, task: &TransferTask) -> Arc<dyn BreakpointUpload + Send + Sync> {
         match task.breakpoint_upload() {
             Some(a) => a.clone(),
@@ -124,6 +206,7 @@ impl DefaultHttpClient {
         }
     }
 
+    /// Selects download protocol implementation for a task.
     fn download_arc(&self, task: &TransferTask) -> Arc<dyn BreakpointDownload + Send + Sync> {
         match task.breakpoint_download() {
             Some(a) => a.clone(),
@@ -186,6 +269,7 @@ async fn upload_prepare(
     })
 }
 
+/// Runs download prepare stage and computes resume offset/total size.
 async fn download_prepare(
     client: &reqwest::Client,
     task: &TransferTask,
@@ -211,7 +295,7 @@ async fn download_prepare(
         }
     };
 
-    // 与`check_resume` 一致：以本地已落盘长度作为续传起点，避免与调度器 offset 不一致产生空洞。
+    // Use local persisted length as resume start to avoid sparse gaps.
     let start = local_len;
     let head_url = download.head_url(task);
     let mut head_headers = task.headers().clone();
@@ -294,6 +378,7 @@ async fn download_prepare(
     })
 }
 
+/// Uploads exactly one chunk and returns next transfer outcome.
 async fn upload_one_chunk(
     client: &reqwest::Client,
     task: &TransferTask,
@@ -307,6 +392,7 @@ async fn upload_one_chunk(
             next_offset: offset,
             total_size: total,
             done: true,
+            completion_payload: None,
         });
     }
     let read_len = chunk_size.min(total - offset);
@@ -315,6 +401,7 @@ async fn upload_one_chunk(
             next_offset: offset,
             total_size: total,
             done: true,
+            completion_payload: None,
         });
     }
 
@@ -371,19 +458,23 @@ async fn upload_one_chunk(
             next_offset: total,
             total_size: total,
             done: true,
+            completion_payload: info.completed_file_id,
         });
     }
     let next = info.next_byte.unwrap_or(offset + buf.len() as u64).min(total);
+    let mut completion_payload = None;
     if next >= total {
-        upload.complete_upload(client, task).await?;
+        completion_payload = upload.complete_upload(client, task).await?;
     }
     Ok(ChunkOutcome {
         next_offset: next,
         total_size: total,
         done: next >= total,
+        completion_payload,
     })
 }
 
+/// Builds `Range` header value from start/chunk-size/total-size.
 fn range_spec(start: u64, chunk_size: u64, total: u64) -> String {
     if total == 0 {
         return format!("bytes={start}-");
@@ -392,6 +483,7 @@ fn range_spec(start: u64, chunk_size: u64, total: u64) -> String {
     format!("bytes={start}-{end}")
 }
 
+/// Parses `Content-Range` header into `(start, end, total)`.
 fn parse_content_range(value: &str) -> Result<(u64, u64, Option<u64>), MeowError> {
     let s = value.trim();
     let mut parts = s.splitn(2, ' ');
@@ -460,6 +552,7 @@ fn parse_content_range(value: &str) -> Result<(u64, u64, Option<u64>), MeowError
     Ok((start, end, total))
 }
 
+/// Downloads exactly one range chunk and appends/writes it to local file.
 async fn download_one_chunk(
     client: &reqwest::Client,
     task: &TransferTask,
@@ -480,6 +573,7 @@ async fn download_one_chunk(
             next_offset: offset,
             total_size: total,
             done: true,
+            completion_payload: None,
         });
     }
 
@@ -695,15 +789,18 @@ async fn download_one_chunk(
         next_offset: next,
         total_size: total,
         done: next >= total,
+        completion_payload: None,
     })
 }
 
+/// Maps `reqwest::Error` into SDK error type.
 fn map_reqwest(e: reqwest::Error) -> MeowError {
     MeowError::from_source(InnerErrorCode::HttpError, e.to_string(), e)
 }
 
 #[async_trait]
 impl TransferTrait for DefaultHttpClient {
+    /// Prepares transfer execution according to task direction.
     async fn prepare(
         &self,
         task: &TransferTask,
@@ -720,6 +817,7 @@ impl TransferTrait for DefaultHttpClient {
         }
     }
 
+    /// Transfers one chunk according to task direction.
     async fn transfer_chunk(
         &self,
         task: &TransferTask,
@@ -746,6 +844,7 @@ impl TransferTrait for DefaultHttpClient {
         }
     }
 
+    /// Handles task cancel; upload direction may trigger protocol abort.
     async fn cancel(&self, task: &TransferTask) -> Result<(), MeowError> {
         if task.direction() != Direction::Upload {
             return Ok(());

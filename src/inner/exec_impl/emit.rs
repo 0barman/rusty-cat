@@ -1,7 +1,8 @@
 use crate::file_transfer_record::FileTransferRecord;
 use crate::inner::group_state::RecordEntry;
 use crate::inner::scheduler_state::SchedulerState;
-use crate::inner::task_callbacks::ProgressCb;
+use crate::ids::TaskId;
+use crate::inner::task_callbacks::{CompleteCb, ProgressCb};
 use crate::transfer_status::TransferStatus;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -12,6 +13,17 @@ pub(crate) fn invoke_progress_cb(cb: &ProgressCb, dto: FileTransferRecord) {
         crate::meow_flow_log!(
             "callback",
             "progress callback panicked; panic suppressed to protect scheduler"
+        );
+    }
+}
+
+pub(crate) fn invoke_complete_cb(cb: &CompleteCb, task_id: TaskId, payload: Option<String>) {
+    // 完成回调 panic 不应冲击调度核心；吞掉 panic，继续调度流程。
+    let ret = catch_unwind(AssertUnwindSafe(|| cb(task_id, payload)));
+    if ret.is_err() {
+        crate::meow_flow_log!(
+            "callback",
+            "complete callback panicked; panic suppressed to protect scheduler"
         );
     }
 }
