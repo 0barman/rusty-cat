@@ -246,7 +246,7 @@ async fn custom_upload_breakpoint_exercises_transfer_task_getters() {
                 .lock()
                 .expect("lock statuses")
                 .push(record.status().clone());
-        })
+        }, Some(|_, _| {}))
         .await
         .expect("enqueue upload");
 
@@ -295,7 +295,7 @@ async fn custom_download_breakpoint_exercises_transfer_task_getters() {
                 .lock()
                 .expect("lock statuses")
                 .push(record.status().clone());
-        })
+        }, Some(|_, _| {}))
         .await
         .expect("enqueue download");
 

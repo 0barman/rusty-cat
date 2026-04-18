@@ -12,6 +12,7 @@ pub(crate) enum WorkerEvent {
     Completed {
         key: UniqueId,
         total_size: u64,
+        completion_payload: Option<String>,
     },
     Failed {
         key: UniqueId,

@@ -52,7 +52,7 @@ async fn second_enqueue_with_same_download_url_hits_duplicate_branch() {
             s1.lock()
                 .expect("lock statuses1")
                 .push(record.status().clone());
-        })
+        }, Some(|_, _| {}))
         .await
         .expect("enqueue first task");
     client
@@ -60,7 +60,7 @@ async fn second_enqueue_with_same_download_url_hits_duplicate_branch() {
             s2.lock()
                 .expect("lock statuses2")
                 .push(record.status().clone());
-        })
+        }, Some(|_, _| {}))
         .await
         .expect("enqueue second task should still return task id");
 
@@ -108,7 +108,7 @@ async fn resume_without_pause_hits_invalid_task_state_branch() {
     )
     .build();
     let task_id = client
-        .enqueue(task, |_record: FileTransferRecord| {})
+        .enqueue(task, |_record: FileTransferRecord| {}, Some(|_, _| {}))
         .await
         .expect("enqueue task");
 

@@ -10,25 +10,41 @@ use crate::direction::Direction;
 use crate::http_breakpoint::{BreakpointDownload, BreakpointDownloadHttpConfig, BreakpointUpload};
 use crate::inner::inner_task::InnerTask;
 
-/// 对 [`crate::transfer_executor_trait::TransferTrait`] 暴露的任务快照：仅含查询接口，由内部从 [`InnerTask`] 填充。
+/// Immutable task snapshot exposed to transfer executor implementations.
+///
+/// This type is internally created from [`InnerTask`] and intentionally exposes
+/// read-only accessors.
 #[derive(Clone)]
 pub struct TransferTask {
+    /// Stable file signature.
     file_sign: String,
+    /// Display file name.
     file_name: String,
+    /// Local file path.
     file_path: PathBuf,
+    /// Transfer direction.
     direction: Direction,
+    /// Total file size in bytes.
     total_size: u64,
+    /// Chunk size in bytes.
     chunk_size: u64,
+    /// Request URL.
     url: String,
+    /// Request HTTP method.
     method: Method,
+    /// Base request headers.
     headers: HeaderMap,
+    /// HTTP config for breakpoint download behavior.
     breakpoint_download_http: BreakpointDownloadHttpConfig,
+    /// Upload breakpoint protocol implementation.
     breakpoint_upload: Arc<dyn BreakpointUpload + Send + Sync>,
+    /// Download breakpoint protocol implementation.
     breakpoint_download: Arc<dyn BreakpointDownload + Send + Sync>,
+    /// Optional per-task custom HTTP client.
     http_client: Option<reqwest::Client>,
-    /// 任务级上传文件句柄槽位，避免每个 chunk 反复 open。
+    /// Task-level upload file handle slot to avoid reopening per chunk.
     upload_file_slot: Arc<Mutex<Option<File>>>,
-    /// 任务级下载文件句柄槽位，避免每个 chunk 反复 open/create。
+    /// Task-level download file handle slot to avoid reopening per chunk.
     download_file_slot: Arc<Mutex<Option<File>>>,
 }
 
@@ -52,6 +68,7 @@ impl std::fmt::Debug for TransferTask {
 }
 
 impl TransferTask {
+    /// Creates a transfer snapshot from an internal runtime task.
     pub(crate) fn from_inner(inner: &InnerTask) -> Self {
         Self {
             file_sign: inner.file_sign().to_string(),
@@ -72,64 +89,180 @@ impl TransferTask {
         }
     }
 
+    /// Returns transfer direction.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rusty_cat::api::TransferTask;
+    ///
+    /// fn inspect(task: &TransferTask) {
+    ///     let _ = task.direction();
+    /// }
+    /// ```
     pub fn direction(&self) -> Direction {
         self.direction
     }
 
+    /// Returns total file size in bytes.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rusty_cat::api::TransferTask;
+    ///
+    /// fn inspect(task: &TransferTask) {
+    ///     let _ = task.total_size();
+    /// }
+    /// ```
     pub fn total_size(&self) -> u64 {
         self.total_size
     }
 
+    /// Returns chunk size in bytes.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rusty_cat::api::TransferTask;
+    ///
+    /// fn inspect(task: &TransferTask) {
+    ///     let _ = task.chunk_size();
+    /// }
+    /// ```
     pub fn chunk_size(&self) -> u64 {
         self.chunk_size
     }
 
+    /// Returns file signature.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rusty_cat::api::TransferTask;
+    ///
+    /// fn inspect(task: &TransferTask) {
+    ///     let _ = task.file_sign();
+    /// }
+    /// ```
     pub fn file_sign(&self) -> &str {
         &self.file_sign
     }
 
+    /// Returns display file name.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rusty_cat::api::TransferTask;
+    ///
+    /// fn inspect(task: &TransferTask) {
+    ///     let _ = task.file_name();
+    /// }
+    /// ```
     pub fn file_name(&self) -> &str {
         &self.file_name
     }
 
+    /// Returns local file path.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rusty_cat::api::TransferTask;
+    ///
+    /// fn inspect(task: &TransferTask) {
+    ///     let _ = task.file_path();
+    /// }
+    /// ```
     pub fn file_path(&self) -> &Path {
         &self.file_path
     }
 
+    /// Returns request URL.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rusty_cat::api::TransferTask;
+    ///
+    /// fn inspect(task: &TransferTask) {
+    ///     let _ = task.url();
+    /// }
+    /// ```
     pub fn url(&self) -> &str {
         &self.url
     }
 
+    /// Returns request HTTP method.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rusty_cat::api::TransferTask;
+    ///
+    /// fn inspect(task: &TransferTask) {
+    ///     let _ = task.method();
+    /// }
+    /// ```
     pub fn method(&self) -> Method {
         self.method.clone()
     }
 
+    /// Returns base request headers.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rusty_cat::api::TransferTask;
+    ///
+    /// fn inspect(task: &TransferTask) {
+    ///     let _ = task.headers();
+    /// }
+    /// ```
     pub fn headers(&self) -> &HeaderMap {
         &self.headers
     }
 
-    /// 返回任务级断点下载 HTTP 配置，供自定义 [`crate::download_trait::BreakpointDownload`]
-    /// 实现读取（例如 `range_accept` 语义）。
+    /// Returns task-level breakpoint download HTTP configuration.
+    ///
+    /// Custom [`crate::download_trait::BreakpointDownload`] implementations can
+    /// read values such as `range_accept`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rusty_cat::api::TransferTask;
+    ///
+    /// fn inspect(task: &TransferTask) {
+    ///     let _ = task.breakpoint_download_http();
+    /// }
+    /// ```
     pub fn breakpoint_download_http(&self) -> Option<&BreakpointDownloadHttpConfig> {
         Some(&self.breakpoint_download_http)
     }
 
+    /// Returns task-level upload protocol implementation.
     pub(crate) fn breakpoint_upload(&self) -> Option<&Arc<dyn BreakpointUpload + Send + Sync>> {
         Some(&self.breakpoint_upload)
     }
 
+    /// Returns task-level download protocol implementation.
     pub(crate) fn breakpoint_download(&self) -> Option<&Arc<dyn BreakpointDownload + Send + Sync>> {
         Some(&self.breakpoint_download)
     }
 
+    /// Returns task-level custom HTTP client, if configured.
     pub(crate) fn http_client_ref(&self) -> Option<&reqwest::Client> {
         self.http_client.as_ref()
     }
 
+    /// Returns upload file handle slot used by executor.
     pub(crate) fn upload_file_slot(&self) -> &Arc<Mutex<Option<File>>> {
         &self.upload_file_slot
     }
 
+    /// Returns download file handle slot used by executor.
     pub(crate) fn download_file_slot(&self) -> &Arc<Mutex<Option<File>>> {
         &self.download_file_slot
     }

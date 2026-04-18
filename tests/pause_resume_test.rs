@@ -182,7 +182,7 @@ async fn pause_then_resume_keeps_same_task_id_and_finishes() {
                 .lock()
                 .expect("lock statuses")
                 .push(record.status().clone());
-        })
+        }, Some(|_, _| {}))
         .await
         .expect("enqueue task");
 

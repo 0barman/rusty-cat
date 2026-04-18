@@ -58,7 +58,7 @@ async fn upload_record_file_sign_matches_source_md5() {
             ) {
                 *terminal_cb.lock().expect("lock terminal") = Some(record.status().clone());
             }
-        })
+        }, Some(|_, _| {}))
         .await
         .expect("enqueue upload task");
 
@@ -120,7 +120,7 @@ async fn second_upload_with_same_sign_hits_duplicate_branch() {
         .expect("build second upload task");
 
     client
-        .enqueue(task1, |_record: FileTransferRecord| {})
+        .enqueue(task1, |_record: FileTransferRecord| {}, Some(|_, _| {}))
         .await
         .expect("enqueue first upload");
     client
@@ -128,7 +128,7 @@ async fn second_upload_with_same_sign_hits_duplicate_branch() {
             s2.lock()
                 .expect("lock statuses2")
                 .push(record.status().clone());
-        })
+        }, Some(|_, _| {}))
         .await
         .expect("enqueue second upload should still return task id");
 

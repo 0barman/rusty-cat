@@ -28,7 +28,11 @@ pub(crate) async fn handle_worker_event(event: WorkerEvent, state: &mut Schedule
                 );
             }
         }
-        WorkerEvent::Completed { key, total_size } => {
+        WorkerEvent::Completed {
+            key,
+            total_size,
+            completion_payload,
+        } => {
             crate::meow_flow_log!(
                 "worker_event",
                 "completed: key={:?} total_size={}",
@@ -43,6 +47,7 @@ pub(crate) async fn handle_worker_event(event: WorkerEvent, state: &mut Schedule
                 state
                     .task_id_to_dedupe_mut()
                     .remove(&group.leader_inner().task_id());
+                let task_id = group.entry().inner().task_id();
                 crate::inner::exec_impl::emit::emit_status(
                     state,
                     group.entry(),
@@ -50,6 +55,13 @@ pub(crate) async fn handle_worker_event(event: WorkerEvent, state: &mut Schedule
                     total_size,
                     total_size,
                 );
+                if let Some(cb) = group.entry().callbacks().complete_cb() {
+                    crate::inner::exec_impl::emit::invoke_complete_cb(
+                        cb,
+                        task_id,
+                        completion_payload,
+                    );
+                }
             }
             state.offsets_mut().remove(&key);
         }

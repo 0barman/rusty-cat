@@ -1,6 +1,7 @@
-//! 断点上传/下载协议插件：
-//! - 执行器只做并发调度、分片读写、重试、进度、暂停恢复；
-//! - 协议插件只负责业务语义（初始化、分片请求、完成/取消、响应解析）。
+//! Breakpoint upload/download protocol plugins.
+//!
+//! - The executor handles scheduling, chunk I/O, retries, progress, and state.
+//! - Protocol plugins handle business-specific request/response semantics.
 
 use async_trait::async_trait;
 use crate::error::{InnerErrorCode, MeowError};
@@ -14,29 +15,47 @@ use reqwest::Method;
 
 #[derive(Debug, Clone, Default)]
 pub struct UploadResumeInfo {
-    /// 若已上传完成，服务端返回的文件 ID。
+    /// File ID returned by server when upload is already complete.
     pub completed_file_id: Option<String>,
-    /// 建议下一字节偏移（`nextByte`）。
+    /// Suggested next byte offset (`nextByte`) from server.
+    ///
+    /// Range: `>= 0`.
     pub next_byte: Option<u64>,
 }
 
-/// 一次上传 HTTP 请求体。
+/// Upload HTTP request body payload.
 #[derive(Debug)]
 pub enum UploadBody {
     Multipart(multipart::Form),
     Binary(Vec<u8>),
 }
 
-/// 协议插件返回给执行器的上传请求描述。
+/// Upload request description returned by protocol plugin.
 #[derive(Debug)]
 pub struct UploadRequest {
+    /// HTTP method for upload call.
     pub method: Method,
+    /// Target request URL.
     pub url: String,
+    /// Request headers.
     pub headers: HeaderMap,
+    /// Body payload.
     pub body: UploadBody,
 }
 
 impl UploadRequest {
+    /// Creates an upload request using URL/method/headers from task.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rusty_cat::api::{TransferTask, UploadBody, UploadRequest};
+    ///
+    /// fn make_request(task: &TransferTask, bytes: Vec<u8>) {
+    ///     let req = UploadRequest::from_task(task, UploadBody::Binary(bytes));
+    ///     let _ = req;
+    /// }
+    /// ```
     pub fn from_task(task: &TransferTask, body: UploadBody) -> Self {
         Self {
             method: task.method(),
@@ -47,7 +66,7 @@ impl UploadRequest {
     }
 }
 
-
+/// Parses default upload response JSON payload into [`UploadResumeInfo`].
 fn parse_default_upload_response(body: &str) -> Result<UploadResumeInfo, MeowError> {
     if body.trim().is_empty() {
         crate::meow_flow_log!(
@@ -80,6 +99,7 @@ fn parse_default_upload_response(body: &str) -> Result<UploadResumeInfo, MeowErr
     })
 }
 
+/// Sends upload request and returns response body as string.
 async fn send_upload_request(
     client: &reqwest::Client,
     req: UploadRequest,
@@ -101,12 +121,14 @@ async fn send_upload_request(
     Ok(body)
 }
 
+/// Maps `reqwest` errors into SDK errors.
 fn map_reqwest(e: reqwest::Error) -> MeowError {
     MeowError::from_source(InnerErrorCode::HttpError, e.to_string(), e)
 }
 
 #[derive(Debug, Clone)]
 pub struct DefaultStyleUpload {
+    /// Optional business category sent in multipart form.
     pub category: String,
 }
 
@@ -118,13 +140,21 @@ impl Default for DefaultStyleUpload {
     }
 }
 
+/// Multipart field key: file md5/signature.
 const KEY_FILE_MD5: &str = "fileMd5";
+/// Multipart field key: file name.
 const KEY_FILE_NAME: &str = "fileName";
+/// Multipart field key: business category.
 const KEY_CATEGORY: &str = "category";
+/// Multipart field key: total file size.
 const KEY_TOTAL_SIZE: &str = "totalSize";
+/// Multipart field key: current chunk offset.
 const KEY_OFFSET: &str = "offset";
+/// Multipart field key: current chunk byte length.
 const KEY_PART_SIZE: &str = "partSize";
+/// Multipart field key: file binary part.
 const KEY_FILE: &str = "file";
+/// Multipart part file name used for chunk payload.
 const KEY_UPLOAD_CHUNK_DATA: &str = "upload_chunk_data";
 
 #[derive(serde::Deserialize)]
@@ -137,6 +167,7 @@ struct DefaultUploadResp {
 
 #[async_trait]
 impl BreakpointUpload for DefaultStyleUpload {
+    /// Sends prepare request for default multipart upload protocol.
     async fn prepare(&self, ctx: UploadPrepareCtx<'_>) -> Result<UploadResumeInfo, MeowError> {
         let form = multipart::Form::new()
             .text(KEY_FILE_MD5, ctx.task.file_sign().to_string())
@@ -148,6 +179,7 @@ impl BreakpointUpload for DefaultStyleUpload {
         parse_default_upload_response(&body)
     }
 
+    /// Sends one upload chunk for default multipart upload protocol.
     async fn upload_chunk(&self, ctx: UploadChunkCtx<'_>) -> Result<UploadResumeInfo, MeowError> {
         let part = multipart::Part::bytes(ctx.chunk.to_vec())
             .file_name(KEY_UPLOAD_CHUNK_DATA)
@@ -168,11 +200,15 @@ impl BreakpointUpload for DefaultStyleUpload {
     }
 }
 
-/// 断点下载中与 HTTP 请求相关的可配置项（Range GET 的 Accept、HEAD 行为等），通常放在
-/// [`TransferTask`] 上由调用方传入；未设置时由 [`crate::meow_config::MeowConfig`] 在入队时补齐。
+/// HTTP behavior config for breakpoint range download.
+///
+/// This is usually provided by caller in task config. If missing, enqueue logic
+/// fills it from [`crate::meow_config::MeowConfig`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BreakpointDownloadHttpConfig {
-    /// 分片 GET（带 `Range`）使用的 `Accept` 头。
+    /// `Accept` header used by range GET chunk requests.
+    ///
+    /// Typical value: `application/octet-stream`.
     pub range_accept: String,
 }
 
@@ -186,6 +222,7 @@ impl Default for BreakpointDownloadHttpConfig {
 
 pub(crate) const DEFAULT_RANGE_ACCEPT: &str = "application/octet-stream";
 
+/// Inserts header pair into map when both name/value are valid.
 pub(crate) fn insert_header(map: &mut HeaderMap, name: &str, value: &str) {
     if let (Ok(n), Ok(v)) = (
         HeaderName::from_bytes(name.as_bytes()),
@@ -195,7 +232,10 @@ pub(crate) fn insert_header(map: &mut HeaderMap, name: &str, value: &str) {
     }
 }
 
-/// 默认 Range 下载：仅设置 Range / Accept，总长度取自 `Content-Length`。
+/// Default range download protocol.
+///
+/// It sets `Range` and `Accept` headers and reads total size from
+/// `Content-Length`.
 #[derive(Debug, Clone, Default)]
 pub struct StandardRangeDownload;
 

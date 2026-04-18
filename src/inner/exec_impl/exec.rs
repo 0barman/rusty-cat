@@ -269,6 +269,7 @@ async fn run_group(
                 .send(WorkerEvent::Completed {
                     key,
                     total_size: known_total,
+                    completion_payload: outcome.completion_payload,
                 })
                 .await;
             return;

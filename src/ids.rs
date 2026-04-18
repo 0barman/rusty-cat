@@ -2,11 +2,14 @@ use std::fmt;
 
 use uuid::Uuid;
 
-/// 由 [`crate::MeowClient::enqueue`] 返回，用于后续暂停、取消等操作关联同一传输任务。
+/// Task ID returned by [`crate::MeowClient::enqueue`].
+///
+/// Use this ID for pause/resume/cancel operations on the same task.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TaskId(Uuid);
 
 impl TaskId {
+    /// Generates a random v4 task ID.
     pub(crate) fn new_v4() -> Self {
         Self(Uuid::new_v4())
     }
@@ -24,11 +27,15 @@ impl fmt::Display for TaskId {
     }
 }
 
-/// 通过 [`crate::MeowClient::register_global_progress_listener`] 注册后返回，用于 [`crate::MeowClient::unregister_global_progress_listener`]。
+/// Listener ID returned by
+/// [`crate::MeowClient::register_global_progress_listener`].
+///
+/// Use this ID to unregister the listener later.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GlobalProgressListenerId(Uuid);
 
 impl GlobalProgressListenerId {
+    /// Generates a random v4 listener ID.
     pub(crate) fn new_v4() -> Self {
         Self(Uuid::new_v4())
     }

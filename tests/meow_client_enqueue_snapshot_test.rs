@@ -35,7 +35,7 @@ async fn enqueue_rejects_empty_task_with_parameter_empty() {
     let empty_task = DownloadPounceBuilder::new("", &path, 1024, "", Method::GET).build();
 
     let err = client
-        .enqueue(empty_task, |_record: FileTransferRecord| {})
+        .enqueue(empty_task, |_record: FileTransferRecord| {}, Some(|_, _| {}))
         .await
         .expect_err("empty task should be rejected");
     assert_eq!(err.code(), InnerErrorCode::ParameterEmpty as i32);
@@ -72,7 +72,7 @@ async fn snapshot_reports_activity_and_returns_to_zero_after_completion() {
                 .lock()
                 .expect("lock statuses")
                 .push(record.status().clone());
-        })
+        }, Some(|_, _| {}))
         .await
         .expect("enqueue snapshot task");
 

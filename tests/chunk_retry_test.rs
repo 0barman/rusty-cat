@@ -61,7 +61,7 @@ async fn default_retry_3_recovers_after_two_chunk_failures() {
                 .lock()
                 .expect("lock statuses callback")
                 .push(record.status().clone());
-        })
+        }, Some(|_, _| {}))
         .await
         .expect("enqueue task");
 
@@ -98,7 +98,7 @@ async fn configured_retry_0_fails_on_first_chunk_failure() {
                 .lock()
                 .expect("lock statuses callback")
                 .push(record.status().clone());
-        })
+        }, Some(|_, _| {}))
         .await
         .expect("enqueue task");
 

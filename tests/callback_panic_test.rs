@@ -83,7 +83,7 @@ async fn task_callback_panic_does_not_break_scheduler() {
             if panic_flag.swap(false, Ordering::AcqRel) {
                 panic!("task progress callback panic in test");
             }
-        })
+        }, Some(|_, _| {}))
         .await
         .expect("enqueue task");
 
@@ -136,7 +136,61 @@ async fn global_callback_panic_does_not_break_scheduler() {
                 .lock()
                 .expect("lock statuses")
                 .push(record.status().clone());
-        })
+        }, Some(|_, _| {}))
+        .await
+        .expect("enqueue task");
+
+    let status = wait_terminal_status(statuses).await;
+    client.close().await.expect("close client");
+    server.shutdown();
+    let bytes = fs::read(&path).expect("read final file");
+    fs::remove_file(&path).expect("remove temp file");
+
+    match status {
+        TransferStatus::Complete => {}
+        other => panic!("expected complete status, got {other:?}"),
+    }
+    assert_eq!(bytes, b"abcdwxyz");
+}
+
+#[tokio::test]
+async fn complete_callback_panic_does_not_break_scheduler() {
+    let server = dev_server::ScriptedServer::spawn_download(vec![
+        head_response(),
+        valid_range_get_response(),
+    ]);
+    let path = temp_download_path("complete_cb");
+    fs::write(&path, b"abcd").expect("write local prefix");
+
+    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
+    let statuses_for_task = statuses.clone();
+    let should_panic_once = Arc::new(AtomicBool::new(true));
+    let panic_flag = should_panic_once.clone();
+
+    let task = DownloadPounceBuilder::new(
+        "case.bin",
+        &path,
+        4,
+        format!("{}/download", server.base_url()),
+        Method::GET,
+    )
+    .build();
+    client
+        .enqueue(
+            task,
+            move |record: FileTransferRecord| {
+                statuses_for_task
+                    .lock()
+                    .expect("lock statuses")
+                    .push(record.status().clone());
+            },
+            Some(move |_, _| {
+                if panic_flag.swap(false, Ordering::AcqRel) {
+                    panic!("complete callback panic in test");
+                }
+            }),
+        )
         .await
         .expect("enqueue task");
 

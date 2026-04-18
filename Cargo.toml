@@ -1,6 +1,6 @@
 [package]
 name = "rusty-cat"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "Async HTTP client for resumable file upload and download."
 license = "MIT"

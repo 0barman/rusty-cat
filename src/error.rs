@@ -4,55 +4,72 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InnerErrorCode {
+    /// Unknown/unclassified error.
     Unknown = -1,
-    /// 成功
+    /// Success (non-error sentinel).
     Success = 0,
-    ///
+    /// Runtime creation failed.
     RuntimeCreationFailedError = 101,
-
+    /// Required parameter is empty or invalid.
     ParameterEmpty = 102,
-
-    /// the same file is already queued or running
+    /// The same file/task is already queued or running.
     DuplicateTaskError = 103,
+    /// Failed to enqueue task.
     EnqueueError = 104,
-
+    /// Local I/O operation failed.
     IoError = 105,
+    /// HTTP request/response operation failed.
     HttpError = 106,
-    /// 客户端已经执行过 close，不可再提交或控制任务。
+    /// Client has already been closed and can no longer accept operations.
     ClientClosed = 107,
-    /// 控制接口收到未知 task_id（例如任务已结束或 id 不存在）。
+    /// Unknown task ID in control API.
     TaskNotFound = 108,
+    /// HTTP response status is not expected.
     ResponseStatusError = 109,
+    /// `Content-Length` from HEAD is missing or invalid.
     MissingOrInvalidContentLengthFromHead = 110,
-    /// 控制命令发送到调度线程失败（队列关闭/线程退出等）。
+    /// Failed to send command to scheduler thread.
     CommandSendFailed = 111,
-    /// 控制命令已发送，但应答通道异常关闭。
+    /// Command response channel closed unexpectedly.
     CommandResponseFailed = 112,
-    /// JSON 等响应体解析失败。
+    /// Failed to parse response payload (for example JSON).
     ResponseParseError = 113,
-    /// HTTP Range 协议非法（状态、Content-Range、偏移等不一致）。
+    /// Invalid HTTP range semantics or headers.
     InvalidRange = 114,
-    /// 本地文件不存在（常见于上传源文件丢失）。
+    /// Local file does not exist.
     FileNotFound = 115,
-    /// 文件校验失败（例如签名/摘要不匹配）。
+    /// File checksum/signature does not match expected value.
     ChecksumMismatch = 116,
-    /// 任务当前状态不允许该操作（例如 resume 非 paused 任务）。
+    /// Current task state does not allow requested operation.
     InvalidTaskState = 117,
-    /// 内部锁被 poison，无法安全读取/写入共享状态。
+    /// Internal lock is poisoned.
     LockPoisoned = 118,
-    /// 构建内置 HTTP 客户端失败。
+    /// Failed to build internal HTTP client.
     HttpClientBuildFailed = 119,
 }
 
+/// Library error type returned by most public APIs.
 #[derive(Debug, Clone)]
 pub struct MeowError {
-    /// [InnerErrorCode]
+    /// Numeric error code, usually mapped from [`InnerErrorCode`].
     code: i32,
+    /// Human-readable error message.
     msg: String,
+    /// Optional chained source error.
     source: Option<Arc<dyn StdError + Send + Sync>>,
 }
 
 impl MeowError {
+    /// Creates a new error with raw numeric code and message.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rusty_cat::api::MeowError;
+    ///
+    /// let err = MeowError::new(9999, "custom failure".to_string());
+    /// assert_eq!(err.code(), 9999);
+    /// ```
     pub fn new(code: i32, msg: String) -> Self {
         crate::log::emit_lazy(|| {
             crate::log::Log::debug("error", format!("MeowError::new code={} msg={}", code, msg))
@@ -64,14 +81,44 @@ impl MeowError {
         }
     }
 
+    /// Returns numeric error code.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rusty_cat::api::{InnerErrorCode, MeowError};
+    ///
+    /// let err = MeowError::from_code1(InnerErrorCode::ClientClosed);
+    /// assert_eq!(err.code(), InnerErrorCode::ClientClosed as i32);
+    /// ```
     pub fn code(&self) -> i32 {
         self.code
     }
 
+    /// Returns error message as an owned `String`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rusty_cat::api::{InnerErrorCode, MeowError};
+    ///
+    /// let err = MeowError::from_code_str(InnerErrorCode::InvalidRange, "bad range");
+    /// assert_eq!(err.msg(), "bad range".to_string());
+    /// ```
     pub fn msg(&self) -> String {
         self.msg.clone()
     }
 
+    /// Creates an error from [`InnerErrorCode`] with empty message.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rusty_cat::api::{InnerErrorCode, MeowError};
+    ///
+    /// let err = MeowError::from_code1(InnerErrorCode::ParameterEmpty);
+    /// assert_eq!(err.code(), InnerErrorCode::ParameterEmpty as i32);
+    /// ```
     pub fn from_code1(code: InnerErrorCode) -> Self {
         crate::log::emit_lazy(|| {
             crate::log::Log::debug("error", format!("MeowError::from_code1 code={:?}", code))
@@ -83,6 +130,16 @@ impl MeowError {
         }
     }
 
+    /// Creates an error from [`InnerErrorCode`] and message.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rusty_cat::api::{InnerErrorCode, MeowError};
+    ///
+    /// let err = MeowError::from_code(InnerErrorCode::EnqueueError, "enqueue failed".to_string());
+    /// assert_eq!(err.code(), InnerErrorCode::EnqueueError as i32);
+    /// ```
     pub fn from_code(code: InnerErrorCode, msg: String) -> Self {
         crate::log::emit_lazy(|| {
             crate::log::Log::debug(
@@ -97,6 +154,16 @@ impl MeowError {
         }
     }
 
+    /// Creates an error from [`InnerErrorCode`] and `&str` message.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rusty_cat::api::{InnerErrorCode, MeowError};
+    ///
+    /// let err = MeowError::from_code_str(InnerErrorCode::TaskNotFound, "unknown id");
+    /// assert_eq!(err.code(), InnerErrorCode::TaskNotFound as i32);
+    /// ```
     pub fn from_code_str(code: InnerErrorCode, msg: &str) -> Self {
         crate::log::emit_lazy(|| {
             crate::log::Log::debug(
@@ -111,6 +178,19 @@ impl MeowError {
         }
     }
 
+    /// Creates an error with source chaining.
+    ///
+    /// Use this helper to preserve original low-level errors.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rusty_cat::api::{InnerErrorCode, MeowError};
+    ///
+    /// let source = std::io::Error::other("disk error");
+    /// let err = MeowError::from_source(InnerErrorCode::IoError, "upload failed", source);
+    /// assert_eq!(err.code(), InnerErrorCode::IoError as i32);
+    /// ```
     pub fn from_source<E>(code: InnerErrorCode, msg: impl Into<String>, source: E) -> Self
     where
         E: StdError + Send + Sync + 'static,
