@@ -1,7 +1,7 @@
 use crate::file_transfer_record::FileTransferRecord;
+use crate::ids::TaskId;
 use crate::inner::group_state::RecordEntry;
 use crate::inner::scheduler_state::SchedulerState;
-use crate::ids::TaskId;
 use crate::inner::task_callbacks::{CompleteCb, ProgressCb};
 use crate::transfer_status::TransferStatus;
 use std::panic::{catch_unwind, AssertUnwindSafe};

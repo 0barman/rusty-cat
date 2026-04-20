@@ -177,12 +177,16 @@ async fn pause_then_resume_keeps_same_task_id_and_finishes() {
     let task = DownloadPounceBuilder::new("payload.bin", &path, 4, url, Method::GET).build();
     // 入队并持有 task_id，后续将使用同一个 id 做 pause/resume。
     let task_id = client
-        .enqueue(task, move |record: FileTransferRecord| {
-            statuses_for_cb
-                .lock()
-                .expect("lock statuses")
-                .push(record.status().clone());
-        }, Some(|_, _| {}))
+        .enqueue(
+            task,
+            move |record: FileTransferRecord| {
+                statuses_for_cb
+                    .lock()
+                    .expect("lock statuses")
+                    .push(record.status().clone());
+            },
+            |_, _| {},
+        )
         .await
         .expect("enqueue task");
 

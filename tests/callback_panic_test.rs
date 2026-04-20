@@ -79,11 +79,15 @@ async fn task_callback_panic_does_not_break_scheduler() {
     )
     .build();
     client
-        .enqueue(task, move |_record: FileTransferRecord| {
-            if panic_flag.swap(false, Ordering::AcqRel) {
-                panic!("task progress callback panic in test");
-            }
-        }, Some(|_, _| {}))
+        .enqueue(
+            task,
+            move |_record: FileTransferRecord| {
+                if panic_flag.swap(false, Ordering::AcqRel) {
+                    panic!("task progress callback panic in test");
+                }
+            },
+            |_, _| {},
+        )
         .await
         .expect("enqueue task");
 
@@ -131,12 +135,16 @@ async fn global_callback_panic_does_not_break_scheduler() {
     )
     .build();
     client
-        .enqueue(task, move |record: FileTransferRecord| {
-            statuses_for_task
-                .lock()
-                .expect("lock statuses")
-                .push(record.status().clone());
-        }, Some(|_, _| {}))
+        .enqueue(
+            task,
+            move |record: FileTransferRecord| {
+                statuses_for_task
+                    .lock()
+                    .expect("lock statuses")
+                    .push(record.status().clone());
+            },
+            |_, _| {},
+        )
         .await
         .expect("enqueue task");
 
@@ -185,11 +193,11 @@ async fn complete_callback_panic_does_not_break_scheduler() {
                     .expect("lock statuses")
                     .push(record.status().clone());
             },
-            Some(move |_, _| {
+            move |_, _| {
                 if panic_flag.swap(false, Ordering::AcqRel) {
                     panic!("complete callback panic in test");
                 }
-            }),
+            },
         )
         .await
         .expect("enqueue task");

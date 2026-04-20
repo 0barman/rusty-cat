@@ -34,6 +34,10 @@ pub(crate) async fn calculate_sign(file: &File) -> Result<String, MeowError> {
     Ok(format!("{:x}", digest))
 }
 
+pub(crate) fn calculate_sign_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", md5::compute(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::calculate_sign;

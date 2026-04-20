@@ -1,6 +1,7 @@
 use crate::direction::Direction;
 use crate::http_breakpoint::BreakpointUpload;
 use crate::pounce_task::PounceTask;
+use crate::upload_source::UploadSource;
 use reqwest::header::HeaderMap;
 use reqwest::Method;
 use std::io;
@@ -11,8 +12,8 @@ use std::sync::Arc;
 pub struct UploadPounceBuilder {
     /// Display file name used in logs and callbacks.
     file_name: String,
-    /// Source local file path.
-    file_path: PathBuf,
+    /// Upload byte source.
+    upload_source: UploadSource,
     /// Chunk size in bytes for each upload request.
     ///
     /// Effective range: `>= 1`; zero is normalized to default (1 MiB).
@@ -29,6 +30,10 @@ pub struct UploadPounceBuilder {
     ///
     /// Effective range: `>= 0`; `0` means "do not retry".
     max_chunk_retries: u32,
+    /// Maximum retry count after the first failed upload prepare (`BreakpointUpload::prepare`).
+    ///
+    /// Effective range: `>= 0`; `0` means "do not retry prepare".
+    max_upload_prepare_retries: u32,
 }
 
 impl UploadPounceBuilder {
@@ -49,13 +54,32 @@ impl UploadPounceBuilder {
     pub fn new(file_name: impl Into<String>, file_path: impl AsRef<Path>, chunk_size: u64) -> Self {
         Self {
             file_name: file_name.into(),
-            file_path: file_path.as_ref().to_path_buf(),
+            upload_source: UploadSource::File(file_path.as_ref().to_path_buf()),
             chunk_size: PounceTask::normalized_chunk_size(chunk_size),
             url: String::new(),
             method: Method::POST,
             headers: HeaderMap::new(),
             breakpoint_upload: None,
             max_chunk_retries: PounceTask::DEFAULT_MAX_CHUNK_RETRIES,
+            max_upload_prepare_retries: PounceTask::DEFAULT_MAX_UPLOAD_PREPARE_RETRIES,
+        }
+    }
+
+    /// Creates a new upload builder from in-memory bytes.
+    ///
+    /// The payload is moved into `Arc<Vec<u8>>` to avoid extra copies when task
+    /// values are cloned across runtime layers.
+    pub fn from_bytes(file_name: impl Into<String>, bytes: Vec<u8>, chunk_size: u64) -> Self {
+        Self {
+            file_name: file_name.into(),
+            upload_source: UploadSource::Bytes(Arc::new(bytes)),
+            chunk_size: PounceTask::normalized_chunk_size(chunk_size),
+            url: String::new(),
+            method: Method::POST,
+            headers: HeaderMap::new(),
+            breakpoint_upload: None,
+            max_chunk_retries: PounceTask::DEFAULT_MAX_CHUNK_RETRIES,
+            max_upload_prepare_retries: PounceTask::DEFAULT_MAX_UPLOAD_PREPARE_RETRIES,
         }
     }
 
@@ -85,7 +109,15 @@ impl UploadPounceBuilder {
     ///     .with_file_path("./new-path/a.bin");
     /// ```
     pub fn with_file_path(mut self, path: impl AsRef<Path>) -> Self {
-        self.file_path = path.as_ref().to_path_buf();
+        self.upload_source = UploadSource::File(path.as_ref().to_path_buf());
+        self
+    }
+
+    /// Sets upload source as in-memory bytes.
+    ///
+    /// This replaces previously configured file path source, if any.
+    pub fn with_bytes(mut self, bytes: Vec<u8>) -> Self {
+        self.upload_source = UploadSource::Bytes(Arc::new(bytes));
         self
     }
 
@@ -159,11 +191,29 @@ impl UploadPounceBuilder {
         self
     }
 
-    /// Builds upload [`PounceTask`] and derives `total_size` from file metadata.
+    /// Configures max retry attempts after the first failed upload prepare (default: `3`).
+    ///
+    /// Applies only to the upload prepare stage (`BreakpointUpload::prepare`), not chunk transfer.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rusty_cat::api::UploadPounceBuilder;
+    ///
+    /// let _builder = UploadPounceBuilder::new("a.bin", "./a.bin", 1024)
+    ///     .with_max_upload_prepare_retries(5);
+    /// ```
+    pub fn with_max_upload_prepare_retries(mut self, retries: u32) -> Self {
+        self.max_upload_prepare_retries =
+            PounceTask::normalized_max_upload_prepare_retries(retries);
+        self
+    }
+
+    /// Builds upload [`PounceTask`].
     ///
     /// # Errors
     ///
-    /// Returns `io::Error` if metadata cannot be read from `file_path`.
+    /// Returns `io::Error` if metadata cannot be read from file-path source.
     ///
     /// # Examples
     ///
@@ -177,11 +227,15 @@ impl UploadPounceBuilder {
     /// # Ok::<(), std::io::Error>(())
     /// ```
     pub fn build(self) -> io::Result<PounceTask> {
-        let total_size = std::fs::metadata(&self.file_path)?.len();
+        let (file_path, total_size) = match &self.upload_source {
+            UploadSource::File(path) => (path.clone(), std::fs::metadata(path)?.len()),
+            UploadSource::Bytes(bytes) => (PathBuf::from(&self.file_name), bytes.len() as u64),
+        };
         Ok(PounceTask {
             direction: Direction::Upload,
             file_name: self.file_name,
-            file_path: self.file_path,
+            file_path,
+            upload_source: Some(self.upload_source),
             total_size,
             chunk_size: self.chunk_size,
             url: self.url,
@@ -192,6 +246,7 @@ impl UploadPounceBuilder {
             breakpoint_download: None,
             breakpoint_download_http: None,
             max_chunk_retries: self.max_chunk_retries,
+            max_upload_prepare_retries: self.max_upload_prepare_retries,
         })
     }
 }

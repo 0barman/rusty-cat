@@ -3,9 +3,9 @@
 //! - The executor handles scheduling, chunk I/O, retries, progress, and state.
 //! - Protocol plugins handle business-specific request/response semantics.
 
-use async_trait::async_trait;
 use crate::error::{InnerErrorCode, MeowError};
 use crate::transfer_task::TransferTask;
+use async_trait::async_trait;
 
 pub use crate::download_trait::{BreakpointDownload, DownloadHeadCtx, DownloadRangeGetCtx};
 pub use crate::upload_trait::{BreakpointUpload, UploadChunkCtx, UploadPrepareCtx};

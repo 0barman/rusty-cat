@@ -38,13 +38,17 @@ async fn test_upload() {
         .build()
         .expect("build upload task");
     client
-        .enqueue(task, move |record: FileTransferRecord| {
-            println!("upload progress: {:?}", record);
-            statuses_for_cb
-                .lock()
-                .expect("lock statuses")
-                .push(record.status().clone());
-        }, Some(|_, _| {}))
+        .enqueue(
+            task,
+            move |record: FileTransferRecord| {
+                println!("upload progress: {:?}", record);
+                statuses_for_cb
+                    .lock()
+                    .expect("lock statuses")
+                    .push(record.status().clone());
+            },
+            |_, _| {},
+        )
         .await
         .expect("enqueue upload task");
 

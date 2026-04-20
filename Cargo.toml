@@ -1,6 +1,6 @@
 [package]
 name = "rusty-cat"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Async HTTP client for resumable file upload and download."
 license = "MIT"
@@ -31,9 +31,14 @@ md5 = "0.7"
 
 [dev-dependencies]
 async-trait = "0.1.89"
+criterion = { version = "0.5.1", features = ["html_reports"] }
 # 集成测试里使用 tokio::time::sleep；库代码本身不需要 time feature
 tokio = { version = "1.50.0", default-features = false, features = [
     "rt-multi-thread",
     "macros",
     "time",
 ] }
+
+[[bench]]
+name = "transfer_hotspots"
+harness = false

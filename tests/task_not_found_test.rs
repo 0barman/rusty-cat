@@ -18,7 +18,7 @@ async fn cancel_unknown_task_returns_task_not_found() {
     )
     .build();
     let task_id = client
-        .enqueue(task, |_record: FileTransferRecord| {}, Some(|_, _| {}))
+        .enqueue(task, |_record: FileTransferRecord| {}, |_, _| {})
         .await
         .expect("enqueue");
 
@@ -51,7 +51,7 @@ async fn pause_unknown_task_returns_task_not_found() {
     )
     .build();
     let task_id = client
-        .enqueue(task, |_record: FileTransferRecord| {}, Some(|_, _| {}))
+        .enqueue(task, |_record: FileTransferRecord| {}, |_, _| {})
         .await
         .expect("enqueue");
 
@@ -81,7 +81,7 @@ async fn resume_unknown_task_returns_task_not_found() {
     )
     .build();
     let task_id = client
-        .enqueue(task, |_record: FileTransferRecord| {}, Some(|_, _| {}))
+        .enqueue(task, |_record: FileTransferRecord| {}, |_, _| {})
         .await
         .expect("enqueue");
 

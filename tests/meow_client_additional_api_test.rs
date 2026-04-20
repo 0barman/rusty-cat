@@ -139,7 +139,7 @@ async fn upload_file_deleted_after_build_hits_file_not_found_branch() {
 
     let client = MeowClient::new(MeowConfig::new(1, 1));
     let err = client
-        .enqueue(task, |_record: FileTransferRecord| {}, Some(|_, _| {}))
+        .enqueue(task, |_record: FileTransferRecord| {}, |_, _| {})
         .await
         .expect_err("enqueue should fail due to missing source");
     assert_eq!(err.code(), InnerErrorCode::FileNotFound as i32);
@@ -174,7 +174,7 @@ async fn task_and_listener_id_debug_format_paths_are_observable() {
     )
     .build();
     let task_id = client
-        .enqueue(task, |_record: FileTransferRecord| {}, Some(|_, _| {}))
+        .enqueue(task, |_record: FileTransferRecord| {}, |_, _| {})
         .await
         .expect("enqueue task for id debug");
     let task_text = format!("{task_id:?}");

@@ -11,7 +11,9 @@ use crate::transfer_status::TransferStatus;
 use crate::transfer_task::TransferTask;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) async fn try_start_next(
@@ -42,8 +44,16 @@ pub(crate) async fn try_start_next(
             };
             state.queued_set_mut().remove(&key);
 
+            if state.paused_set().contains(&key) {
+                crate::meow_flow_log!("scheduler", "skip key paused (requeue): key={:?}", key);
+                state.queued_mut().push_back(key.clone());
+                state.queued_set_mut().insert(key.clone());
+                continue;
+            }
             if state.active().contains_key(&key) {
                 crate::meow_flow_log!("scheduler", "skip key already active: key={:?}", key);
+                state.queued_mut().push_back(key.clone());
+                state.queued_set_mut().insert(key.clone());
                 continue;
             }
             let Some(group) = state.groups().get(&key) else {
@@ -160,22 +170,66 @@ async fn run_group(
         start_offset
     );
     let task = TransferTask::from_inner(&inner);
-    let offset_ret = executor.prepare(&task, start_offset).await;
+    // 上传 `prepare` 已在 `DefaultHttpTransfer::upload_prepare` 内按 `max_upload_prepare_retries` 重试；
+    // 此处仅对下载 `prepare`（HEAD 等）做外层连接级重试，避免与上传语义叠加或改写错误码。
+    let max_prep_retries = match inner.direction() {
+        Direction::Upload => 0,
+        Direction::Download => inner.max_chunk_retries(),
+    };
+    let mut prep_attempt: u32 = 0;
     let PrepareOutcome {
         next_offset,
         total_size: prep_total,
-    } = match offset_ret {
-        Ok(v) => v,
-        Err(e) => {
-            crate::meow_flow_log!(
-                "run_group",
-                "prepare failed: key={:?} task_id={:?} err={}",
-                key,
-                inner.task_id(),
-                e
-            );
-            let _ = worker_tx.send(WorkerEvent::Failed { key, error: e }).await;
+    } = loop {
+        if cancel.is_cancelled() {
+            let _ = worker_tx
+                .send(WorkerEvent::Canceled { key: key.clone() })
+                .await;
             return;
+        }
+        match executor.prepare(&task, start_offset).await {
+            Ok(v) => break v,
+            Err(e) => {
+                if cancel.is_cancelled() {
+                    let _ = worker_tx
+                        .send(WorkerEvent::Canceled { key: key.clone() })
+                        .await;
+                    return;
+                }
+                let retryable = matches!(inner.direction(), Direction::Download)
+                    && crate::inner::exec_impl::retry::is_connection_layer_retryable(&e);
+                let reached_limit = prep_attempt >= max_prep_retries;
+                if !retryable || reached_limit {
+                    crate::meow_flow_log!(
+                        "run_group",
+                        "prepare failed: key={:?} task_id={:?} err={}",
+                        key,
+                        inner.task_id(),
+                        e
+                    );
+                    let _ = worker_tx.send(WorkerEvent::Failed { key, error: e }).await;
+                    return;
+                }
+                let delay_ms =
+                    crate::inner::exec_impl::retry::calc_backoff_with_jitter_ms(prep_attempt);
+                crate::meow_flow_log!(
+                    "run_group",
+                    "prepare retry scheduled: key={:?} task_id={:?} attempt={} delay_ms={} err={}",
+                    key,
+                    inner.task_id(),
+                    prep_attempt + 1,
+                    delay_ms,
+                    e
+                );
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        let _ = worker_tx.send(WorkerEvent::Canceled { key: key.clone() }).await;
+                        return;
+                    }
+                    _ = sleep(Duration::from_millis(delay_ms)) => {}
+                }
+                prep_attempt += 1;
+            }
         }
     };
     let mut offset = next_offset;

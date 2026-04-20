@@ -9,9 +9,10 @@ use crate::direction::Direction;
 use crate::error::{InnerErrorCode, MeowError};
 use crate::http_breakpoint::{BreakpointDownload, BreakpointDownloadHttpConfig, BreakpointUpload};
 use crate::ids::TaskId;
-use crate::inner::sign::calculate_sign;
+use crate::inner::sign::{calculate_sign, calculate_sign_bytes};
 use crate::inner::UniqueId;
 use crate::pounce_task::PounceTask;
+use crate::upload_source::UploadSource;
 
 /// 调度与 [`crate::transfer_executor_trait::TransferTrait`] 视图的内部任务；不对外暴露构造。
 #[derive(Clone)]
@@ -20,6 +21,7 @@ pub(crate) struct InnerTask {
     file_sign: String,
     file_name: String,
     file_path: PathBuf,
+    upload_source: Option<UploadSource>,
     direction: Direction,
     total_size: u64,
     chunk_size: u64,
@@ -31,6 +33,8 @@ pub(crate) struct InnerTask {
     breakpoint_download_http: BreakpointDownloadHttpConfig,
     /// 每个分片的最大重试次数（仅作用于 chunk 传输失败）。
     max_chunk_retries: u32,
+    /// 上传 prepare（`BreakpointUpload::prepare`）首次失败后的最大重试次数。
+    max_upload_prepare_retries: u32,
     http_client: Option<reqwest::Client>,
 }
 
@@ -49,6 +53,7 @@ impl InnerTask {
             direction,
             file_name,
             file_path,
+            upload_source,
             total_size,
             chunk_size,
             url,
@@ -59,46 +64,74 @@ impl InnerTask {
             breakpoint_download,
             breakpoint_download_http,
             max_chunk_retries,
+            max_upload_prepare_retries,
         } = pounce;
+
+        let upload_source = upload_source.or_else(|| {
+            if direction == Direction::Upload {
+                Some(UploadSource::File(file_path.clone()))
+            } else {
+                None
+            }
+        });
 
         let file_sign = match direction {
             Direction::Upload => {
-                crate::meow_flow_log!(
-                    "inner_task",
-                    "build upload task: task_id={:?} path={}",
-                    task_id,
-                    file_path.display()
-                );
-                let file = File::open(&file_path).await.map_err(|e| {
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        crate::meow_flow_log!(
-                            "inner_task",
-                            "upload source missing: task_id={:?} path={} err={}",
-                            task_id,
-                            file_path.display(),
-                            e
-                        );
-                        MeowError::from_source(
-                            InnerErrorCode::FileNotFound,
-                            format!("upload source file not found: {}", file_path.display()),
-                            e,
-                        )
-                    } else {
-                        crate::meow_flow_log!(
-                            "inner_task",
-                            "upload source open failed: task_id={:?} path={} err={}",
-                            task_id,
-                            file_path.display(),
-                            e
-                        );
-                        MeowError::from_source(
-                            InnerErrorCode::IoError,
-                            format!("open upload source failed: {}", file_path.display()),
-                            e,
-                        )
-                    }
+                let source = upload_source.as_ref().ok_or_else(|| {
+                    MeowError::from_code_str(
+                        InnerErrorCode::ParameterEmpty,
+                        "upload task missing upload source",
+                    )
                 })?;
-                calculate_sign(&file).await?
+                match source {
+                    UploadSource::File(path) => {
+                        crate::meow_flow_log!(
+                            "inner_task",
+                            "build upload task from file: task_id={:?} path={}",
+                            task_id,
+                            path.display()
+                        );
+                        let file = File::open(path).await.map_err(|e| {
+                            if e.kind() == std::io::ErrorKind::NotFound {
+                                crate::meow_flow_log!(
+                                    "inner_task",
+                                    "upload source missing: task_id={:?} path={} err={}",
+                                    task_id,
+                                    path.display(),
+                                    e
+                                );
+                                MeowError::from_source(
+                                    InnerErrorCode::FileNotFound,
+                                    format!("upload source file not found: {}", path.display()),
+                                    e,
+                                )
+                            } else {
+                                crate::meow_flow_log!(
+                                    "inner_task",
+                                    "upload source open failed: task_id={:?} path={} err={}",
+                                    task_id,
+                                    path.display(),
+                                    e
+                                );
+                                MeowError::from_source(
+                                    InnerErrorCode::IoError,
+                                    format!("open upload source failed: {}", path.display()),
+                                    e,
+                                )
+                            }
+                        })?;
+                        calculate_sign(&file).await?
+                    }
+                    UploadSource::Bytes(bytes) => {
+                        crate::meow_flow_log!(
+                            "inner_task",
+                            "build upload task from bytes: task_id={:?} len={}",
+                            task_id,
+                            bytes.len()
+                        );
+                        calculate_sign_bytes(bytes.as_slice())
+                    }
+                }
             }
             Direction::Download => {
                 crate::meow_flow_log!(
@@ -116,13 +149,14 @@ impl InnerTask {
         let breakpoint_download_http = breakpoint_download_http.unwrap_or(default_download_http);
         crate::meow_flow_log!(
             "inner_task",
-            "from_pounce resolved: task_id={:?} dir={:?} file={} chunk={} total={} max_chunk_retries={}",
+            "from_pounce resolved: task_id={:?} dir={:?} file={} chunk={} total={} max_chunk_retries={} max_upload_prepare_retries={}",
             task_id,
             direction,
             file_name,
             chunk_size,
             total_size,
-            max_chunk_retries
+            max_chunk_retries,
+            max_upload_prepare_retries
         );
 
         Ok(Self {
@@ -130,6 +164,7 @@ impl InnerTask {
             file_sign,
             file_name,
             file_path,
+            upload_source,
             direction,
             total_size,
             chunk_size,
@@ -140,6 +175,7 @@ impl InnerTask {
             breakpoint_download,
             breakpoint_download_http,
             max_chunk_retries,
+            max_upload_prepare_retries,
             http_client,
         })
     }
@@ -165,6 +201,10 @@ impl InnerTask {
 
     pub(crate) fn file_path(&self) -> &Path {
         &self.file_path
+    }
+
+    pub(crate) fn upload_source(&self) -> Option<&UploadSource> {
+        self.upload_source.as_ref()
     }
 
     pub(crate) fn direction(&self) -> Direction {
@@ -205,6 +245,10 @@ impl InnerTask {
 
     pub(crate) fn max_chunk_retries(&self) -> u32 {
         self.max_chunk_retries
+    }
+
+    pub(crate) fn max_upload_prepare_retries(&self) -> u32 {
+        self.max_upload_prepare_retries
     }
 
     pub(crate) fn http_client_ref(&self) -> Option<&reqwest::Client> {

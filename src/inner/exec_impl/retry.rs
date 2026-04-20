@@ -41,6 +41,24 @@ pub(crate) enum ChunkRetryResult {
 /// 1) 将重试策略封装在独立模块，降低对 `exec.rs` 的耦合；
 /// 2) 对外只暴露“成功/取消/失败”三态，简化上层流程控制；
 /// 3) 在每次重试决策都打详细日志，便于线上排障。
+///
+/// # 参数说明
+///
+/// - **`executor`**：当前任务使用的传输后端（实现 [`TransferTrait`]），负责实际 HTTP/IO。
+/// - **`task`**：只读任务快照（路径、URL、分片大小、协议实现等），单次分片传输的输入上下文。
+/// - **`key`**：调度器中的任务键（方向 + 去重标识），用于日志关联与排障。
+/// - **`cancel`**：工作协程的取消令牌；在每次发起分片前以及退避等待期间会监听，
+///   取值上为有效令牌即可；取消后返回 [`ChunkRetryResult::Cancelled`]。
+/// - **`offset`**：本分片在文件中的起始字节偏移；有效范围为 **`0..task.total_size()`**
+///   （含已传完边界：若 `offset >= total` 应由上层结束循环，此处仍可能收到合法边界值）。
+/// - **`chunk_size`**：本分片计划读取/上传的字节数；通常来自任务的 `chunk_size`，
+///   有效范围为 **`>= 1`**（任务构建阶段已将 `0` 归一化）；与 `known_total` 共同决定末片长度。
+/// - **`known_total`**：当前已知的文件总字节数；来自 prepare 或最近成功的分片结果，
+///   有效范围为 **`0`**（未知时由上层回退）或 **`> 0`** 且应与远端/本地总大小一致，
+///   用于末片裁剪与完成判定。
+/// - **`max_chunk_retries`**：在**首次尝试失败之后**允许的最大重试次数；语义与退避逻辑绑定：
+///   - **`0`**：不重试，任意失败立即返回 [`ChunkRetryResult::Failed`]
+///   - **`N > 0`**：最多再重试 `N` 次（总尝试次数上界为 **`1 + N`**）
 pub(crate) async fn transfer_chunk_with_retry(
     executor: &Arc<dyn TransferTrait>,
     task: &TransferTask,
@@ -88,8 +106,21 @@ pub(crate) async fn transfer_chunk_with_retry(
                 return ChunkRetryResult::Done(outcome);
             }
             Err(err) => {
+                // pause/cancel 可能在 in-flight 请求返回后才落到令牌上；此时错误常为 HttpError
+                //（底层 Canceled/reset），应优先走取消分支而不是按网络错误重试或失败。
+                if cancel.is_cancelled() {
+                    crate::meow_flow_log!(
+                        "chunk_retry",
+                        "cancel after chunk error: key={:?} offset={} attempt={} err={}",
+                        key,
+                        offset,
+                        attempt,
+                        err
+                    );
+                    return ChunkRetryResult::Cancelled;
+                }
                 // 决策是否可重试：由常量边界 + 剩余次数共同决定。
-                let retryable = is_chunk_retryable(&err);
+                let retryable = is_transport_retryable(&err);
                 let reached_limit = attempt >= max_chunk_retries;
                 if !retryable || reached_limit {
                     crate::meow_flow_log!(
@@ -139,20 +170,29 @@ pub(crate) async fn transfer_chunk_with_retry(
     }
 }
 
-/// 判断分片错误是否可重试。
+/// 判断网络/HTTP 层瞬时错误是否可按与分片相同的策略重试（prepare / chunk 共用）。
 ///
 /// 目前按“错误码边界常量”判定；后续如需动态配置可在此处平滑接入配置表。
-fn is_chunk_retryable(err: &MeowError) -> bool {
+pub(crate) fn is_transport_retryable(err: &MeowError) -> bool {
     RETRYABLE_CHUNK_ERROR_CODES
         .iter()
         .any(|code| *code == err.code())
+}
+
+/// 仅连接/请求栈层面的错误（[`InnerErrorCode::HttpError`]），用于 `prepare` 外层的有限重试：
+/// 避免把业务态的 [`InnerErrorCode::ResponseStatusError`]（如上传 prepare 返回 5xx）当成可重试，
+/// 否则在单响应脚本/服务端已关连接时会退化成下一次尝试的 `HttpError`，掩盖真实错误码。
+pub(crate) fn is_connection_layer_retryable(err: &MeowError) -> bool {
+    err.code() == InnerErrorCode::HttpError as i32
 }
 
 /// 计算退避时长（指数退避 + 抖动）：
 /// - base: 200ms
 /// - max: 5000ms
 /// - jitter: ±20%
-fn calc_backoff_with_jitter_ms(attempt: u32) -> u64 {
+///
+/// `attempt` 为从 0 起的重试轮次索引，与分片重试模块内语义一致。
+pub(crate) fn calc_backoff_with_jitter_ms(attempt: u32) -> u64 {
     // 指数退避：base * 2^attempt，并限制上限。
     let exp = CHUNK_RETRY_BASE_DELAY_MS.saturating_mul(1u64 << attempt.min(20));
     let capped = exp.min(CHUNK_RETRY_MAX_DELAY_MS);

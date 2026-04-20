@@ -241,12 +241,16 @@ async fn custom_upload_breakpoint_exercises_transfer_task_getters() {
         .build()
         .expect("build upload task");
     client
-        .enqueue(task, move |record: FileTransferRecord| {
-            statuses_cb
-                .lock()
-                .expect("lock statuses")
-                .push(record.status().clone());
-        }, Some(|_, _| {}))
+        .enqueue(
+            task,
+            move |record: FileTransferRecord| {
+                statuses_cb
+                    .lock()
+                    .expect("lock statuses")
+                    .push(record.status().clone());
+            },
+            |_, _| {},
+        )
         .await
         .expect("enqueue upload");
 
@@ -290,12 +294,16 @@ async fn custom_download_breakpoint_exercises_transfer_task_getters() {
     .with_breakpoint_download(protocol)
     .build();
     client
-        .enqueue(task, move |record: FileTransferRecord| {
-            statuses_cb
-                .lock()
-                .expect("lock statuses")
-                .push(record.status().clone());
-        }, Some(|_, _| {}))
+        .enqueue(
+            task,
+            move |record: FileTransferRecord| {
+                statuses_cb
+                    .lock()
+                    .expect("lock statuses")
+                    .push(record.status().clone());
+            },
+            |_, _| {},
+        )
         .await
         .expect("enqueue download");
 

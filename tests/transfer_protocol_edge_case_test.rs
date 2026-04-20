@@ -44,8 +44,8 @@ async fn wait_terminal_status(statuses: Arc<Mutex<Vec<TransferStatus>>>) -> Tran
 async fn upload_prepare_http_non_success_hits_response_status_error() {
     // 场景说明：
     // 1) 上传 prepare 请求返回 HTTP 500；
-    // 2) 任务应直接失败且错误码为 ResponseStatusError；
-    // 3) 覆盖 upload_prepare 的非成功状态分支。
+    // 2) 关闭 prepare 重试（脚本仅一条响应），任务应失败且错误码为 ResponseStatusError；
+    // 3) 覆盖 upload_prepare_once 的非成功状态分支。
     let server = dev_server::ScriptedServer::spawn_download(vec![
         "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbad"
             .to_string(),
@@ -58,15 +58,20 @@ async fn upload_prepare_http_non_success_hits_response_status_error() {
     let statuses_cb = statuses.clone();
     let task = UploadPounceBuilder::new("u.bin", &src, 1024)
         .with_url(format!("{}/upload/u.bin", server.base_url()))
+        .with_max_upload_prepare_retries(0)
         .build()
         .expect("build upload task");
     client
-        .enqueue(task, move |record: FileTransferRecord| {
-            statuses_cb
-                .lock()
-                .expect("lock statuses")
-                .push(record.status().clone());
-        }, Some(|_, _| {}))
+        .enqueue(
+            task,
+            move |record: FileTransferRecord| {
+                statuses_cb
+                    .lock()
+                    .expect("lock statuses")
+                    .push(record.status().clone());
+            },
+            |_, _| {},
+        )
         .await
         .expect("enqueue upload task");
 
@@ -103,12 +108,16 @@ async fn upload_prepare_invalid_json_hits_response_parse_error() {
         .build()
         .expect("build upload task");
     client
-        .enqueue(task, move |record: FileTransferRecord| {
-            statuses_cb
-                .lock()
-                .expect("lock statuses")
-                .push(record.status().clone());
-        }, Some(|_, _| {}))
+        .enqueue(
+            task,
+            move |record: FileTransferRecord| {
+                statuses_cb
+                    .lock()
+                    .expect("lock statuses")
+                    .push(record.status().clone());
+            },
+            |_, _| {},
+        )
         .await
         .expect("enqueue upload task");
 
@@ -149,12 +158,16 @@ async fn upload_prepare_completed_file_id_branch_finishes_without_chunk_http() {
         .build()
         .expect("build upload task");
     client
-        .enqueue(task, move |record: FileTransferRecord| {
-            statuses_cb
-                .lock()
-                .expect("lock statuses")
-                .push(record.status().clone());
-        }, Some(|_, _| {}))
+        .enqueue(
+            task,
+            move |record: FileTransferRecord| {
+                statuses_cb
+                    .lock()
+                    .expect("lock statuses")
+                    .push(record.status().clone());
+            },
+            |_, _| {},
+        )
         .await
         .expect("enqueue upload task");
 
@@ -191,12 +204,16 @@ async fn download_prepare_missing_content_length_hits_error_branch() {
     )
     .build();
     client
-        .enqueue(task, move |record: FileTransferRecord| {
-            statuses_cb
-                .lock()
-                .expect("lock statuses")
-                .push(record.status().clone());
-        }, Some(|_, _| {}))
+        .enqueue(
+            task,
+            move |record: FileTransferRecord| {
+                statuses_cb
+                    .lock()
+                    .expect("lock statuses")
+                    .push(record.status().clone());
+            },
+            |_, _| {},
+        )
         .await
         .expect("enqueue download task");
 
@@ -240,12 +257,16 @@ async fn download_prepare_local_larger_than_remote_hits_invalid_range_branch() {
     )
     .build();
     client
-        .enqueue(task, move |record: FileTransferRecord| {
-            statuses_cb
-                .lock()
-                .expect("lock statuses")
-                .push(record.status().clone());
-        }, Some(|_, _| {}))
+        .enqueue(
+            task,
+            move |record: FileTransferRecord| {
+                statuses_cb
+                    .lock()
+                    .expect("lock statuses")
+                    .push(record.status().clone());
+            },
+            |_, _| {},
+        )
         .await
         .expect("enqueue download task");
 
@@ -287,12 +308,16 @@ async fn download_chunk_total_changed_and_empty_body_error_branches() {
     )
     .build();
     client_a
-        .enqueue(task_a, move |record: FileTransferRecord| {
-            statuses_a_cb
-                .lock()
-                .expect("lock statuses a")
-                .push(record.status().clone());
-        }, Some(|_, _| {}))
+        .enqueue(
+            task_a,
+            move |record: FileTransferRecord| {
+                statuses_a_cb
+                    .lock()
+                    .expect("lock statuses a")
+                    .push(record.status().clone());
+            },
+            |_, _| {},
+        )
         .await
         .expect("enqueue task a");
     let terminal_a = wait_terminal_status(statuses_a).await;
@@ -322,12 +347,16 @@ async fn download_chunk_total_changed_and_empty_body_error_branches() {
     )
     .build();
     client_b
-        .enqueue(task_b, move |record: FileTransferRecord| {
-            statuses_b_cb
-                .lock()
-                .expect("lock statuses b")
-                .push(record.status().clone());
-        }, Some(|_, _| {}))
+        .enqueue(
+            task_b,
+            move |record: FileTransferRecord| {
+                statuses_b_cb
+                    .lock()
+                    .expect("lock statuses b")
+                    .push(record.status().clone());
+            },
+            |_, _| {},
+        )
         .await
         .expect("enqueue task b");
     let terminal_b = wait_terminal_status(statuses_b).await;

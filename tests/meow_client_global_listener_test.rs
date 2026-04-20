@@ -32,7 +32,7 @@ async fn wait_transfer_done(
 ) {
     let task = DownloadPounceBuilder::new("listener.bin", path, 2048, url, Method::GET).build();
     let _task_id = client
-        .enqueue(task, status_cb, Some(|_, _| {}))
+        .enqueue(task, status_cb, |_, _| {})
         .await
         .expect("enqueue listener test task");
 

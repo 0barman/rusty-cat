@@ -7,6 +7,7 @@ use reqwest::Method;
 
 use crate::direction::Direction;
 use crate::http_breakpoint::{BreakpointDownload, BreakpointDownloadHttpConfig, BreakpointUpload};
+use crate::upload_source::UploadSource;
 
 /// User-facing task input built by upload/download builders.
 ///
@@ -20,6 +21,8 @@ pub struct PounceTask {
     pub(crate) file_name: String,
     /// Local source/target path.
     pub(crate) file_path: PathBuf,
+    /// Upload-only source descriptor.
+    pub(crate) upload_source: Option<UploadSource>,
     /// Total file size in bytes (upload only at build time).
     pub(crate) total_size: u64,
     /// Chunk size in bytes.
@@ -44,6 +47,10 @@ pub struct PounceTask {
     ///
     /// Applies only to chunk transfer stage, not prepare stage.
     pub(crate) max_chunk_retries: u32,
+    /// Maximum retry count after the first failed upload `prepare` (`BreakpointUpload::prepare`).
+    ///
+    /// Used only for upload direction; download tasks carry the default but do not consult it.
+    pub(crate) max_upload_prepare_retries: u32,
 }
 
 impl fmt::Debug for PounceTask {
@@ -52,6 +59,7 @@ impl fmt::Debug for PounceTask {
             .field("direction", &self.direction)
             .field("file_name", &self.file_name)
             .field("file_path", &self.file_path)
+            .field("upload_source", &self.upload_source)
             .field("total_size", &self.total_size)
             .field("chunk_size", &self.chunk_size)
             .field("url", &self.url)
@@ -74,6 +82,10 @@ impl fmt::Debug for PounceTask {
             )
             .field("breakpoint_download_http", &self.breakpoint_download_http)
             .field("max_chunk_retries", &self.max_chunk_retries)
+            .field(
+                "max_upload_prepare_retries",
+                &self.max_upload_prepare_retries,
+            )
             .finish()
     }
 }
@@ -81,6 +93,9 @@ impl fmt::Debug for PounceTask {
 impl PounceTask {
     /// Default maximum retry count per chunk transfer.
     pub const DEFAULT_MAX_CHUNK_RETRIES: u32 = 3;
+
+    /// Default maximum retry count after the first failed upload prepare.
+    pub const DEFAULT_MAX_UPLOAD_PREPARE_RETRIES: u32 = 3;
 
     /// Normalizes chunk size input.
     ///
@@ -101,16 +116,20 @@ impl PounceTask {
         max_chunk_retries
     }
 
+    /// Normalizes upload prepare retry count input (same rules as chunk retries).
+    pub(crate) fn normalized_max_upload_prepare_retries(max_upload_prepare_retries: u32) -> u32 {
+        max_upload_prepare_retries
+    }
+
     /// Checks whether required task fields are missing/invalid.
     ///
     /// For upload, `total_size` must be greater than `0`.
     pub(crate) fn is_empty(&self) -> bool {
-        self.file_path.as_os_str().is_empty()
-            || self.file_name.is_empty()
+        self.file_name.is_empty()
             || self.url.is_empty()
             || match self.direction {
-                Direction::Upload => self.total_size == 0,
-                Direction::Download => false,
+                Direction::Upload => self.total_size == 0 || self.upload_source.is_none(),
+                Direction::Download => self.file_path.as_os_str().is_empty(),
             }
     }
 }

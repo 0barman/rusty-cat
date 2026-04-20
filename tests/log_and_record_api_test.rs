@@ -69,14 +69,18 @@ async fn file_transfer_record_getters_return_expected_values_from_callback() {
     )
     .build();
     client
-        .enqueue(task, move |record: FileTransferRecord| {
-            if matches!(
-                record.status(),
-                TransferStatus::Transmission | TransferStatus::Complete
-            ) {
-                *latest_for_cb.lock().expect("lock latest record") = Some(record);
-            }
-        }, Some(|_, _| {}))
+        .enqueue(
+            task,
+            move |record: FileTransferRecord| {
+                if matches!(
+                    record.status(),
+                    TransferStatus::Transmission | TransferStatus::Complete
+                ) {
+                    *latest_for_cb.lock().expect("lock latest record") = Some(record);
+                }
+            },
+            |_, _| {},
+        )
         .await
         .expect("enqueue getter task");
 
