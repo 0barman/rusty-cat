@@ -48,19 +48,27 @@ async fn second_enqueue_with_same_download_url_hits_duplicate_branch() {
     let task2 = DownloadPounceBuilder::new("dup.bin", &path2, 1024, url, Method::GET).build();
 
     client
-        .enqueue(task1, move |record: FileTransferRecord| {
-            s1.lock()
-                .expect("lock statuses1")
-                .push(record.status().clone());
-        }, Some(|_, _| {}))
+        .enqueue(
+            task1,
+            move |record: FileTransferRecord| {
+                s1.lock()
+                    .expect("lock statuses1")
+                    .push(record.status().clone());
+            },
+            |_, _| {},
+        )
         .await
         .expect("enqueue first task");
     client
-        .enqueue(task2, move |record: FileTransferRecord| {
-            s2.lock()
-                .expect("lock statuses2")
-                .push(record.status().clone());
-        }, Some(|_, _| {}))
+        .enqueue(
+            task2,
+            move |record: FileTransferRecord| {
+                s2.lock()
+                    .expect("lock statuses2")
+                    .push(record.status().clone());
+            },
+            |_, _| {},
+        )
         .await
         .expect("enqueue second task should still return task id");
 
@@ -108,7 +116,7 @@ async fn resume_without_pause_hits_invalid_task_state_branch() {
     )
     .build();
     let task_id = client
-        .enqueue(task, |_record: FileTransferRecord| {}, Some(|_, _| {}))
+        .enqueue(task, |_record: FileTransferRecord| {}, |_, _| {})
         .await
         .expect("enqueue task");
 

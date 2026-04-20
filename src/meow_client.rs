@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
-use crate::dflt::default_http_client::{default_breakpoint_arcs, DefaultHttpClient};
+use crate::dflt::default_http_transfer::{default_breakpoint_arcs, DefaultHttpTransfer};
 use crate::error::{InnerErrorCode, MeowError};
 use crate::file_transfer_record::FileTransferRecord;
 use crate::ids::{GlobalProgressListenerId, TaskId};
@@ -124,19 +124,19 @@ impl MeowClient {
             crate::meow_flow_log!("executor", "reuse existing executor");
             return Ok(exec);
         }
-        let default = DefaultHttpClient::try_with_http_timeouts(
+        let default_http_transfer = DefaultHttpTransfer::try_with_http_timeouts(
             self.config.http_timeout(),
             self.config.tcp_keepalive(),
         )?;
         crate::meow_flow_log!(
             "executor",
-            "initializing default HTTP client (timeout={:?}, tcp_keepalive={:?})",
+            "initializing DefaultHttpTransfer (timeout={:?}, tcp_keepalive={:?})",
             self.config.http_timeout(),
             self.config.tcp_keepalive()
         );
         let exec = Executor::new(
             self.config.clone(),
-            Arc::new(default),
+            Arc::new(default_http_transfer),
             self.global_progress_listener.clone(),
         )?;
         let _ = self.executor.set(exec);
@@ -341,7 +341,7 @@ impl MeowClient {
     ///
     /// - `task`: Built by upload/download task builders.
     /// - `progress_cb`: Per-task callback invoked with transfer progress.
-    /// - `complete_cb`: Optional callback fired once when task reaches
+    /// - `complete_cb`: Callback fired once when task reaches
     ///   [`crate::transfer_status::TransferStatus::Complete`]. The second
     ///   argument is provider-defined payload returned by upload protocol
     ///   `complete_upload`; download tasks usually receive `None`.
@@ -386,20 +386,20 @@ impl MeowClient {
     ///         |record| {
     ///             println!("status={:?} progress={:.2}", record.status(), record.progress());
     ///         },
-    ///         Some(|task_id, payload| {
+    ///         |task_id, payload| {
     ///             println!("task {task_id} completed, payload={payload:?}");
-    ///         }),
+    ///         },
     ///     )
     ///     .await?;
     /// println!("enqueued task: {task_id}");
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn enqueue<PCB,CCB>(
+    pub async fn enqueue<PCB, CCB>(
         &self,
         task: PounceTask,
         progress_cb: PCB,
-        complete_cb: Option<CCB>,
+        complete_cb: CCB,
     ) -> Result<TaskId, MeowError>
     where
         PCB: Fn(FileTransferRecord) + Send + Sync + 'static,
@@ -414,7 +414,7 @@ impl MeowClient {
         crate::meow_flow_log!("enqueue", "task={:?}", task);
 
         let progress: ProgressCb = Arc::new(progress_cb);
-        let complete: Option<CompleteCb> = complete_cb.map(|cb| Arc::new(cb) as CompleteCb);
+        let complete: Option<CompleteCb> = Some(Arc::new(complete_cb) as CompleteCb);
         let callbacks = TaskCallbacks::new(Some(progress), complete);
 
         let (def_up, def_down) = default_breakpoint_arcs();

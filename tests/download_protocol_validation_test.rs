@@ -66,12 +66,16 @@ async fn run_download_case(
     let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
     let statuses_cb = statuses.clone();
     client
-        .enqueue(task, move |record: FileTransferRecord| {
-            statuses_cb
-                .lock()
-                .expect("lock statuses in callback")
-                .push(record.status().clone());
-        }, Some(|_, _| {}))
+        .enqueue(
+            task,
+            move |record: FileTransferRecord| {
+                statuses_cb
+                    .lock()
+                    .expect("lock statuses in callback")
+                    .push(record.status().clone());
+            },
+            |_, _| {},
+        )
         .await
         .expect("enqueue download task");
 

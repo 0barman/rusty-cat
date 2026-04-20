@@ -1,6 +1,6 @@
-use async_trait::async_trait;
 use crate::http_breakpoint::UploadResumeInfo;
 use crate::{MeowError, TransferTask};
+use async_trait::async_trait;
 
 /// Context for upload prepare stage.
 #[derive(Debug, Clone, Copy)]

@@ -57,7 +57,8 @@ async fn complete_callback_receives_payload_from_upload_protocol() {
     fs::write(&upload_path, b"payload-upload-data").expect("write upload source fixture");
 
     let client = MeowClient::new(MeowConfig::new(1, 1));
-    let complete_calls: Arc<Mutex<Vec<(TaskId, Option<String>)>>> = Arc::new(Mutex::new(Vec::new()));
+    let complete_calls: Arc<Mutex<Vec<(TaskId, Option<String>)>>> =
+        Arc::new(Mutex::new(Vec::new()));
     let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
 
     let complete_calls_cb = complete_calls.clone();
@@ -80,12 +81,12 @@ async fn complete_callback_receives_payload_from_upload_protocol() {
                     .expect("lock statuses")
                     .push(record.status().clone());
             },
-            Some(move |id, data| {
+            move |id, data| {
                 complete_calls_cb
                     .lock()
                     .expect("lock complete calls")
                     .push((id, data));
-            }),
+            },
         )
         .await
         .expect("enqueue task");
@@ -104,7 +105,10 @@ async fn complete_callback_receives_payload_from_upload_protocol() {
 
     let calls = complete_calls.lock().expect("lock complete calls").clone();
     assert_eq!(calls.len(), 1, "complete callback should be fired once");
-    assert_eq!(calls[0].0, task_id, "complete callback task id should match");
+    assert_eq!(
+        calls[0].0, task_id,
+        "complete callback task id should match"
+    );
     assert_eq!(calls[0].1.as_deref(), Some(payload.as_str()));
 
     client.close().await.expect("close client");

@@ -1,5 +1,5 @@
-use reqwest::header::HeaderMap;
 use crate::{InnerErrorCode, MeowError, TransferTask};
+use reqwest::header::HeaderMap;
 
 /// Header merge context for download HEAD request.
 pub struct DownloadHeadCtx<'a> {
@@ -40,7 +40,9 @@ pub struct DownloadRangeGetCtx<'a> {
 /// # Examples
 ///
 /// ```no_run
-/// use rusty_cat::api::{BreakpointDownload, DownloadHeadCtx, DownloadRangeGetCtx, MeowError};
+/// use rusty_cat::api::{
+///     BreakpointDownload, DownloadHeadCtx, DownloadRangeGetCtx, MeowError, StandardRangeDownload,
+/// };
 ///
 /// #[derive(Default)]
 /// struct MyDownloadProtocol;
@@ -52,7 +54,7 @@ pub struct DownloadRangeGetCtx<'a> {
 ///
 ///     fn merge_range_get_headers(&self, ctx: DownloadRangeGetCtx<'_>) -> Result<(), MeowError> {
 ///         // Reuse default behavior or customize as needed.
-///         BreakpointDownload::merge_range_get_headers(self, ctx)
+///         StandardRangeDownload.merge_range_get_headers(ctx)
 ///     }
 /// }
 /// ```
@@ -72,7 +74,7 @@ pub trait BreakpointDownload: Send + Sync {
     /// use rusty_cat::api::{BreakpointDownload, StandardRangeDownload, TransferTask};
     ///
     /// fn head_url_for(task: &TransferTask) -> String {
-    ///     StandardRangeDownload.head_url(task)
+    ///     BreakpointDownload::head_url(&StandardRangeDownload, task)
     /// }
     /// ```
     fn head_url(&self, task: &TransferTask) -> String {
@@ -94,7 +96,8 @@ pub trait BreakpointDownload: Send + Sync {
     /// use rusty_cat::api::DownloadHeadCtx;
     ///
     /// fn inspect_head_ctx(ctx: &DownloadHeadCtx<'_>) {
-    ///     let _ = (ctx.task.file_name(), ctx.base);
+    ///     let _ = ctx.task.file_name();
+    ///     let _ = ctx.base.len();
     /// }
     /// ```
     fn merge_head_headers(&self, _ctx: DownloadHeadCtx<'_>) -> Result<(), MeowError> {

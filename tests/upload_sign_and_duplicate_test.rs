@@ -47,18 +47,22 @@ async fn upload_record_file_sign_matches_source_md5() {
         .build()
         .expect("build upload task");
     client
-        .enqueue(task, move |record: FileTransferRecord| {
-            signs_cb
-                .lock()
-                .expect("lock signs")
-                .push(record.file_sign().to_string());
-            if matches!(
-                record.status(),
-                TransferStatus::Complete | TransferStatus::Failed(_) | TransferStatus::Canceled
-            ) {
-                *terminal_cb.lock().expect("lock terminal") = Some(record.status().clone());
-            }
-        }, Some(|_, _| {}))
+        .enqueue(
+            task,
+            move |record: FileTransferRecord| {
+                signs_cb
+                    .lock()
+                    .expect("lock signs")
+                    .push(record.file_sign().to_string());
+                if matches!(
+                    record.status(),
+                    TransferStatus::Complete | TransferStatus::Failed(_) | TransferStatus::Canceled
+                ) {
+                    *terminal_cb.lock().expect("lock terminal") = Some(record.status().clone());
+                }
+            },
+            |_, _| {},
+        )
         .await
         .expect("enqueue upload task");
 
@@ -120,15 +124,19 @@ async fn second_upload_with_same_sign_hits_duplicate_branch() {
         .expect("build second upload task");
 
     client
-        .enqueue(task1, |_record: FileTransferRecord| {}, Some(|_, _| {}))
+        .enqueue(task1, |_record: FileTransferRecord| {}, |_, _| {})
         .await
         .expect("enqueue first upload");
     client
-        .enqueue(task2, move |record: FileTransferRecord| {
-            s2.lock()
-                .expect("lock statuses2")
-                .push(record.status().clone());
-        }, Some(|_, _| {}))
+        .enqueue(
+            task2,
+            move |record: FileTransferRecord| {
+                s2.lock()
+                    .expect("lock statuses2")
+                    .push(record.status().clone());
+            },
+            |_, _| {},
+        )
         .await
         .expect("enqueue second upload should still return task id");
 

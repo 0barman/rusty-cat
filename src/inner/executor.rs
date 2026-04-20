@@ -9,9 +9,9 @@ use crate::inner::worker_event::WorkerEvent;
 use crate::inner::UniqueId;
 use crate::meow_config::MeowConfig;
 use crate::transfer_executor_trait::TransferTrait;
-use crate::transfer_task::TransferTask;
 use crate::transfer_snapshot::TransferSnapshot;
 use crate::transfer_status::TransferStatus;
+use crate::transfer_task::TransferTask;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 

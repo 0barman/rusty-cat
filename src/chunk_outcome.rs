@@ -1,3 +1,18 @@
+/// Result of processing a single upload/download chunk.
+///
+/// # Examples
+///
+/// ```
+/// use rusty_cat::chunk_outcome::ChunkOutcome;
+///
+/// let o = ChunkOutcome {
+///     next_offset: 1024,
+///     total_size: 4096,
+///     done: false,
+///     completion_payload: None,
+/// };
+/// assert!(!o.done);
+/// ```
 #[derive(Debug, Clone)]
 pub struct ChunkOutcome {
     /// Next byte offset to continue transfer from.

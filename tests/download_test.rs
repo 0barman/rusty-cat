@@ -43,13 +43,17 @@ async fn test_download() {
     .build();
 
     client
-        .enqueue(task, move |record: FileTransferRecord| {
-            println!("progress: {:?}", record);
-            statuses_for_cb
-                .lock()
-                .expect("lock statuses")
-                .push(record.status().clone());
-        }, Some(|_, _| {}))
+        .enqueue(
+            task,
+            move |record: FileTransferRecord| {
+                println!("progress: {:?}", record);
+                statuses_for_cb
+                    .lock()
+                    .expect("lock statuses")
+                    .push(record.status().clone());
+            },
+            |_, _| {},
+        )
         .await
         .expect("enqueue download task");
 

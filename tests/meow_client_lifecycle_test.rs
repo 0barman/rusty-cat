@@ -66,7 +66,7 @@ async fn all_control_apis_return_client_closed_after_close() {
     )
     .build();
     let task_id = client
-        .enqueue(task, |_record: FileTransferRecord| {}, Some(|_, _| {}))
+        .enqueue(task, |_record: FileTransferRecord| {}, |_, _| {})
         .await
         .expect("enqueue initial task");
 
@@ -85,7 +85,7 @@ async fn all_control_apis_return_client_closed_after_close() {
             )
             .build(),
             |_record: FileTransferRecord| {},
-            Some(|_, _| {}),
+            |_, _| {},
         )
         .await
         .expect_err("enqueue after close must fail");
@@ -158,12 +158,16 @@ async fn close_active_transfer_should_emit_pause_or_terminal_status() {
     )
     .build();
     client
-        .enqueue(task, move |record: FileTransferRecord| {
-            statuses_cb
-                .lock()
-                .expect("lock statuses")
-                .push(record.status().clone());
-        }, Some(|_, _| {}))
+        .enqueue(
+            task,
+            move |record: FileTransferRecord| {
+                statuses_cb
+                    .lock()
+                    .expect("lock statuses")
+                    .push(record.status().clone());
+            },
+            |_, _| {},
+        )
         .await
         .expect("enqueue active task");
 

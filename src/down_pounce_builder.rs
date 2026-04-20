@@ -268,6 +268,7 @@ impl DownloadPounceBuilder {
             direction: Direction::Download,
             file_name: self.file_name,
             file_path: self.file_path,
+            upload_source: None,
             total_size: 0,
             chunk_size: self.chunk_size,
             url: self.url,
@@ -278,6 +279,7 @@ impl DownloadPounceBuilder {
             breakpoint_download: self.breakpoint_download,
             breakpoint_download_http: self.breakpoint_download_http,
             max_chunk_retries: self.max_chunk_retries,
+            max_upload_prepare_retries: PounceTask::DEFAULT_MAX_UPLOAD_PREPARE_RETRIES,
         }
     }
 }

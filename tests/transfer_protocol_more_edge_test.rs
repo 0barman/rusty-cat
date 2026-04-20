@@ -46,12 +46,16 @@ async fn run_download_case_with_responses(
     )
     .build();
     client
-        .enqueue(task, move |record: FileTransferRecord| {
-            statuses_cb
-                .lock()
-                .expect("lock statuses")
-                .push(record.status().clone());
-        }, Some(|_, _| {}))
+        .enqueue(
+            task,
+            move |record: FileTransferRecord| {
+                statuses_cb
+                    .lock()
+                    .expect("lock statuses")
+                    .push(record.status().clone());
+            },
+            |_, _| {},
+        )
         .await
         .expect("enqueue edge task");
 
