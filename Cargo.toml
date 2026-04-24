@@ -8,7 +8,7 @@ repository = "https://github.com/0barman/rusty-cat"
 readme = "README.md"
 keywords = ["async", "download", "http", "upload", "resume"]
 categories = ["asynchronous", "network-programming"]
-include = ["src/**", "Cargo.toml", "README.md", "LICENSE*"]
+include = ["src/**/*.rs", "Cargo.toml", "README.md", "LICENSE*"]
 
 [dependencies]
 uuid = { version = "1.23.0", features = ["v4"] }
