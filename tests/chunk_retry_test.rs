@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use reqwest::Method;
 use rusty_cat::down_pounce_builder::DownloadPounceBuilder;
 use rusty_cat::error::InnerErrorCode;
 use rusty_cat::file_transfer_record::FileTransferRecord;
@@ -48,7 +47,6 @@ async fn default_retry_3_recovers_after_two_chunk_failures() {
         &path,
         4,
         format!("{}/download", server.base_url()),
-        Method::GET,
     )
     .build();
     let client = MeowClient::new(MeowConfig::new(1, 1));
@@ -56,7 +54,7 @@ async fn default_retry_3_recovers_after_two_chunk_failures() {
     let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
     let statuses_cb = statuses.clone();
     client
-        .enqueue(
+        .try_enqueue(
             task,
             move |record: FileTransferRecord| {
                 statuses_cb
@@ -88,7 +86,6 @@ async fn configured_retry_0_fails_on_first_chunk_failure() {
         &path,
         4,
         format!("{}/download", server.base_url()),
-        Method::GET,
     )
     .with_max_chunk_retries(0)
     .build();
@@ -97,7 +94,7 @@ async fn configured_retry_0_fails_on_first_chunk_failure() {
     let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
     let statuses_cb = statuses.clone();
     client
-        .enqueue(
+        .try_enqueue(
             task,
             move |record: FileTransferRecord| {
                 statuses_cb

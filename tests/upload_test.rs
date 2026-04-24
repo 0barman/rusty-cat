@@ -38,7 +38,7 @@ async fn test_upload() {
         .build()
         .expect("build upload task");
     client
-        .enqueue(
+        .try_enqueue(
             task,
             move |record: FileTransferRecord| {
                 println!("upload progress: {:?}", record);

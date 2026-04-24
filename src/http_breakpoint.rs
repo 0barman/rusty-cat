@@ -180,8 +180,15 @@ impl BreakpointUpload for DefaultStyleUpload {
     }
 
     /// Sends one upload chunk for default multipart upload protocol.
+    ///
+    /// The chunk payload is forwarded to `reqwest` as a stream built from the
+    /// shared [`bytes::Bytes`] handle, so no per-chunk `Vec::to_vec` copy is
+    /// required. Retries clone the same `Bytes` (refcount only) instead of
+    /// re-allocating the chunk buffer.
     async fn upload_chunk(&self, ctx: UploadChunkCtx<'_>) -> Result<UploadResumeInfo, MeowError> {
-        let part = multipart::Part::bytes(ctx.chunk.to_vec())
+        let chunk_len = ctx.chunk.len();
+        let body = reqwest::Body::from(ctx.chunk.clone());
+        let part = multipart::Part::stream_with_length(body, chunk_len as u64)
             .file_name(KEY_UPLOAD_CHUNK_DATA)
             .mime_str("application/octet-stream")
             .map_err(|e| MeowError::from_code(InnerErrorCode::HttpError, e.to_string()))?;
@@ -192,7 +199,7 @@ impl BreakpointUpload for DefaultStyleUpload {
             .text(KEY_FILE_NAME, ctx.task.file_name().to_string())
             .text(KEY_CATEGORY, self.category.clone())
             .text(KEY_OFFSET, ctx.offset.to_string())
-            .text(KEY_PART_SIZE, ctx.chunk.len().to_string())
+            .text(KEY_PART_SIZE, chunk_len.to_string())
             .text(KEY_TOTAL_SIZE, ctx.task.total_size().to_string());
         let req = UploadRequest::from_task(ctx.task, UploadBody::Multipart(form));
         let body = send_upload_request(ctx.client, req).await?;

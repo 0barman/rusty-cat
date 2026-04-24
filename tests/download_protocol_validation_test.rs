@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use reqwest::Method;
 use rusty_cat::down_pounce_builder::DownloadPounceBuilder;
 use rusty_cat::file_transfer_record::FileTransferRecord;
 use rusty_cat::meow_config::MeowConfig;
@@ -59,14 +58,13 @@ async fn run_download_case(
         &path,
         4,
         format!("{}/download", server.base_url()),
-        Method::GET,
     )
     .build();
     let client = MeowClient::new(MeowConfig::new(1, 1));
     let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
     let statuses_cb = statuses.clone();
     client
-        .enqueue(
+        .try_enqueue(
             task,
             move |record: FileTransferRecord| {
                 statuses_cb

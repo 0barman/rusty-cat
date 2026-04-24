@@ -2,7 +2,6 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use reqwest::Method;
 use rusty_cat::down_pounce_builder::DownloadPounceBuilder;
 use rusty_cat::up_pounce_builder::UploadPounceBuilder;
 
@@ -62,7 +61,7 @@ fn download_builder_chunk_size_zero_and_retry_zero_paths_are_kept() {
     // 2) with_max_chunk_retries(0) 应保留为 0（禁用重试分支）；
     // 3) 通过 Debug 输出断言两个字段都符合预期。
     let path = temp_file_path("download_chunk_retry_zero");
-    let task = DownloadPounceBuilder::new("d.bin", &path, 0, "http://127.0.0.1:9/d", Method::GET)
+    let task = DownloadPounceBuilder::new("d.bin", &path, 0, "http://127.0.0.1:9/d")
         .with_max_chunk_retries(0)
         .build();
     let text = format!("{task:?}");

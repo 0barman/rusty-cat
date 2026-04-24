@@ -18,9 +18,9 @@ use crate::upload_source::UploadSource;
 #[derive(Clone)]
 pub struct TransferTask {
     /// Stable file signature.
-    file_sign: String,
+    file_sign: Arc<str>,
     /// Display file name.
-    file_name: String,
+    file_name: Arc<str>,
     /// Local file path.
     file_path: PathBuf,
     /// Upload-only source descriptor.
@@ -83,8 +83,8 @@ impl TransferTask {
     /// Creates a transfer snapshot from an internal runtime task.
     pub(crate) fn from_inner(inner: &InnerTask) -> Self {
         Self {
-            file_sign: inner.file_sign().to_string(),
-            file_name: inner.file_name().to_string(),
+            file_sign: inner.file_sign_arc(),
+            file_name: inner.file_name_arc(),
             file_path: inner.file_path().to_path_buf(),
             upload_source: inner.upload_source().cloned(),
             direction: inner.direction(),

@@ -1,18 +1,22 @@
+use std::sync::Arc;
+
 use crate::direction::Direction;
 use crate::ids::TaskId;
 use crate::transfer_status::TransferStatus;
 
 /// Immutable progress/state record emitted by transfer callbacks.
 ///
-/// This snapshot is safe to clone and pass across threads.
+/// This snapshot is safe to clone and pass across threads. `file_sign` and
+/// `file_name` are backed by `Arc<str>` so per-event fan-out only performs
+/// a refcount bump instead of string allocation.
 #[derive(Debug, Clone)]
 pub struct FileTransferRecord {
     /// Unique task identifier.
     task_id: TaskId,
     /// File signature (upload usually MD5; download may use client-defined value).
-    file_sign: String,
+    file_sign: Arc<str>,
     /// Display file name.
-    file_name: String,
+    file_name: Arc<str>,
     /// Total file size in bytes.
     total_size: u64,
     /// Progress ratio in range `0.0..=1.0`.
@@ -51,8 +55,8 @@ impl FileTransferRecord {
     /// ```
     pub fn new(
         task_id: TaskId,
-        file_sign: String,
-        file_name: String,
+        file_sign: impl Into<Arc<str>>,
+        file_name: impl Into<Arc<str>>,
         total_size: u64,
         progress: f32,
         status: TransferStatus,
@@ -60,8 +64,8 @@ impl FileTransferRecord {
     ) -> Self {
         Self {
             task_id,
-            file_sign,
-            file_name,
+            file_sign: file_sign.into(),
+            file_name: file_name.into(),
             total_size,
             progress,
             status,

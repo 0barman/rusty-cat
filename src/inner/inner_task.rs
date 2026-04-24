@@ -18,8 +18,8 @@ use crate::upload_source::UploadSource;
 #[derive(Clone)]
 pub(crate) struct InnerTask {
     task_id: TaskId,
-    file_sign: String,
-    file_name: String,
+    file_sign: Arc<str>,
+    file_name: Arc<str>,
     file_path: PathBuf,
     upload_source: Option<UploadSource>,
     direction: Direction,
@@ -129,7 +129,7 @@ impl InnerTask {
                             task_id,
                             bytes.len()
                         );
-                        calculate_sign_bytes(bytes.as_slice())
+                        calculate_sign_bytes(&bytes[..])
                     }
                 }
             }
@@ -161,8 +161,8 @@ impl InnerTask {
 
         Ok(Self {
             task_id,
-            file_sign,
-            file_name,
+            file_sign: Arc::<str>::from(file_sign),
+            file_name: Arc::<str>::from(file_name),
             file_path,
             upload_source,
             direction,
@@ -186,17 +186,31 @@ impl InnerTask {
 
     pub(crate) fn dedupe_key(&self) -> UniqueId {
         match self.direction {
-            Direction::Upload => (Direction::Upload, self.file_sign.clone()),
+            Direction::Upload => (Direction::Upload, self.file_sign.to_string()),
             Direction::Download => (Direction::Download, self.url.clone()),
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn file_sign(&self) -> &str {
         &self.file_sign
     }
 
+    #[allow(dead_code)]
     pub(crate) fn file_name(&self) -> &str {
         &self.file_name
+    }
+
+    /// Returns a cheaply-clonable handle to the file signature for hot-path DTO
+    /// construction (progress/status emission).
+    pub(crate) fn file_sign_arc(&self) -> Arc<str> {
+        Arc::clone(&self.file_sign)
+    }
+
+    /// Returns a cheaply-clonable handle to the display file name for hot-path
+    /// DTO construction (progress/status emission).
+    pub(crate) fn file_name_arc(&self) -> Arc<str> {
+        Arc::clone(&self.file_name)
     }
 
     pub(crate) fn file_path(&self) -> &Path {

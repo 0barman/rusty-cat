@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use reqwest::Method;
 use rusty_cat::down_pounce_builder::DownloadPounceBuilder;
 use rusty_cat::error::InnerErrorCode;
 use rusty_cat::file_transfer_record::FileTransferRecord;
@@ -62,11 +61,10 @@ async fn all_control_apis_return_client_closed_after_close() {
         &path,
         2048,
         format!("{}/download/lifecycle.bin", server.base_url()),
-        Method::GET,
     )
     .build();
     let task_id = client
-        .enqueue(task, |_record: FileTransferRecord| {}, |_, _| {})
+        .try_enqueue(task, |_record: FileTransferRecord| {}, |_, _| {})
         .await
         .expect("enqueue initial task");
 
@@ -75,13 +73,12 @@ async fn all_control_apis_return_client_closed_after_close() {
 
     let new_path = temp_download_path("enqueue_closed");
     let enqueue_after_close = client
-        .enqueue(
+        .try_enqueue(
             DownloadPounceBuilder::new(
                 "closed.bin",
                 &new_path,
                 1024,
                 format!("{}/download/closed.bin", server.base_url()),
-                Method::GET,
             )
             .build(),
             |_record: FileTransferRecord| {},
@@ -154,11 +151,10 @@ async fn close_active_transfer_should_emit_pause_or_terminal_status() {
         &path,
         1024,
         format!("{}/download/active.bin", server.base_url()),
-        Method::GET,
     )
     .build();
     client
-        .enqueue(
+        .try_enqueue(
             task,
             move |record: FileTransferRecord| {
                 statuses_cb

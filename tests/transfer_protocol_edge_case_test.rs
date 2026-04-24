@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use reqwest::Method;
 use rusty_cat::down_pounce_builder::DownloadPounceBuilder;
 use rusty_cat::error::InnerErrorCode;
 use rusty_cat::file_transfer_record::FileTransferRecord;
@@ -62,7 +61,7 @@ async fn upload_prepare_http_non_success_hits_response_status_error() {
         .build()
         .expect("build upload task");
     client
-        .enqueue(
+        .try_enqueue(
             task,
             move |record: FileTransferRecord| {
                 statuses_cb
@@ -108,7 +107,7 @@ async fn upload_prepare_invalid_json_hits_response_parse_error() {
         .build()
         .expect("build upload task");
     client
-        .enqueue(
+        .try_enqueue(
             task,
             move |record: FileTransferRecord| {
                 statuses_cb
@@ -158,7 +157,7 @@ async fn upload_prepare_completed_file_id_branch_finishes_without_chunk_http() {
         .build()
         .expect("build upload task");
     client
-        .enqueue(
+        .try_enqueue(
             task,
             move |record: FileTransferRecord| {
                 statuses_cb
@@ -200,11 +199,10 @@ async fn download_prepare_missing_content_length_hits_error_branch() {
         &path,
         1024,
         format!("{}/download/d.bin", server.base_url()),
-        Method::GET,
     )
     .build();
     client
-        .enqueue(
+        .try_enqueue(
             task,
             move |record: FileTransferRecord| {
                 statuses_cb
@@ -253,11 +251,10 @@ async fn download_prepare_local_larger_than_remote_hits_invalid_range_branch() {
         &path,
         1024,
         format!("{}/download/d.bin", server.base_url()),
-        Method::GET,
     )
     .build();
     client
-        .enqueue(
+        .try_enqueue(
             task,
             move |record: FileTransferRecord| {
                 statuses_cb
@@ -304,11 +301,10 @@ async fn download_chunk_total_changed_and_empty_body_error_branches() {
         &path_a,
         4,
         format!("{}/download/a.bin", server_a.base_url()),
-        Method::GET,
     )
     .build();
     client_a
-        .enqueue(
+        .try_enqueue(
             task_a,
             move |record: FileTransferRecord| {
                 statuses_a_cb
@@ -343,11 +339,10 @@ async fn download_chunk_total_changed_and_empty_body_error_branches() {
         &path_b,
         4,
         format!("{}/download/b.bin", server_b.base_url()),
-        Method::GET,
     )
     .build();
     client_b
-        .enqueue(
+        .try_enqueue(
             task_b,
             move |record: FileTransferRecord| {
                 statuses_b_cb

@@ -7,7 +7,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use reqwest::Method;
 use rusty_cat::direction::Direction;
 use rusty_cat::down_pounce_builder::DownloadPounceBuilder;
 use rusty_cat::file_transfer_record::FileTransferRecord;
@@ -91,7 +90,7 @@ async fn meow_config_concurrency_limits_and_queue_behavior_work() {
             .build()
             .expect("build upload task");
         client
-            .enqueue(task, |_record: FileTransferRecord| {}, |_, _| {})
+            .try_enqueue(task, |_record: FileTransferRecord| {}, |_, _| {})
             .await
             .expect("enqueue upload task");
     }
@@ -104,11 +103,10 @@ async fn meow_config_concurrency_limits_and_queue_behavior_work() {
             &path,
             1024,
             format!("{}/download/down_{i}.bin", server.base_url()),
-            Method::GET,
         )
         .build();
         client
-            .enqueue(task, |_record: FileTransferRecord| {}, |_, _| {})
+            .try_enqueue(task, |_record: FileTransferRecord| {}, |_, _| {})
             .await
             .expect("enqueue download task");
     }

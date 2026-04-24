@@ -69,8 +69,8 @@ pub(crate) fn emit_status(
     let inner = entry.inner();
     let dto = FileTransferRecord::new(
         inner.task_id(),
-        inner.file_sign().to_string(),
-        inner.file_name().to_string(),
+        inner.file_sign_arc(),
+        inner.file_name_arc(),
         total,
         if total == 0 {
             0.0

@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use reqwest::Method;
 use rusty_cat::down_pounce_builder::DownloadPounceBuilder;
 use rusty_cat::file_transfer_record::FileTransferRecord;
 use rusty_cat::log::{Log, LogLevel};
@@ -65,11 +64,10 @@ async fn file_transfer_record_getters_return_expected_values_from_callback() {
         &path,
         1024,
         format!("{}/download/getter.bin", server.base_url()),
-        Method::GET,
     )
     .build();
     client
-        .enqueue(
+        .try_enqueue(
             task,
             move |record: FileTransferRecord| {
                 if matches!(

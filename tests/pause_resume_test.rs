@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use reqwest::Method;
 use rusty_cat::down_pounce_builder::DownloadPounceBuilder;
 use rusty_cat::file_transfer_record::FileTransferRecord;
 use rusty_cat::meow_config::MeowConfig;
@@ -174,10 +173,10 @@ async fn pause_then_resume_keeps_same_task_id_and_finishes() {
     // 在回调里共享状态轨迹容器。
     let statuses_for_cb = statuses.clone();
     // 构建下载任务，chunk 固定为 4。
-    let task = DownloadPounceBuilder::new("payload.bin", &path, 4, url, Method::GET).build();
+    let task = DownloadPounceBuilder::new("payload.bin", &path, 4, url).build();
     // 入队并持有 task_id，后续将使用同一个 id 做 pause/resume。
     let task_id = client
-        .enqueue(
+        .try_enqueue(
             task,
             move |record: FileTransferRecord| {
                 statuses_for_cb

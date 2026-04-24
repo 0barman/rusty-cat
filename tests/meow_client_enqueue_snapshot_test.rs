@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use reqwest::Method;
 use rusty_cat::down_pounce_builder::DownloadPounceBuilder;
 use rusty_cat::error::InnerErrorCode;
 use rusty_cat::file_transfer_record::FileTransferRecord;
@@ -32,10 +31,10 @@ async fn enqueue_rejects_empty_task_with_parameter_empty() {
     // 3) 该用例保证输入校验边界稳定，避免空任务进入调度层。
     let client = MeowClient::new(MeowConfig::new(1, 1));
     let path = temp_download_path("empty_task");
-    let empty_task = DownloadPounceBuilder::new("", &path, 1024, "", Method::GET).build();
+    let empty_task = DownloadPounceBuilder::new("", &path, 1024, "").build();
 
     let err = client
-        .enqueue(empty_task, |_record: FileTransferRecord| {}, |_, _| {})
+        .try_enqueue(empty_task, |_record: FileTransferRecord| {}, |_, _| {})
         .await
         .expect_err("empty task should be rejected");
     assert_eq!(err.code(), InnerErrorCode::ParameterEmpty as i32);
@@ -63,11 +62,10 @@ async fn snapshot_reports_activity_and_returns_to_zero_after_completion() {
         &path,
         1024,
         format!("{}/download/snapshot.bin", server.base_url()),
-        Method::GET,
     )
     .build();
     client
-        .enqueue(
+        .try_enqueue(
             task,
             move |record: FileTransferRecord| {
                 statuses_cb

@@ -9,7 +9,16 @@ use std::sync::Arc;
 /// Builder for creating a download [`PounceTask`].
 ///
 /// Use this builder when you need fine-grained control over URL, headers,
-/// HTTP method, and breakpoint download behavior.
+/// and breakpoint download behavior.
+///
+/// # HTTP method
+///
+/// Download HTTP methods are **not configurable**: the executor always issues
+/// `HEAD` during the prepare stage and `GET` with `Range` headers during
+/// chunk transfer. These are fixed by the HTTP Range protocol (RFC 7233) and
+/// by the breakpoint-resume contract, so there is no builder knob for the
+/// request method. If a gateway requires an unusual verb, implement a custom
+/// [`BreakpointDownload`] instead.
 pub struct DownloadPounceBuilder {
     /// Display file name used in callbacks and logs.
     file_name: String,
@@ -21,8 +30,6 @@ pub struct DownloadPounceBuilder {
     chunk_size: u64,
     /// Resource URL.
     url: String,
-    /// HTTP method used for the download request.
-    method: Method,
     /// Base headers copied into HEAD and range GET requests.
     headers: HeaderMap,
     /// Optional client-defined file signature shown in progress records.
@@ -46,7 +53,10 @@ impl DownloadPounceBuilder {
     /// - `file_path`: Local output path.
     /// - `chunk_size`: Desired chunk size in bytes; `0` falls back to default.
     /// - `url`: Download URL.
-    /// - `method`: Usually `GET`; custom methods are allowed for gateway APIs.
+    ///
+    /// The HTTP method is fixed by protocol (`HEAD` for prepare, `GET` with
+    /// `Range` for chunks) and is therefore not a parameter; see the
+    /// [struct-level docs](DownloadPounceBuilder) for details.
     ///
     /// # Usage rules
     ///
@@ -55,7 +65,6 @@ impl DownloadPounceBuilder {
     /// # Examples
     ///
     /// ```no_run
-    /// use reqwest::Method;
     /// use rusty_cat::api::DownloadPounceBuilder;
     ///
     /// let task = DownloadPounceBuilder::new(
@@ -63,7 +72,6 @@ impl DownloadPounceBuilder {
     ///     "./downloads/demo.bin",
     ///     1024 * 1024,
     ///     "https://example.com/demo.bin",
-    ///     Method::GET,
     /// )
     /// .build();
     /// let _ = task;
@@ -73,14 +81,12 @@ impl DownloadPounceBuilder {
         file_path: impl AsRef<Path>,
         chunk_size: u64,
         url: impl Into<String>,
-        method: Method,
     ) -> Self {
         Self {
             file_name: file_name.into(),
             file_path: file_path.as_ref().to_path_buf(),
             chunk_size: PounceTask::normalized_chunk_size(chunk_size),
             url: url.into(),
-            method,
             headers: HeaderMap::new(),
             client_file_sign: None,
             breakpoint_download: None,
@@ -94,10 +100,9 @@ impl DownloadPounceBuilder {
     /// # Examples
     ///
     /// ```no_run
-    /// use reqwest::Method;
     /// use rusty_cat::api::DownloadPounceBuilder;
     ///
-    /// let _task = DownloadPounceBuilder::new("a.bin", "./a.bin", 1024, "https://old", Method::GET)
+    /// let _task = DownloadPounceBuilder::new("a.bin", "./a.bin", 1024, "https://old")
     ///     .with_url("https://new")
     ///     .build();
     /// ```
@@ -111,32 +116,14 @@ impl DownloadPounceBuilder {
     /// # Examples
     ///
     /// ```no_run
-    /// use reqwest::Method;
     /// use rusty_cat::api::DownloadPounceBuilder;
     ///
-    /// let _task = DownloadPounceBuilder::new("a.bin", "./a.bin", 1024, "https://x", Method::GET)
+    /// let _task = DownloadPounceBuilder::new("a.bin", "./a.bin", 1024, "https://x")
     ///     .with_file_path("./downloads/new-a.bin")
     ///     .build();
     /// ```
     pub fn with_file_path(mut self, path: impl AsRef<Path>) -> Self {
         self.file_path = path.as_ref().to_path_buf();
-        self
-    }
-
-    /// Overrides HTTP method used by the request.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use reqwest::Method;
-    /// use rusty_cat::api::DownloadPounceBuilder;
-    ///
-    /// let _task = DownloadPounceBuilder::new("a.bin", "./a.bin", 1024, "https://x", Method::GET)
-    ///     .with_method(Method::GET)
-    ///     .build();
-    /// ```
-    pub fn with_method(mut self, method: Method) -> Self {
-        self.method = method;
         self
     }
 
@@ -147,14 +134,13 @@ impl DownloadPounceBuilder {
     /// # Examples
     ///
     /// ```no_run
-    /// use reqwest::Method;
     /// use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
     /// use rusty_cat::api::DownloadPounceBuilder;
     ///
     /// let mut headers = HeaderMap::new();
     /// headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer token"));
     ///
-    /// let _task = DownloadPounceBuilder::new("a.bin", "./a.bin", 1024, "https://x", Method::GET)
+    /// let _task = DownloadPounceBuilder::new("a.bin", "./a.bin", 1024, "https://x")
     ///     .with_headers(headers)
     ///     .build();
     /// ```
@@ -168,10 +154,9 @@ impl DownloadPounceBuilder {
     /// # Examples
     ///
     /// ```no_run
-    /// use reqwest::Method;
     /// use rusty_cat::api::DownloadPounceBuilder;
     ///
-    /// let _task = DownloadPounceBuilder::new("a.bin", "./a.bin", 1024, "https://x", Method::GET)
+    /// let _task = DownloadPounceBuilder::new("a.bin", "./a.bin", 1024, "https://x")
     ///     .with_client_file_sign("client-sign-001")
     ///     .build();
     /// ```
@@ -186,11 +171,10 @@ impl DownloadPounceBuilder {
     ///
     /// ```no_run
     /// use std::sync::Arc;
-    /// use reqwest::Method;
     /// use rusty_cat::api::{DownloadPounceBuilder, StandardRangeDownload};
     ///
     /// let protocol = Arc::new(StandardRangeDownload);
-    /// let _task = DownloadPounceBuilder::new("a.bin", "./a.bin", 1024, "https://x", Method::GET)
+    /// let _task = DownloadPounceBuilder::new("a.bin", "./a.bin", 1024, "https://x")
     ///     .with_breakpoint_download(protocol)
     ///     .build();
     /// ```
@@ -207,10 +191,9 @@ impl DownloadPounceBuilder {
     /// # Examples
     ///
     /// ```no_run
-    /// use reqwest::Method;
     /// use rusty_cat::api::{BreakpointDownloadHttpConfig, DownloadPounceBuilder};
     ///
-    /// let _task = DownloadPounceBuilder::new("a.bin", "./a.bin", 1024, "https://x", Method::GET)
+    /// let _task = DownloadPounceBuilder::new("a.bin", "./a.bin", 1024, "https://x")
     ///     .with_breakpoint_download_http(BreakpointDownloadHttpConfig {
     ///         range_accept: "application/octet-stream".to_string(),
     ///     })
@@ -231,10 +214,9 @@ impl DownloadPounceBuilder {
     /// # Examples
     ///
     /// ```no_run
-    /// use reqwest::Method;
     /// use rusty_cat::api::DownloadPounceBuilder;
     ///
-    /// let _task = DownloadPounceBuilder::new("a.bin", "./a.bin", 1024, "https://x", Method::GET)
+    /// let _task = DownloadPounceBuilder::new("a.bin", "./a.bin", 1024, "https://x")
     ///     .with_max_chunk_retries(5)
     ///     .build();
     /// ```
@@ -250,7 +232,6 @@ impl DownloadPounceBuilder {
     /// # Examples
     ///
     /// ```no_run
-    /// use reqwest::Method;
     /// use rusty_cat::api::DownloadPounceBuilder;
     ///
     /// let task = DownloadPounceBuilder::new(
@@ -258,7 +239,6 @@ impl DownloadPounceBuilder {
     ///     "./downloads/file.iso",
     ///     2 * 1024 * 1024,
     ///     "https://example.com/file.iso",
-    ///     Method::GET,
     /// )
     /// .build();
     /// let _ = task;
@@ -272,7 +252,10 @@ impl DownloadPounceBuilder {
             total_size: 0,
             chunk_size: self.chunk_size,
             url: self.url,
-            method: self.method,
+            // Download uses HEAD (prepare) + GET (chunks) hard-coded by the
+            // executor; this field is a placeholder and is never consulted on
+            // the download path.
+            method: Method::GET,
             headers: self.headers,
             client_file_sign: self.client_file_sign,
             breakpoint_upload: None,

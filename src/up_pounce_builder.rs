@@ -2,6 +2,7 @@ use crate::direction::Direction;
 use crate::http_breakpoint::BreakpointUpload;
 use crate::pounce_task::PounceTask;
 use crate::upload_source::UploadSource;
+use bytes::Bytes;
 use reqwest::header::HeaderMap;
 use reqwest::Method;
 use std::io;
@@ -67,12 +68,14 @@ impl UploadPounceBuilder {
 
     /// Creates a new upload builder from in-memory bytes.
     ///
-    /// The payload is moved into `Arc<Vec<u8>>` to avoid extra copies when task
-    /// values are cloned across runtime layers.
+    /// The payload is moved into [`bytes::Bytes`] (zero-copy takeover of the
+    /// provided `Vec<u8>`). Subsequent per-chunk slices and protocol-level
+    /// clones are reference-count bumps only, so large in-memory payloads are
+    /// never duplicated across scheduler/runtime layers.
     pub fn from_bytes(file_name: impl Into<String>, bytes: Vec<u8>, chunk_size: u64) -> Self {
         Self {
             file_name: file_name.into(),
-            upload_source: UploadSource::Bytes(Arc::new(bytes)),
+            upload_source: UploadSource::Bytes(Bytes::from(bytes)),
             chunk_size: PounceTask::normalized_chunk_size(chunk_size),
             url: String::new(),
             method: Method::POST,
@@ -116,8 +119,11 @@ impl UploadPounceBuilder {
     /// Sets upload source as in-memory bytes.
     ///
     /// This replaces previously configured file path source, if any.
+    ///
+    /// The payload is stored as [`bytes::Bytes`] (zero-copy takeover of the
+    /// provided `Vec<u8>`); clones are reference-count bumps only.
     pub fn with_bytes(mut self, bytes: Vec<u8>) -> Self {
-        self.upload_source = UploadSource::Bytes(Arc::new(bytes));
+        self.upload_source = UploadSource::Bytes(Bytes::from(bytes));
         self
     }
 

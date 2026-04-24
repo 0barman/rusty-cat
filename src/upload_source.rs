@@ -1,5 +1,6 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+
+use bytes::Bytes;
 
 /// Immutable upload source data used by upload tasks.
 ///
@@ -11,9 +12,10 @@ pub(crate) enum UploadSource {
     File(PathBuf),
     /// Upload bytes are read directly from process memory.
     ///
-    /// `Arc<Vec<u8>>` avoids cloning large payload buffers when tasks are
-    /// cloned across scheduler/runtime layers.
-    Bytes(Arc<Vec<u8>>),
+    /// `Bytes` is cheap to clone (refcount bump) and slicing is zero-copy, so
+    /// tasks cloned across scheduler/runtime layers and per-chunk slices never
+    /// duplicate the underlying payload.
+    Bytes(Bytes),
 }
 
 impl std::fmt::Debug for UploadSource {
