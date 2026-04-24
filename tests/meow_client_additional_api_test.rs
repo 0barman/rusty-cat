@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use reqwest::Method;
 use rusty_cat::debug_log_listener_active;
 use rusty_cat::down_pounce_builder::DownloadPounceBuilder;
 use rusty_cat::error::InnerErrorCode;
@@ -139,7 +138,7 @@ async fn upload_file_deleted_after_build_hits_file_not_found_branch() {
 
     let client = MeowClient::new(MeowConfig::new(1, 1));
     let err = client
-        .enqueue(task, |_record: FileTransferRecord| {}, |_, _| {})
+        .try_enqueue(task, |_record: FileTransferRecord| {}, |_, _| {})
         .await
         .expect_err("enqueue should fail due to missing source");
     assert_eq!(err.code(), InnerErrorCode::FileNotFound as i32);
@@ -170,11 +169,10 @@ async fn task_and_listener_id_debug_format_paths_are_observable() {
         &path,
         2048,
         format!("{}/download/id.bin", server.base_url()),
-        Method::GET,
     )
     .build();
     let task_id = client
-        .enqueue(task, |_record: FileTransferRecord| {}, |_, _| {})
+        .try_enqueue(task, |_record: FileTransferRecord| {}, |_, _| {})
         .await
         .expect("enqueue task for id debug");
     let task_text = format!("{task_id:?}");

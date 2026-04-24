@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use reqwest::Method;
 use rusty_cat::down_pounce_builder::DownloadPounceBuilder;
 use rusty_cat::file_transfer_record::FileTransferRecord;
 use rusty_cat::meow_config::MeowConfig;
@@ -75,11 +74,10 @@ async fn task_callback_panic_does_not_break_scheduler() {
         &path,
         4,
         format!("{}/download", server.base_url()),
-        Method::GET,
     )
     .build();
     client
-        .enqueue(
+        .try_enqueue(
             task,
             move |_record: FileTransferRecord| {
                 if panic_flag.swap(false, Ordering::AcqRel) {
@@ -131,11 +129,10 @@ async fn global_callback_panic_does_not_break_scheduler() {
         &path,
         4,
         format!("{}/download", server.base_url()),
-        Method::GET,
     )
     .build();
     client
-        .enqueue(
+        .try_enqueue(
             task,
             move |record: FileTransferRecord| {
                 statuses_for_task
@@ -181,11 +178,10 @@ async fn complete_callback_panic_does_not_break_scheduler() {
         &path,
         4,
         format!("{}/download", server.base_url()),
-        Method::GET,
     )
     .build();
     client
-        .enqueue(
+        .try_enqueue(
             task,
             move |record: FileTransferRecord| {
                 statuses_for_task

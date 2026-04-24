@@ -73,7 +73,7 @@ async fn complete_callback_receives_payload_from_upload_protocol() {
         .expect("build upload task");
 
     let task_id = client
-        .enqueue(
+        .try_enqueue(
             task,
             move |record| {
                 statuses_cb

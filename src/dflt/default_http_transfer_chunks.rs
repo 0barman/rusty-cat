@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use bytes::Bytes;
 use reqwest::header::CONTENT_RANGE;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -98,60 +99,70 @@ pub(crate) async fn upload_one_chunk(
 
     let (info, uploaded_chunk_len) = match task.upload_source() {
         Some(UploadSource::File(path)) => {
-            let mut buf_guard = task.upload_chunk_buf().lock().await;
-            if buf_guard.len() < read_len_usize {
-                buf_guard.resize(read_len_usize, 0);
-            } else {
-                buf_guard.truncate(read_len_usize);
-            }
+            // 复用每任务只申请一次的 Vec<u8> 缓冲做磁盘读取，再一次性构造
+            // `Bytes` 句柄：后续 reqwest `Body::from(Bytes)` 以及重试中的
+            // `Bytes::clone` 均为零拷贝，彻底避免协议层的 `to_vec` 分配。
+            let chunk_bytes = {
+                let mut buf_guard = task.upload_chunk_buf().lock().await;
+                if buf_guard.len() < read_len_usize {
+                    buf_guard.resize(read_len_usize, 0);
+                } else {
+                    buf_guard.truncate(read_len_usize);
+                }
 
-            let mut slot = task.upload_file_slot().lock().await;
-            if slot.is_none() {
-                let opened = File::open(path).await.map_err(|e| {
+                let mut slot = task.upload_file_slot().lock().await;
+                if slot.is_none() {
+                    let opened = File::open(path).await.map_err(|e| {
+                        MeowError::from_source(
+                            InnerErrorCode::IoError,
+                            format!("open upload source failed: {}", path.display()),
+                            e,
+                        )
+                    })?;
+                    *slot = Some(opened);
+                }
+                let file = slot.as_mut().ok_or_else(|| {
+                    MeowError::from_code_str(
+                        InnerErrorCode::IoError,
+                        "upload file slot unexpectedly empty after open",
+                    )
+                })?;
+                file.seek(std::io::SeekFrom::Start(offset))
+                    .await
+                    .map_err(|e| {
+                        MeowError::from_source(
+                            InnerErrorCode::IoError,
+                            format!(
+                                "seek upload source failed: offset={offset} path={}",
+                                path.display()
+                            ),
+                            e,
+                        )
+                    })?;
+                file.read_exact(&mut buf_guard).await.map_err(|e| {
                     MeowError::from_source(
                         InnerErrorCode::IoError,
-                        format!("open upload source failed: {}", path.display()),
+                        format!("read upload source failed: path={}", path.display()),
                         e,
                     )
                 })?;
-                *slot = Some(opened);
-            }
-            let file = slot.as_mut().ok_or_else(|| {
-                MeowError::from_code_str(
-                    InnerErrorCode::IoError,
-                    "upload file slot unexpectedly empty after open",
-                )
-            })?;
-            file.seek(std::io::SeekFrom::Start(offset))
-                .await
-                .map_err(|e| {
-                    MeowError::from_source(
-                        InnerErrorCode::IoError,
-                        format!(
-                            "seek upload source failed: offset={offset} path={}",
-                            path.display()
-                        ),
-                        e,
-                    )
-                })?;
-            file.read_exact(&mut buf_guard).await.map_err(|e| {
-                MeowError::from_source(
-                    InnerErrorCode::IoError,
-                    format!("read upload source failed: path={}", path.display()),
-                    e,
-                )
-            })?;
-            drop(slot);
+                drop(slot);
+                // 复制一次到 Bytes，释放对 Vec<u8> 复用缓冲的持有；
+                // 这相比旧实现（协议层 `to_vec`）总分配次数不变，但 clone
+                // 与重试都变成 O(1)。
+                Bytes::copy_from_slice(&buf_guard[..])
+            };
 
+            let chunk_len = chunk_bytes.len() as u64;
             let info = upload
                 .upload_chunk(UploadChunkCtx {
                     client,
                     task,
-                    chunk: &buf_guard[..],
+                    chunk: chunk_bytes,
                     offset,
                 })
                 .await?;
-            (info, buf_guard.len() as u64)
+            (info, chunk_len)
         }
         Some(UploadSource::Bytes(bytes)) => {
             let start = offset as usize;
@@ -165,7 +176,10 @@ pub(crate) async fn upload_one_chunk(
                     ),
                 ));
             }
-            let chunk = &bytes[start..end];
+            // 内存源是零拷贝关键路径：`Bytes::slice` 只增加 refcount，
+            // 既不复制数据也不分配新缓冲。
+            let chunk = bytes.slice(start..end);
+            let chunk_len = chunk.len() as u64;
             let info = upload
                 .upload_chunk(UploadChunkCtx {
                     client,
@@ -174,7 +188,7 @@ pub(crate) async fn upload_one_chunk(
                     offset,
                 })
                 .await?;
-            (info, chunk.len() as u64)
+            (info, chunk_len)
         }
         None => {
             return Err(MeowError::from_code_str(
@@ -584,5 +598,85 @@ mod tests {
     fn parse_content_range_invalid_order_fail() {
         let err = parse_content_range("bytes 100-1/1000").unwrap_err();
         assert!(err.msg().contains("invalid content-range order"));
+    }
+
+    // ------------------------------------------------------------------
+    // Property-based 测试：对 `parse_content_range` 的鲁棒性防护。
+    // 覆盖要点：
+    //   1) 合法输入（含 `*` 未知总大小）必须能被还原；
+    //   2) 不同非法输入（顺序颠倒、缺斜杠、单位非 bytes、非数字）不得 panic，
+    //      必须以 `InvalidRange` 形式返回错误。
+    // ------------------------------------------------------------------
+    mod prop {
+        use super::super::parse_content_range;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// 合法输入应被还原为同样的三元组。
+            #[test]
+            fn parse_content_range_roundtrip_ok(
+                start in 0u64..u64::MAX / 2,
+                len in 1u64..1024 * 1024,
+                total in 1u64..u64::MAX / 2,
+            ) {
+                let end = start.saturating_add(len - 1);
+                // 跳过 end >= total 的组合，这类由上层语义处理，不属于本函数职责。
+                prop_assume!(end < total);
+
+                let header = format!("bytes {start}-{end}/{total}");
+                let (ps, pe, pt) = parse_content_range(&header).expect("parse ok");
+                prop_assert_eq!(ps, start);
+                prop_assert_eq!(pe, end);
+                prop_assert_eq!(pt, Some(total));
+            }
+
+            /// 未知总大小（`*`）分支也应正确返回 `None`。
+            #[test]
+            fn parse_content_range_unknown_total(
+                start in 0u64..u64::MAX / 2,
+                len in 1u64..1024 * 1024,
+            ) {
+                let end = start.saturating_add(len - 1);
+                let header = format!("bytes {start}-{end}/*");
+                let (ps, pe, pt) = parse_content_range(&header).expect("parse ok");
+                prop_assert_eq!(ps, start);
+                prop_assert_eq!(pe, end);
+                prop_assert!(pt.is_none());
+            }
+
+            /// end < start 必须返回错误，不能 panic。
+            #[test]
+            fn parse_content_range_reversed_range_fails(
+                start in 1u64..1_000_000,
+                delta in 1u64..1_000_000,
+                total in 1u64..u64::MAX / 2,
+            ) {
+                let end = start.saturating_sub(delta);
+                prop_assume!(end < start);
+                let header = format!("bytes {start}-{end}/{total}");
+                prop_assert!(parse_content_range(&header).is_err());
+            }
+
+            /// 任意“随便写”的字符串不得导致 panic；要么 Ok 要么 Err。
+            #[test]
+            fn parse_content_range_never_panics(s in ".{0,128}") {
+                let _ = parse_content_range(&s);
+            }
+
+            /// 单位不是 `bytes` 应该失败。
+            #[test]
+            fn parse_content_range_wrong_unit_fails(
+                unit in "[a-z]{1,8}",
+                start in 0u64..1_000_000,
+                end in 0u64..1_000_000,
+                total in 1u64..1_000_000,
+            ) {
+                prop_assume!(unit != "bytes");
+                let header = format!("{unit} {start}-{end}/{total}");
+                prop_assert!(parse_content_range(&header).is_err());
+            }
+        }
     }
 }

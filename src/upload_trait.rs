@@ -1,3 +1,5 @@
+use bytes::Bytes;
+
 use crate::http_breakpoint::UploadResumeInfo;
 use crate::{MeowError, TransferTask};
 use async_trait::async_trait;
@@ -16,14 +18,22 @@ pub struct UploadPrepareCtx<'a> {
 }
 
 /// Context for upload chunk stage.
-#[derive(Debug, Clone, Copy)]
+///
+/// [`UploadChunkCtx::chunk`] is a [`bytes::Bytes`] handle. Cloning it is an
+/// O(1) refcount bump, and passing it into [`reqwest::Body`] never copies the
+/// underlying buffer. This lets protocol implementations send the same chunk
+/// multiple times (for example during retries) without re-allocating.
+#[derive(Debug, Clone)]
 pub struct UploadChunkCtx<'a> {
     /// HTTP client used for requests.
     pub client: &'a reqwest::Client,
     /// Immutable task snapshot.
     pub task: &'a TransferTask,
     /// Raw bytes for the current chunk.
-    pub chunk: &'a [u8],
+    ///
+    /// `Bytes` is cheap to clone and can be converted into `reqwest::Body`
+    /// without copying. Avoid calling [`bytes::Bytes::to_vec`] on hot paths.
+    pub chunk: Bytes,
     /// Start offset of this chunk in the full file.
     ///
     /// Range: `>= 0`.
@@ -121,7 +131,8 @@ pub trait BreakpointUpload: Send + Sync {
     /// ```no_run
     /// use rusty_cat::api::UploadChunkCtx;
     ///
-    /// fn read_chunk_ctx(ctx: UploadChunkCtx<'_>) {
+    /// fn read_chunk_ctx(ctx: &UploadChunkCtx<'_>) {
+    ///     // `ctx.chunk` is a `bytes::Bytes`; cloning is a cheap refcount bump.
     ///     let _ = (ctx.offset, ctx.chunk.len(), ctx.task.total_size());
     /// }
     /// ```
@@ -131,7 +142,7 @@ pub trait BreakpointUpload: Send + Sync {
     ///
     /// Typical use case: multipart-complete API calls. Return value is an
     /// optional provider-defined payload that will be forwarded to
-    /// `MeowClient::enqueue` complete callback.
+    /// `MeowClient::try_enqueue` complete callback.
     ///
     /// Default implementation is a no-op (`Ok(None)`).
     ///

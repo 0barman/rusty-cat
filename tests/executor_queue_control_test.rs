@@ -5,7 +5,6 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use reqwest::Method;
 use rusty_cat::down_pounce_builder::DownloadPounceBuilder;
 use rusty_cat::error::InnerErrorCode;
 use rusty_cat::file_transfer_record::FileTransferRecord;
@@ -39,11 +38,10 @@ async fn zero_concurrency_queue_pause_resume_cancel_flow() {
         &path,
         1024,
         format!("{}/download/q.bin", server.base_url()),
-        Method::GET,
     )
     .build();
     let task_id = client
-        .enqueue(task, |_record: FileTransferRecord| {}, |_, _| {})
+        .try_enqueue(task, |_record: FileTransferRecord| {}, |_, _| {})
         .await
         .expect("enqueue queued task");
 

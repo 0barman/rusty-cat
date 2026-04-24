@@ -1,7 +1,7 @@
 //! 对外公开 API 的非法入参 / 非法调用顺序回归测试。
 //!
 //! 覆盖范围（与既有用例分工）：
-//! - [`MeowClient::enqueue`]：`PounceTask::is_empty` 触发的 `ParameterEmpty`（下载/上传字段缺失、0 字节上传源等）。
+//! - [`MeowClient::try_enqueue`]：`PounceTask::is_empty` 触发的 `ParameterEmpty`（下载/上传字段缺失、0 字节上传源等）。
 //! - [`MeowClient`] 生命周期：`ClientClosed`、`is_closed`、重复 `close`；关闭后对 `pause`/`resume`/`cancel`/`snapshot` 的拒绝。
 //! - [`UploadPounceBuilder::build`]：源文件不存在时的 `io::ErrorKind::NotFound`。
 //! - [`MeowConfig`]：`max_upload_concurrency`/`max_download_concurrency` 为 0 时仍可初始化；`command_queue_capacity` /
@@ -18,7 +18,6 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use reqwest::Method;
 use rusty_cat::down_pounce_builder::DownloadPounceBuilder;
 use rusty_cat::error::InnerErrorCode;
 use rusty_cat::file_transfer_record::FileTransferRecord;
@@ -36,21 +35,16 @@ fn temp_path(case: &str) -> PathBuf {
     p
 }
 
-// --- MeowClient::enqueue + PounceTask::is_empty ---
+// --- MeowClient::try_enqueue + PounceTask::is_empty ---
 
 #[tokio::test]
 async fn enqueue_download_empty_file_name_returns_parameter_empty() {
     let client = MeowClient::new(MeowConfig::new(1, 1));
-    let task = DownloadPounceBuilder::new(
-        "",
-        temp_path("empty_name"),
-        1024,
-        "http://127.0.0.1:9/x",
-        Method::GET,
-    )
-    .build();
+    let task =
+        DownloadPounceBuilder::new("", temp_path("empty_name"), 1024, "http://127.0.0.1:9/x")
+            .build();
     let err = client
-        .enqueue(task, |_r: FileTransferRecord| {}, |_, _| {})
+        .try_enqueue(task, |_r: FileTransferRecord| {}, |_, _| {})
         .await
         .expect_err("empty download display name");
     assert_eq!(err.code(), InnerErrorCode::ParameterEmpty as i32);
@@ -60,10 +54,9 @@ async fn enqueue_download_empty_file_name_returns_parameter_empty() {
 #[tokio::test]
 async fn enqueue_download_empty_url_returns_parameter_empty() {
     let client = MeowClient::new(MeowConfig::new(1, 1));
-    let task =
-        DownloadPounceBuilder::new("a.bin", temp_path("empty_url"), 1024, "", Method::GET).build();
+    let task = DownloadPounceBuilder::new("a.bin", temp_path("empty_url"), 1024, "").build();
     let err = client
-        .enqueue(task, |_r: FileTransferRecord| {}, |_, _| {})
+        .try_enqueue(task, |_r: FileTransferRecord| {}, |_, _| {})
         .await
         .expect_err("empty download url");
     assert_eq!(err.code(), InnerErrorCode::ParameterEmpty as i32);
@@ -73,10 +66,9 @@ async fn enqueue_download_empty_url_returns_parameter_empty() {
 #[tokio::test]
 async fn enqueue_download_empty_local_path_returns_parameter_empty() {
     let client = MeowClient::new(MeowConfig::new(1, 1));
-    let task =
-        DownloadPounceBuilder::new("a.bin", "", 1024, "http://127.0.0.1:9/x", Method::GET).build();
+    let task = DownloadPounceBuilder::new("a.bin", "", 1024, "http://127.0.0.1:9/x").build();
     let err = client
-        .enqueue(task, |_r: FileTransferRecord| {}, |_, _| {})
+        .try_enqueue(task, |_r: FileTransferRecord| {}, |_, _| {})
         .await
         .expect_err("empty local path");
     assert_eq!(err.code(), InnerErrorCode::ParameterEmpty as i32);
@@ -93,7 +85,7 @@ async fn enqueue_upload_empty_url_returns_parameter_empty() {
         .expect("build upload task");
     let client = MeowClient::new(MeowConfig::new(1, 1));
     let err = client
-        .enqueue(task, |_r: FileTransferRecord| {}, |_, _| {})
+        .try_enqueue(task, |_r: FileTransferRecord| {}, |_, _| {})
         .await
         .expect_err("empty upload url");
     assert_eq!(err.code(), InnerErrorCode::ParameterEmpty as i32);
@@ -111,7 +103,7 @@ async fn enqueue_upload_zero_byte_file_returns_parameter_empty() {
         .expect("build upload task");
     let client = MeowClient::new(MeowConfig::new(1, 1));
     let err = client
-        .enqueue(task, |_r: FileTransferRecord| {}, |_, _| {})
+        .try_enqueue(task, |_r: FileTransferRecord| {}, |_, _| {})
         .await
         .expect_err("upload with total_size 0");
     assert_eq!(err.code(), InnerErrorCode::ParameterEmpty as i32);
@@ -129,7 +121,7 @@ async fn enqueue_upload_empty_file_name_returns_parameter_empty() {
         .expect("build upload task");
     let client = MeowClient::new(MeowConfig::new(1, 1));
     let err = client
-        .enqueue(task, |_r: FileTransferRecord| {}, |_, _| {})
+        .try_enqueue(task, |_r: FileTransferRecord| {}, |_, _| {})
         .await
         .expect_err("empty upload file name");
     assert_eq!(err.code(), InnerErrorCode::ParameterEmpty as i32);
@@ -158,7 +150,7 @@ async fn enqueue_upload_empty_source_path_returns_parameter_empty() {
         }
     };
     let err = client
-        .enqueue(task, |_r: FileTransferRecord| {}, |_, _| {})
+        .try_enqueue(task, |_r: FileTransferRecord| {}, |_, _| {})
         .await
         .expect_err("empty upload source path");
     assert_eq!(err.code(), InnerErrorCode::ParameterEmpty as i32);
@@ -188,11 +180,10 @@ async fn enqueue_after_client_close_returns_client_closed() {
         temp_path("late"),
         1024,
         "http://127.0.0.1:9/late",
-        Method::GET,
     )
     .build();
     let err = client
-        .enqueue(task, |_r: FileTransferRecord| {}, |_, _| {})
+        .try_enqueue(task, |_r: FileTransferRecord| {}, |_, _| {})
         .await
         .expect_err("enqueue after close");
     assert_eq!(err.code(), InnerErrorCode::ClientClosed as i32);
@@ -265,11 +256,10 @@ async fn control_apis_after_close_return_client_closed_even_with_prior_task_id()
         temp_path("ctrl_after_close"),
         1024,
         "http://127.0.0.1:9/unused",
-        Method::GET,
     )
     .build();
     let task_id = client
-        .enqueue(task, |_r: FileTransferRecord| {}, |_, _| {})
+        .try_enqueue(task, |_r: FileTransferRecord| {}, |_, _| {})
         .await
         .expect("enqueue");
 

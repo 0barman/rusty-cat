@@ -12,6 +12,7 @@ use crate::transfer_executor_trait::TransferTrait;
 use crate::transfer_snapshot::TransferSnapshot;
 use crate::transfer_status::TransferStatus;
 use crate::transfer_task::TransferTask;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 
@@ -514,9 +515,30 @@ fn task_not_found_error(task_id: TaskId) -> MeowError {
     )
 }
 
-#[derive(Debug, Clone)]
+/// Handle to the background scheduler worker.
+///
+/// The worker itself lives on a **detached [`std::thread`]** which in turn
+/// drives a dedicated Tokio multi-thread runtime. The worker only shuts down
+/// when one of the following happens:
+///
+/// 1. An explicit [`Executor::close`] command is processed and the loop
+///    breaks cleanly (preferred path, drains state and emits `Paused`
+///    events).
+/// 2. All [`TransferCmd`] senders are dropped, in which case `cmd_rx.recv()`
+///    returns `None` and the loop breaks naturally (fallback path).
+///
+/// Because path (1) is the only way to guarantee clean shutdown and deliver
+/// terminal status events to user callbacks, `close()` is treated as a
+/// **required** part of the lifecycle. The [`Drop`] impl below performs a
+/// best-effort shutdown (plus a warning log) for the case where users forget
+/// it, but must not be relied upon for correctness.
+#[derive(Debug)]
 pub(crate) struct Executor {
     cmd_tx: tokio::sync::mpsc::Sender<TransferCmd>,
+    /// Set to `true` by [`Executor::close`] after the worker acknowledges
+    /// shutdown. Read by [`Drop`] to decide whether a best-effort shutdown
+    /// is still required.
+    close_invoked: AtomicBool,
 }
 
 impl Executor {
@@ -547,12 +569,88 @@ impl Executor {
             executor,
         )?;
         crate::meow_flow_log!("executor", "executor worker started");
-        Ok(Self { cmd_tx })
+        Ok(Self {
+            cmd_tx,
+            close_invoked: AtomicBool::new(false),
+        })
+    }
+}
+
+impl Drop for Executor {
+    /// Best-effort shutdown path for when the user forgot to call
+    /// [`crate::meow_client::MeowClient::close`].
+    ///
+    /// We intentionally keep this path simple and non-blocking:
+    ///
+    /// - Emits a `Warn`-level log so the misuse is observable.
+    /// - Attempts a non-blocking `try_send` of [`TransferCmd::Close`] so the
+    ///   worker, if still draining commands, can clean up and emit `Paused`
+    ///   events to user callbacks.
+    /// - Does **not** `await`, does **not** join the scheduler thread, and
+    ///   does **not** attempt to translate in-flight failures: even if the
+    ///   `try_send` fails (channel full or worker already gone), dropping
+    ///   `cmd_tx` immediately afterwards closes the command channel, which
+    ///   makes `cmd_rx.recv()` return `None` and lets the worker loop exit
+    ///   on its own.
+    ///
+    /// This is an aid, not a substitute: callers must still invoke
+    /// `close().await` for deterministic shutdown semantics (final status
+    /// callbacks, flushed resources, etc.).
+    fn drop(&mut self) {
+        if self.close_invoked.load(Ordering::SeqCst) {
+            crate::meow_flow_log!(
+                "executor_drop",
+                "executor dropped after explicit close() -- nothing to do"
+            );
+            return;
+        }
+        // Surface a Warn-level entry via the debug log listener (if any)
+        // so embedding applications can detect the misuse pattern.
+        crate::log::emit(crate::log::Log::new(
+            crate::log::LogLevel::Warn,
+            "executor_drop",
+            "MeowClient dropped without calling close().await; performing \
+             best-effort shutdown. The background scheduler thread will exit \
+             on its own, but terminal status events may be skipped. Always \
+             call MeowClient::close().await for deterministic shutdown.",
+        ));
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        match self.cmd_tx.try_send(TransferCmd::Close { respond_to: tx }) {
+            Ok(()) => {
+                crate::meow_flow_log!(
+                    "executor_drop",
+                    "best-effort Close command queued during Drop"
+                );
+            }
+            Err(e) => {
+                crate::meow_flow_log!(
+                    "executor_drop",
+                    "best-effort Close try_send skipped: {}; relying on \
+                     cmd_tx drop to unblock worker loop",
+                    e
+                );
+            }
+        }
+        // `cmd_tx` is dropped right after this returns. That closes the
+        // command channel: if the Close command above never reached the
+        // worker, the naked `recv() -> None` branch in `worker_loop` still
+        // breaks the loop and tears the runtime down.
     }
 }
 
 impl Executor {
-    pub(crate) fn enqueue(
+    /// Non-blocking command submission for an `Enqueue` request.
+    ///
+    /// This deliberately uses [`tokio::sync::mpsc::Sender::try_send`] rather
+    /// than `send().await`. The caller gets an immediate error if the command
+    /// channel is full (back-pressure signal) instead of being silently
+    /// suspended until the worker drains enough slots.
+    ///
+    /// The public-facing entry point [`crate::meow_client::MeowClient::try_enqueue`]
+    /// reflects this by carrying the `try_` prefix in its name; do not change
+    /// this into an `await`ing `send` without renaming the public API as
+    /// well.
+    pub(crate) fn try_enqueue(
         &self,
         inner: InnerTask,
         callbacks: TaskCallbacks,
@@ -560,7 +658,7 @@ impl Executor {
         let id = inner.task_id();
         crate::meow_flow_log!(
             "executor_api",
-            "enqueue send: task_id={:?} key={:?}",
+            "try_enqueue send: task_id={:?} key={:?}",
             id,
             inner.dedupe_key()
         );
@@ -569,16 +667,16 @@ impl Executor {
             .map_err(|e| {
                 crate::meow_flow_log!(
                     "executor_api",
-                    "enqueue send failed: task_id={:?} err={}",
+                    "try_enqueue send failed: task_id={:?} err={}",
                     id,
                     e
                 );
                 MeowError::from_code(
                     InnerErrorCode::CommandSendFailed,
-                    format!("enqueue_failed: {}", e),
+                    format!("try_enqueue_failed: {}", e),
                 )
             })?;
-        crate::meow_flow_log!("executor_api", "enqueue send ok: task_id={:?}", id);
+        crate::meow_flow_log!("executor_api", "try_enqueue send ok: task_id={:?}", id);
         Ok(id)
     }
 
@@ -728,12 +826,19 @@ impl Executor {
                     format!("close_failed: {}", e),
                 )
             })?;
-        rx.await.map_err(|e| {
+        let result = rx.await.map_err(|e| {
             MeowError::from_code(
                 InnerErrorCode::CommandResponseFailed,
                 format!("close response failed: {}", e),
             )
-        })?
+        })?;
+        // Only mark as fully closed after the worker acknowledges. If the
+        // handshake above failed, keep `close_invoked = false` so `Drop`
+        // still performs its best-effort shutdown path.
+        if result.is_ok() {
+            self.close_invoked.store(true, Ordering::SeqCst);
+        }
+        result
     }
 }
 
@@ -750,8 +855,8 @@ fn to_record_inner(
     };
     FileTransferRecord::new(
         inner.task_id(),
-        inner.file_sign().to_string(),
-        inner.file_name().to_string(),
+        inner.file_sign_arc(),
+        inner.file_name_arc(),
         file_size_u64,
         progress,
         status,

@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use reqwest::Method;
 use rusty_cat::down_pounce_builder::DownloadPounceBuilder;
 use rusty_cat::error::InnerErrorCode;
 use rusty_cat::file_transfer_record::FileTransferRecord;
@@ -43,12 +42,11 @@ async fn second_enqueue_with_same_download_url_hits_duplicate_branch() {
     let s1 = statuses1.clone();
     let s2 = statuses2.clone();
 
-    let task1 =
-        DownloadPounceBuilder::new("dup.bin", &path1, 1024, url.clone(), Method::GET).build();
-    let task2 = DownloadPounceBuilder::new("dup.bin", &path2, 1024, url, Method::GET).build();
+    let task1 = DownloadPounceBuilder::new("dup.bin", &path1, 1024, url.clone()).build();
+    let task2 = DownloadPounceBuilder::new("dup.bin", &path2, 1024, url).build();
 
     client
-        .enqueue(
+        .try_enqueue(
             task1,
             move |record: FileTransferRecord| {
                 s1.lock()
@@ -60,7 +58,7 @@ async fn second_enqueue_with_same_download_url_hits_duplicate_branch() {
         .await
         .expect("enqueue first task");
     client
-        .enqueue(
+        .try_enqueue(
             task2,
             move |record: FileTransferRecord| {
                 s2.lock()
@@ -112,11 +110,10 @@ async fn resume_without_pause_hits_invalid_task_state_branch() {
         &path,
         1024,
         format!("{}/download/invalid.bin", server.base_url()),
-        Method::GET,
     )
     .build();
     let task_id = client
-        .enqueue(task, |_record: FileTransferRecord| {}, |_, _| {})
+        .try_enqueue(task, |_record: FileTransferRecord| {}, |_, _| {})
         .await
         .expect("enqueue task");
 

@@ -1,4 +1,3 @@
-use reqwest::Method;
 use rusty_cat::down_pounce_builder::DownloadPounceBuilder;
 use rusty_cat::error::InnerErrorCode;
 use rusty_cat::file_transfer_record::FileTransferRecord;
@@ -14,11 +13,10 @@ async fn cancel_unknown_task_returns_task_not_found() {
         std::env::temp_dir().join("task-not-found.bin"),
         1024,
         "http://127.0.0.1:9/not-used",
-        Method::GET,
     )
     .build();
     let task_id = client
-        .enqueue(task, |_record: FileTransferRecord| {}, |_, _| {})
+        .try_enqueue(task, |_record: FileTransferRecord| {}, |_, _| {})
         .await
         .expect("enqueue");
 
@@ -47,11 +45,10 @@ async fn pause_unknown_task_returns_task_not_found() {
         std::env::temp_dir().join("task-not-found-pause.bin"),
         1024,
         "http://127.0.0.1:9/not-used",
-        Method::GET,
     )
     .build();
     let task_id = client
-        .enqueue(task, |_record: FileTransferRecord| {}, |_, _| {})
+        .try_enqueue(task, |_record: FileTransferRecord| {}, |_, _| {})
         .await
         .expect("enqueue");
 
@@ -77,11 +74,10 @@ async fn resume_unknown_task_returns_task_not_found() {
         std::env::temp_dir().join("task-not-found-resume.bin"),
         1024,
         "http://127.0.0.1:9/not-used",
-        Method::GET,
     )
     .build();
     let task_id = client
-        .enqueue(task, |_record: FileTransferRecord| {}, |_, _| {})
+        .try_enqueue(task, |_record: FileTransferRecord| {}, |_, _| {})
         .await
         .expect("enqueue");
 

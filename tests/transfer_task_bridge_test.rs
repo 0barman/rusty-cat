@@ -241,7 +241,7 @@ async fn custom_upload_breakpoint_exercises_transfer_task_getters() {
         .build()
         .expect("build upload task");
     client
-        .enqueue(
+        .try_enqueue(
             task,
             move |record: FileTransferRecord| {
                 statuses_cb
@@ -289,12 +289,11 @@ async fn custom_download_breakpoint_exercises_transfer_task_getters() {
         &path,
         1024,
         format!("{}/download/bridge.bin", server.base_url()),
-        Method::GET,
     )
     .with_breakpoint_download(protocol)
     .build();
     client
-        .enqueue(
+        .try_enqueue(
             task,
             move |record: FileTransferRecord| {
                 statuses_cb

@@ -95,7 +95,10 @@ impl MeowError {
         self.code
     }
 
-    /// Returns error message as an owned `String`.
+    /// Returns the error message as a borrowed `&str`.
+    ///
+    /// Borrowing avoids an allocation on every call; callers that need an
+    /// owned `String` can do `err.msg().to_owned()` explicitly.
     ///
     /// # Examples
     ///
@@ -103,10 +106,10 @@ impl MeowError {
     /// use rusty_cat::api::{InnerErrorCode, MeowError};
     ///
     /// let err = MeowError::from_code_str(InnerErrorCode::InvalidRange, "bad range");
-    /// assert_eq!(err.msg(), "bad range".to_string());
+    /// assert_eq!(err.msg(), "bad range");
     /// ```
-    pub fn msg(&self) -> String {
-        self.msg.clone()
+    pub fn msg(&self) -> &str {
+        &self.msg
     }
 
     /// Creates an error from [`InnerErrorCode`] with empty message.

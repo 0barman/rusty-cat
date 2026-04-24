@@ -2,7 +2,7 @@ use std::fmt;
 
 use uuid::Uuid;
 
-/// Task ID returned by [`crate::MeowClient::enqueue`].
+/// Task ID returned by [`crate::MeowClient::try_enqueue`].
 ///
 /// Use this ID for pause/resume/cancel operations on the same task.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

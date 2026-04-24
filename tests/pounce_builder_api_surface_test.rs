@@ -32,24 +32,24 @@ fn download_builder_all_chain_methods_take_effect_in_built_task() {
     let mut headers = HeaderMap::new();
     headers.insert("x-case", HeaderValue::from_static("download-surface"));
 
-    let task =
-        DownloadPounceBuilder::new("origin.bin", &path, 2048, "http://127.0.0.1/a", Method::GET)
-            .with_url("http://127.0.0.1/b")
-            .with_file_path(&moved_path)
-            .with_method(Method::POST)
-            .with_headers(headers)
-            .with_client_file_sign("client-sign-123")
-            .with_breakpoint_download(Arc::new(StandardRangeDownload))
-            .with_breakpoint_download_http(BreakpointDownloadHttpConfig {
-                range_accept: "application/custom-surface".to_string(),
-            })
-            .with_max_chunk_retries(7)
-            .build();
+    let task = DownloadPounceBuilder::new("origin.bin", &path, 2048, "http://127.0.0.1/a")
+        .with_url("http://127.0.0.1/b")
+        .with_file_path(&moved_path)
+        .with_headers(headers)
+        .with_client_file_sign("client-sign-123")
+        .with_breakpoint_download(Arc::new(StandardRangeDownload))
+        .with_breakpoint_download_http(BreakpointDownloadHttpConfig {
+            range_accept: "application/custom-surface".to_string(),
+        })
+        .with_max_chunk_retries(7)
+        .build();
 
     let text = format!("{task:?}");
     assert!(text.contains("file_name: \"origin.bin\""));
     assert!(text.contains("url: \"http://127.0.0.1/b\""));
-    assert!(text.contains("method: POST"));
+    // Download method is fixed by the executor (HEAD + GET) and is not a
+    // configurable builder knob; the placeholder in the task is GET.
+    assert!(text.contains("method: GET"));
     assert!(text.contains("client_file_sign: Some(\"client-sign-123\")"));
     assert!(text.contains("range_accept: \"application/custom-surface\""));
     assert!(text.contains("max_chunk_retries: 7"));

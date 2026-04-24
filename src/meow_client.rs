@@ -32,9 +32,76 @@ pub type GlobalProgressListener = ProgressCb;
 /// 4. Call [`Self::enqueue`] and store returned [`TaskId`].
 /// 5. Control task lifecycle with pause/resume/cancel.
 /// 6. Call [`Self::close`] during shutdown.
-#[derive(Clone)]
+///
+/// # Lifecycle contract: you **must** call [`Self::close`]
+///
+/// The background scheduler runs on a dedicated [`std::thread`] that drives
+/// its own Tokio runtime. That thread is **detached**: there is no handle
+/// stored anywhere to `join()` it, and the only clean shutdown protocol is
+/// an explicit `close().await` command which:
+///
+/// - cancels in-flight transfers,
+/// - flushes `Paused` status events to user callbacks for every known group,
+/// - breaks the worker loop and lets the runtime drop.
+///
+/// Forgetting to call `close` leaves the scheduler thread alive until all
+/// command senders are dropped (which does happen when `MeowClient` is
+/// dropped, but only as a fallback). When that fallback path runs, the
+/// guarantees above do **not** hold: callers may miss terminal status
+/// events, in-flight HTTP transfers are aborted abruptly, and for long-lived
+/// SDK hosts (servers, mobile runtimes, etc.) the misuse is nearly
+/// impossible to debug from the outside.
+///
+/// To help surface this misuse the internal executor implements a
+/// **best-effort [`Drop`]** that, when `close` was never called:
+///
+/// - emits a `Warn`-level log via the debug log listener (tag
+///   `"executor_drop"`),
+/// - performs a non-blocking `try_send` of a final `Close` command so the
+///   worker still has a chance to drain its state,
+/// - then drops the command sender, causing the worker loop to exit on its
+///   own.
+///
+/// This is a safety net, **not** a substitute for calling `close`. Treat
+/// `close().await` as a mandatory step in your shutdown sequence.
+///
+/// # Sharing across tasks / threads
+///
+/// `MeowClient` **intentionally does not implement [`Clone`]**.
+///
+/// The client owns a lazily-initialized [`Executor`] (a single background
+/// worker loop plus its task table, scheduler state and shutdown flag). A
+/// naive field-by-field `Clone` would copy the `OnceLock<Executor>` *before*
+/// it was initialized, letting different clones each spin up their **own**
+/// executor on first use. The result would be:
+///
+/// - multiple independent task tables (tasks enqueued via one clone are
+///   invisible to `pause` / `resume` / `cancel` / `snapshot` on another);
+/// - concurrency limits ([`MeowConfig::max_upload_concurrency`] /
+///   [`MeowConfig::max_download_concurrency`]) silently multiplied by the
+///   number of clones;
+/// - [`Self::close`] only shutting down one of the worker loops, leaking the
+///   rest.
+///
+/// To share a client across tasks or threads, wrap it in [`std::sync::Arc`]
+/// and clone the `Arc` instead:
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use rusty_cat::api::{MeowClient, MeowConfig};
+///
+/// let client = Arc::new(MeowClient::new(MeowConfig::default()));
+/// let client_for_task = Arc::clone(&client);
+/// tokio::spawn(async move {
+///     let _ = client_for_task; // use the shared client here
+/// });
+/// ```
 pub struct MeowClient {
     /// Lazily initialized task executor.
+    ///
+    /// Deliberately **not** wrapped in `Arc`: `MeowClient` is not `Clone`, so
+    /// there is exactly one owner of this `OnceLock`. Share the whole client
+    /// via `Arc<MeowClient>` when multi-owner access is needed.
     executor: OnceLock<Executor>,
     /// Immutable runtime configuration.
     config: MeowConfig,
@@ -326,16 +393,45 @@ impl MeowClient {
 }
 
 impl MeowClient {
-    /// Enqueues a transfer task and returns its [`TaskId`].
+    /// Submits a transfer task to the internal scheduler and returns its
+    /// [`TaskId`].
     ///
     /// The actual upload/download execution is dispatched to an internal
     /// worker system thread. This method only performs lightweight validation
     /// and submission, so it does not block the caller thread waiting for full
     /// transfer completion.
     ///
-    /// `enqueue` is also the recovery entrypoint after process restart. If the
-    /// application was killed during a previous upload/download, restart your
-    /// process and call `enqueue` again to resume that transfer workflow.
+    /// `try_enqueue` is also the recovery entrypoint after process restart.
+    /// If the application was killed during a previous upload/download,
+    /// restart your process and call `try_enqueue` again to resume that
+    /// transfer workflow.
+    ///
+    /// # Back-pressure semantics (why the `try_` prefix)
+    ///
+    /// Internally this method uses
+    /// [`tokio::sync::mpsc::Sender::try_send`] to hand the `Enqueue` command
+    /// to the scheduler worker, **not** `send().await`. That means:
+    ///
+    /// - The `await` point in this function is used for task normalization
+    ///   (e.g. resolving upload breakpoints, building [`InnerTask`]), **not**
+    ///   for waiting on command-queue capacity.
+    /// - If the command queue is momentarily full (bursty enqueue under
+    ///   [`MeowConfig::command_queue_capacity`]), this method returns an
+    ///   immediate `CommandSendFailed` error instead of suspending the
+    ///   caller until a slot frees up.
+    /// - Other control APIs ([`Self::pause`], [`Self::resume`],
+    ///   [`Self::cancel`], [`Self::snapshot`]) use `send().await` and **do**
+    ///   wait for queue capacity. Only enqueue is fail-fast.
+    ///
+    /// Callers that want to batch-enqueue under burst load should either:
+    ///
+    /// 1. size [`MeowConfig::command_queue_capacity`] appropriately, or
+    /// 2. retry on `CommandSendFailed` with their own back-off, or
+    /// 3. rate-limit enqueue calls on the caller side.
+    ///
+    /// The name explicitly carries `try_` so this fail-fast behavior is
+    /// visible at the call site. If a fully-awaiting variant is introduced
+    /// later it should be named `enqueue` (without the `try_` prefix).
     ///
     /// # Parameters
     ///
@@ -351,7 +447,7 @@ impl MeowClient {
     /// - `task` must be non-empty (required path/name/url and valid upload size).
     /// - Callback should be lightweight and non-blocking.
     /// - Store returned task ID for subsequent task control operations.
-    /// - `enqueue` is asynchronous task submission, not synchronous transfer.
+    /// - `try_enqueue` is asynchronous task submission, not synchronous transfer.
     /// - For restart recovery, re-enqueue the same logical task (same
     ///   upload/download target and compatible checkpoint context) so the
     ///   runtime can continue from existing local/remote progress.
@@ -361,12 +457,13 @@ impl MeowClient {
     /// Returns:
     /// - `ClientClosed` if the client was closed.
     /// - `ParameterEmpty` if the task is invalid/empty.
-    /// - Any runtime initialization or enqueue errors from the executor.
+    /// - `CommandSendFailed` if the scheduler command queue is full at the
+    ///   moment of submission (see back-pressure semantics above).
+    /// - Any runtime initialization errors from the executor.
     ///
     /// # Examples
     ///
     /// ```no_run
-    /// use reqwest::Method;
     /// use rusty_cat::api::{DownloadPounceBuilder, MeowClient, MeowConfig};
     ///
     /// # async fn run() -> Result<(), rusty_cat::api::MeowError> {
@@ -376,12 +473,11 @@ impl MeowClient {
     ///     "./downloads/example.bin",
     ///     1024 * 1024,
     ///     "https://example.com/example.bin",
-    ///     Method::GET,
     /// )
     /// .build();
     ///
     /// let task_id = client
-    ///     .enqueue(
+    ///     .try_enqueue(
     ///         task,
     ///         |record| {
     ///             println!("status={:?} progress={:.2}", record.status(), record.progress());
@@ -395,7 +491,7 @@ impl MeowClient {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn enqueue<PCB, CCB>(
+    pub async fn try_enqueue<PCB, CCB>(
         &self,
         task: PounceTask,
         progress_cb: PCB,
@@ -407,11 +503,11 @@ impl MeowClient {
     {
         self.ensure_open()?;
         if task.is_empty() {
-            crate::meow_flow_log!("enqueue", "reject empty task");
+            crate::meow_flow_log!("try_enqueue", "reject empty task");
             return Err(MeowError::from_code1(InnerErrorCode::ParameterEmpty));
         }
 
-        crate::meow_flow_log!("enqueue", "task={:?}", task);
+        crate::meow_flow_log!("try_enqueue", "task={:?}", task);
 
         let progress: ProgressCb = Arc::new(progress_cb);
         let complete: Option<CompleteCb> = Some(Arc::new(complete_cb) as CompleteCb);
@@ -427,8 +523,8 @@ impl MeowClient {
         )
         .await?;
 
-        let task_id = self.get_exec()?.enqueue(inner, callbacks)?;
-        crate::meow_flow_log!("enqueue", "enqueue success: task_id={:?}", task_id);
+        let task_id = self.get_exec()?.try_enqueue(inner, callbacks)?;
+        crate::meow_flow_log!("try_enqueue", "try_enqueue success: task_id={:?}", task_id);
         Ok(task_id)
     }
 
