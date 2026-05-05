@@ -31,7 +31,13 @@ async fn second_enqueue_with_same_download_url_hits_duplicate_branch() {
     // 3) 该用例覆盖 worker 里的 duplicate 分支行为。
     let payload = b"duplicate-branch-payload".repeat(8192);
     let server = dev_server::DevFileServer::spawn(payload);
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
 
     let url = format!("{}/download/dup.bin", server.base_url());
     let path1 = temp_download_path("dup1");
@@ -102,7 +108,13 @@ async fn resume_without_pause_hits_invalid_task_state_branch() {
     // 3) 应返回 InvalidTaskState，覆盖 resume_group 中“not paused”分支。
     let payload = b"invalid-state-payload".repeat(8192);
     let server = dev_server::DevFileServer::spawn(payload);
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let path = temp_download_path("invalid_resume");
 
     let task = DownloadPounceBuilder::new(

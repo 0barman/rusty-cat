@@ -39,7 +39,13 @@ fn temp_path(case: &str) -> PathBuf {
 
 #[tokio::test]
 async fn enqueue_download_empty_file_name_returns_parameter_empty() {
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let task =
         DownloadPounceBuilder::new("", temp_path("empty_name"), 1024, "http://127.0.0.1:9/x")
             .build();
@@ -53,7 +59,13 @@ async fn enqueue_download_empty_file_name_returns_parameter_empty() {
 
 #[tokio::test]
 async fn enqueue_download_empty_url_returns_parameter_empty() {
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let task = DownloadPounceBuilder::new("a.bin", temp_path("empty_url"), 1024, "").build();
     let err = client
         .try_enqueue(task, |_r: FileTransferRecord| {}, |_, _| {})
@@ -65,7 +77,13 @@ async fn enqueue_download_empty_url_returns_parameter_empty() {
 
 #[tokio::test]
 async fn enqueue_download_empty_local_path_returns_parameter_empty() {
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let task = DownloadPounceBuilder::new("a.bin", "", 1024, "http://127.0.0.1:9/x").build();
     let err = client
         .try_enqueue(task, |_r: FileTransferRecord| {}, |_, _| {})
@@ -83,7 +101,13 @@ async fn enqueue_upload_empty_url_returns_parameter_empty() {
         .with_url("")
         .build()
         .expect("build upload task");
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let err = client
         .try_enqueue(task, |_r: FileTransferRecord| {}, |_, _| {})
         .await
@@ -101,7 +125,13 @@ async fn enqueue_upload_zero_byte_file_returns_parameter_empty() {
         .with_url("http://127.0.0.1:9/up")
         .build()
         .expect("build upload task");
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let err = client
         .try_enqueue(task, |_r: FileTransferRecord| {}, |_, _| {})
         .await
@@ -119,7 +149,13 @@ async fn enqueue_upload_empty_file_name_returns_parameter_empty() {
         .with_url("http://127.0.0.1:9/up")
         .build()
         .expect("build upload task");
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let err = client
         .try_enqueue(task, |_r: FileTransferRecord| {}, |_, _| {})
         .await
@@ -131,7 +167,13 @@ async fn enqueue_upload_empty_file_name_returns_parameter_empty() {
 
 #[tokio::test]
 async fn enqueue_upload_empty_source_path_returns_parameter_empty() {
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let task = match UploadPounceBuilder::new("up.bin", PathBuf::new(), 1024)
         .with_url("http://127.0.0.1:9/up")
         .build()
@@ -173,7 +215,13 @@ fn upload_builder_build_missing_file_returns_not_found_io_error() {
 
 #[tokio::test]
 async fn enqueue_after_client_close_returns_client_closed() {
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     client.close().await.expect("close");
     let task = DownloadPounceBuilder::new(
         "late.bin",
@@ -191,7 +239,13 @@ async fn enqueue_after_client_close_returns_client_closed() {
 
 #[tokio::test]
 async fn snapshot_after_client_close_returns_client_closed() {
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     client.close().await.expect("close");
     let err = client.snapshot().await.expect_err("snapshot after close");
     assert_eq!(err.code(), InnerErrorCode::ClientClosed as i32);
@@ -199,7 +253,13 @@ async fn snapshot_after_client_close_returns_client_closed() {
 
 #[tokio::test]
 async fn second_close_returns_client_closed() {
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     client.close().await.expect("first close");
     let err = client.close().await.expect_err("second close");
     assert_eq!(err.code(), InnerErrorCode::ClientClosed as i32);
@@ -207,50 +267,80 @@ async fn second_close_returns_client_closed() {
 
 #[tokio::test]
 async fn is_closed_reflects_successful_close() {
-    let client = MeowClient::new(MeowConfig::new(1, 1));
-    assert!(!client.is_closed().await);
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
+    assert!(!client.is_closed());
     client.close().await.expect("close");
-    assert!(client.is_closed().await);
+    assert!(client.is_closed());
 }
 
 // --- 全局进度监听器：空列表 clear（合法但覆盖 API 表面）---
 
 #[test]
 fn clear_global_listener_on_fresh_client_succeeds() {
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     client.clear_global_listener().expect("clear when empty");
 }
 
 // --- MeowConfig：队列容量为 0 ---
-// `MeowConfig` 当前不在构造期校验；首次拉起 executor 时 Tokio `mpsc::channel(0)` 会 panic。
-// 用 `#[should_panic]` 锁定该非法配置的可观测行为（若未来改为返回 `MeowError`，应改写为错误断言）。
+// `MeowConfig` 通过 builder 的 build() 集中硬校验，非法值应在构造期返回 MeowError，
+// 不能延迟到 executor 初始化时由 Tokio panic。
 
-#[tokio::test]
-#[should_panic(expected = "buffer > 0")]
-async fn meow_config_zero_command_queue_capacity_panics_on_first_use() {
-    let client = MeowClient::new(MeowConfig::default().with_command_queue_capacity(0));
-    client.snapshot().await.expect("triggers executor init");
+#[test]
+fn meow_config_zero_command_queue_capacity_is_rejected_by_builder() {
+    let err = MeowConfig::builder()
+        .command_queue_capacity(0)
+        .build()
+        .expect_err("zero command queue capacity must be rejected");
+    assert_eq!(err.code(), InnerErrorCode::ParameterEmpty as i32);
 }
 
-#[tokio::test]
-#[should_panic(expected = "buffer > 0")]
-async fn meow_config_zero_worker_event_queue_capacity_panics_on_first_use() {
-    let client = MeowClient::new(MeowConfig::default().with_worker_event_queue_capacity(0));
-    client.snapshot().await.expect("triggers executor init");
+#[test]
+fn meow_config_zero_worker_event_queue_capacity_is_rejected_by_builder() {
+    let err = MeowConfig::builder()
+        .worker_event_queue_capacity(0)
+        .build()
+        .expect_err("zero worker event queue capacity must be rejected");
+    assert_eq!(err.code(), InnerErrorCode::ParameterEmpty as i32);
 }
 
-/// 并发上限为 0 时调度器不会拉起任务，但客户端 API 仍应可初始化并查询快照。
-#[tokio::test]
-async fn meow_config_zero_transfer_concurrency_snapshot_still_ok() {
-    let client = MeowClient::new(MeowConfig::new(0, 0));
-    let snap = client.snapshot().await.expect("snapshot");
-    assert_eq!(snap.active_groups, 0);
-    client.close().await.expect("close");
+#[test]
+fn meow_config_zero_transfer_concurrency_is_rejected_by_builder() {
+    let err = MeowConfig::builder()
+        .max_upload_concurrency(0)
+        .max_download_concurrency(1)
+        .build()
+        .expect_err("zero upload concurrency must be rejected");
+    assert_eq!(err.code(), InnerErrorCode::ParameterEmpty as i32);
+
+    let err = MeowConfig::builder()
+        .max_upload_concurrency(1)
+        .max_download_concurrency(0)
+        .build()
+        .expect_err("zero download concurrency must be rejected");
+    assert_eq!(err.code(), InnerErrorCode::ParameterEmpty as i32);
 }
 
 #[tokio::test]
 async fn control_apis_after_close_return_client_closed_even_with_prior_task_id() {
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let task = DownloadPounceBuilder::new(
         "ctrl-after-close.bin",
         temp_path("ctrl_after_close"),

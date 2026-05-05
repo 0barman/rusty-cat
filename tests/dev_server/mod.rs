@@ -62,9 +62,7 @@ impl DevFileServer {
                     Err(_) => break,
                 };
 
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .expect("set dev server read timeout");
+                configure_accepted_stream(&stream, "dev server");
                 if let Err(e) = handle_one_connection(&mut stream, &payload, &inspector_for_thread)
                 {
                     let _ = stream.write_all(
@@ -126,9 +124,7 @@ impl ScriptedServer {
                     Ok(v) => v,
                     Err(_) => break,
                 };
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .expect("set scripted server read timeout");
+                configure_accepted_stream(&stream, "scripted server");
                 let _ = read_http_request(&mut stream);
                 if stream.write_all(response.as_bytes()).is_err() {
                     break;
@@ -190,9 +186,7 @@ impl FlakyDownloadServer {
                     }
                     Err(_) => break,
                 };
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .expect("set flaky server read timeout");
+                configure_accepted_stream(&stream, "flaky server");
                 let (request_line, _, _) = match read_http_request(&mut stream) {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -250,6 +244,21 @@ impl Drop for FlakyDownloadServer {
             let _ = handle.join();
         }
     }
+}
+
+fn configure_accepted_stream(stream: &std::net::TcpStream, server_name: &str) {
+    // Some platforms inherit nonblocking mode from the listener. The test
+    // server handles one connection per accepted stream with blocking IO, so
+    // force streams back to blocking mode before read/write_all/flush.
+    stream
+        .set_nonblocking(false)
+        .unwrap_or_else(|e| panic!("set {server_name} stream blocking: {e}"));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap_or_else(|e| panic!("set {server_name} read timeout: {e}"));
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap_or_else(|e| panic!("set {server_name} write timeout: {e}"));
 }
 
 fn handle_one_connection(

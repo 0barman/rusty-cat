@@ -251,7 +251,13 @@ async fn from_bytes_upload_success_and_file_sign_matches_payload_md5() {
     let expected_sign = format!("{:x}", md5::compute(&payload));
 
     let server = dev_server::DevFileServer::spawn(Vec::new());
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
 
     let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
     let statuses_cb = statuses.clone();
@@ -303,7 +309,13 @@ async fn from_bytes_upload_success_and_file_sign_matches_payload_md5() {
 async fn from_bytes_duplicate_semantics_match_file_source() {
     let payload = b"from-bytes-duplicate-check".repeat(256 * 1024);
     let server = dev_server::DevFileServer::spawn(Vec::new());
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
 
     let second_statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
     let s2 = second_statuses.clone();
@@ -369,7 +381,13 @@ async fn from_bytes_and_file_source_match_on_retry_and_callback_semantics() {
             .with_url(format!("{}/upload/retry-file.bin", server.base_url()))
             .build()
             .expect("build file retry task");
-        let client = MeowClient::new(MeowConfig::new(1, 1));
+        let client = MeowClient::new(
+            MeowConfig::builder()
+                .max_upload_concurrency(1)
+                .max_download_concurrency(1)
+                .build()
+                .expect("valid config"),
+        );
         let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
         let statuses_cb = statuses.clone();
         let complete_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -408,7 +426,13 @@ async fn from_bytes_and_file_source_match_on_retry_and_callback_semantics() {
             .with_url(format!("{}/upload/retry-bytes.bin", server.base_url()))
             .build()
             .expect("build bytes retry task");
-        let client = MeowClient::new(MeowConfig::new(1, 1));
+        let client = MeowClient::new(
+            MeowConfig::builder()
+                .max_upload_concurrency(1)
+                .max_download_concurrency(1)
+                .build()
+                .expect("valid config"),
+        );
         let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
         let statuses_cb = statuses.clone();
         let complete_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));

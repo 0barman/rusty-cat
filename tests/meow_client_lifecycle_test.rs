@@ -3,8 +3,9 @@ mod dev_server;
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusty_cat::down_pounce_builder::DownloadPounceBuilder;
 use rusty_cat::error::InnerErrorCode;
@@ -29,14 +30,17 @@ async fn close_without_executor_initialization_marks_client_closed() {
     // 1) 客户端刚创建，还没有 enqueue 过任务，因此内部 executor 尚未初始化；
     // 2) 直接调用 close 应该成功，并将 closed 标记置为 true；
     // 3) 第二次 close 应该返回 ClientClosed，证明 close 语义是可观测且一致的。
-    let client = MeowClient::new(MeowConfig::new(1, 1));
-
-    assert!(!client.is_closed().await, "new client must be open");
-    client.close().await.expect("first close should succeed");
-    assert!(
-        client.is_closed().await,
-        "client must be closed after close"
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
     );
+
+    assert!(!client.is_closed(), "new client must be open");
+    client.close().await.expect("first close should succeed");
+    assert!(client.is_closed(), "client must be closed after close");
 
     let second_close = client
         .close()
@@ -53,7 +57,13 @@ async fn all_control_apis_return_client_closed_after_close() {
     // 3) 对 enqueue/pause/resume/cancel/snapshot 全部再次调用，统一期望 ClientClosed。
     let payload = b"meow-lifecycle-payload".repeat(4096);
     let server = dev_server::DevFileServer::spawn(payload);
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let path = temp_download_path("after_close");
 
     let task = DownloadPounceBuilder::new(
@@ -69,7 +79,7 @@ async fn all_control_apis_return_client_closed_after_close() {
         .expect("enqueue initial task");
 
     client.close().await.expect("close should succeed");
-    assert!(client.is_closed().await, "client should be closed now");
+    assert!(client.is_closed(), "client should be closed now");
 
     let new_path = temp_download_path("enqueue_closed");
     let enqueue_after_close = client
@@ -141,7 +151,13 @@ async fn close_active_transfer_should_emit_pause_or_terminal_status() {
     // 说明：close 流程会主动发 Paused 并清理任务，不强制要求固定终态。
     let payload = b"meow-close-active".repeat(8192);
     let server = dev_server::DevFileServer::spawn(payload);
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let path = temp_download_path("close_active");
     let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
     let statuses_cb = statuses.clone();
@@ -193,6 +209,69 @@ async fn close_active_transfer_should_emit_pause_or_terminal_status() {
             )
         }),
         "after close there should be at least one paused/terminal status observable"
+    );
+
+    let _ = fs::remove_file(&path);
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn close_waits_for_already_dispatched_callbacks_to_finish() {
+    // 场景说明：
+    // 1) 任务入队后 Pending/Transmission 等进度回调会先投递到 callback dispatcher；
+    // 2) 回调内部模拟慢消费者；
+    // 3) close().await 必须等 dispatcher drain 完毕后才返回，否则 finished 标记会仍为 false。
+    let payload = b"close-callback-barrier".repeat(4096);
+    let server = dev_server::DevFileServer::spawn(payload);
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
+    let path = temp_download_path("close_waits_callback");
+    let callback_started = Arc::new(AtomicBool::new(false));
+    let callback_finished = Arc::new(AtomicBool::new(false));
+    let started_for_cb = callback_started.clone();
+    let finished_for_cb = callback_finished.clone();
+
+    let task = DownloadPounceBuilder::new(
+        "barrier.bin",
+        &path,
+        1024,
+        format!("{}/download/barrier.bin", server.base_url()),
+    )
+    .build();
+    client
+        .try_enqueue(
+            task,
+            move |_record: FileTransferRecord| {
+                if !started_for_cb.swap(true, Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(150));
+                    finished_for_cb.store(true, Ordering::SeqCst);
+                }
+            },
+            |_, _| {},
+        )
+        .await
+        .expect("enqueue barrier task");
+
+    for _ in 0..100 {
+        if callback_started.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        callback_started.load(Ordering::SeqCst),
+        "test must observe a callback before closing"
+    );
+
+    client.close().await.expect("close should drain callbacks");
+    assert!(
+        callback_finished.load(Ordering::SeqCst),
+        "close().await must return only after already dispatched callback finishes"
     );
 
     let _ = fs::remove_file(&path);

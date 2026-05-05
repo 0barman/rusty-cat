@@ -49,7 +49,13 @@ async fn default_retry_3_recovers_after_two_chunk_failures() {
         format!("{}/download", server.base_url()),
     )
     .build();
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
 
     let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
     let statuses_cb = statuses.clone();
@@ -89,7 +95,13 @@ async fn configured_retry_0_fails_on_first_chunk_failure() {
     )
     .with_max_chunk_retries(0)
     .build();
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
 
     let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
     let statuses_cb = statuses.clone();

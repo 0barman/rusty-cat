@@ -32,7 +32,13 @@ async fn run_download_case_with_responses(
     if let Some(bytes) = init_local {
         fs::write(&path, bytes).expect("write initial local bytes");
     }
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
     let statuses_cb = statuses.clone();
 

@@ -285,9 +285,13 @@ async fn custom_reqwest_client_is_used_on_upload_path() {
         .expect("build custom http client");
 
     let client = MeowClient::new(
-        MeowConfig::new(1, 1)
-            .with_http_client(custom_http)
-            .with_http_timeout(Duration::from_secs(10)),
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .http_client(custom_http)
+            .http_timeout(Duration::from_secs(10))
+            .build()
+            .expect("valid config"),
     );
 
     let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));

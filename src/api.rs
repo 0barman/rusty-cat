@@ -2,6 +2,14 @@
 //!
 //! Import from this module when you want a stable, single entry point for the
 //! most commonly used SDK types.
+#[cfg(feature = "aliyun-oss-direct")]
+pub use crate::aliyun_oss_direct;
+#[cfg(feature = "aliyun-oss-presigned")]
+pub use crate::aliyun_oss_presigned;
+#[cfg(feature = "azure-blob-direct")]
+pub use crate::azure_blob_direct;
+#[cfg(feature = "azure-blob-sas")]
+pub use crate::azure_blob_sas;
 pub use crate::chunk_outcome::ChunkOutcome;
 pub use crate::dflt::default_http_transfer::DefaultHttpTransfer;
 pub use crate::direction::Direction;
@@ -19,9 +27,15 @@ pub use crate::log::{
     DebugLogListener, DebugLogListenerError, Log, LogLevel,
 };
 pub use crate::meow_client::{GlobalProgressListener, MeowClient};
-pub use crate::meow_config::MeowConfig;
+pub use crate::meow_config::{MeowConfig, MeowConfigBuilder};
 pub use crate::pounce_task::PounceTask;
 pub use crate::prepare_outcome::PrepareOutcome;
+#[cfg(feature = "presigned")]
+pub use crate::presigned::{
+    headers_from_pairs, CompletionRequest, PresignedDownloadUrlRefresher, PresignedMultipartUpload,
+    PresignedMultipartUploadPlan, PresignedRangeDownload, PresignedRangeDownloadPlan,
+    PresignedUploadPart, PresignedUploadUrlRefresher, PresignedUploadedPart,
+};
 pub use crate::transfer_executor_trait::TransferTrait;
 pub use crate::transfer_snapshot::TransferSnapshot;
 pub use crate::transfer_status::TransferStatus;

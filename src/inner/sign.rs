@@ -43,43 +43,42 @@ mod tests {
     use super::calculate_sign;
     use tokio::fs::File;
 
-    fn temp_path(case: &str) -> std::path::PathBuf {
+    fn temp_path(case: &str) -> Result<std::path::PathBuf, std::time::SystemTimeError> {
         let mut p = std::env::temp_dir();
         let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock before epoch")
+            .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
         p.push(format!("rusty_cat_sign_unit_{case}_{ts}.bin"));
-        p
+        Ok(p)
     }
 
     #[tokio::test]
-    async fn calculate_sign_matches_known_md5_for_non_empty_file() {
+    async fn calculate_sign_matches_known_md5_for_non_empty_file(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let payload = b"sign-module-non-empty".repeat(1024);
         let expected = format!("{:x}", md5::compute(&payload));
-        let path = temp_path("non_empty");
-        tokio::fs::write(&path, &payload)
-            .await
-            .expect("write sign fixture");
+        let path = temp_path("non_empty")?;
+        tokio::fs::write(&path, &payload).await?;
 
-        let file = File::open(&path).await.expect("open sign fixture");
-        let sign = calculate_sign(&file).await.expect("calculate sign");
+        let file = File::open(&path).await?;
+        let sign = calculate_sign(&file).await?;
         assert_eq!(sign, expected, "sign should equal known MD5");
 
         let _ = tokio::fs::remove_file(&path).await;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn calculate_sign_for_empty_file_returns_empty_md5() {
-        let path = temp_path("empty");
-        tokio::fs::write(&path, b"")
-            .await
-            .expect("write empty sign fixture");
+    async fn calculate_sign_for_empty_file_returns_empty_md5(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_path("empty")?;
+        tokio::fs::write(&path, b"").await?;
 
-        let file = File::open(&path).await.expect("open empty sign fixture");
-        let sign = calculate_sign(&file).await.expect("calculate empty sign");
+        let file = File::open(&path).await?;
+        let sign = calculate_sign(&file).await?;
         assert_eq!(sign, "d41d8cd98f00b204e9800998ecf8427e");
 
         let _ = tokio::fs::remove_file(&path).await;
+        Ok(())
     }
 }

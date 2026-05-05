@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use reqwest::Client;
+use rusty_cat::error::InnerErrorCode;
 use rusty_cat::http_breakpoint::BreakpointDownloadHttpConfig;
 use rusty_cat::meow_config::MeowConfig;
 
@@ -23,15 +24,34 @@ fn meow_config_default_and_builder_paths_work_as_expected() {
     let custom_bp = BreakpointDownloadHttpConfig {
         range_accept: "application/custom-binary".to_string(),
     };
-    let custom_cfg = MeowConfig::new(3, 4)
-        .with_http_client(Client::new())
-        .with_http_timeout(Duration::from_secs(11))
-        .with_tcp_keepalive(Duration::from_secs(17))
-        .with_breakpoint_download_http(custom_bp.clone());
+    let custom_cfg = MeowConfig::builder()
+        .max_upload_concurrency(3)
+        .max_download_concurrency(4)
+        .http_client(Client::new())
+        .http_timeout(Duration::from_secs(11))
+        .tcp_keepalive(Duration::from_secs(17))
+        .breakpoint_download_http(custom_bp.clone())
+        .build()
+        .expect("valid custom config");
 
     assert_eq!(custom_cfg.max_upload_concurrency(), 3);
     assert_eq!(custom_cfg.max_download_concurrency(), 4);
     assert_eq!(custom_cfg.http_timeout(), Duration::from_secs(11));
     assert_eq!(custom_cfg.tcp_keepalive(), Duration::from_secs(17));
     assert_eq!(custom_cfg.breakpoint_download_http(), &custom_bp);
+}
+
+#[test]
+fn meow_config_builder_rejects_zero_durations() {
+    let err = MeowConfig::builder()
+        .http_timeout(Duration::ZERO)
+        .build()
+        .expect_err("zero http timeout must be rejected");
+    assert_eq!(err.code(), InnerErrorCode::ParameterEmpty as i32);
+
+    let err = MeowConfig::builder()
+        .tcp_keepalive(Duration::ZERO)
+        .build()
+        .expect_err("zero tcp keepalive must be rejected");
+    assert_eq!(err.code(), InnerErrorCode::ParameterEmpty as i32);
 }

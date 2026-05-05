@@ -78,7 +78,13 @@ async fn dropping_meow_client_without_close_emits_warn_and_does_not_hang() {
     collector.install();
 
     {
-        let client = MeowClient::new(MeowConfig::new(1, 1));
+        let client = MeowClient::new(
+            MeowConfig::builder()
+                .max_upload_concurrency(1)
+                .max_download_concurrency(1)
+                .build()
+                .expect("valid config"),
+        );
         // 强制触发内部 executor 懒初始化；否则 `OnceLock` 里为空，Drop 根本
         // 不会走到 Executor::drop，测不出 best-effort 路径。
         let _ = client
@@ -113,7 +119,13 @@ async fn dropping_meow_client_after_close_does_not_emit_warn() {
     collector.install();
 
     {
-        let client = MeowClient::new(MeowConfig::new(1, 1));
+        let client = MeowClient::new(
+            MeowConfig::builder()
+                .max_upload_concurrency(1)
+                .max_download_concurrency(1)
+                .build()
+                .expect("valid config"),
+        );
         let _ = client
             .snapshot()
             .await
@@ -144,7 +156,13 @@ async fn dropping_meow_client_without_ever_touching_executor_is_silent() {
     collector.install();
 
     {
-        let _client = MeowClient::new(MeowConfig::new(1, 1));
+        let _client = MeowClient::new(
+            MeowConfig::builder()
+                .max_upload_concurrency(1)
+                .max_download_concurrency(1)
+                .build()
+                .expect("valid config"),
+        );
     }
 
     assert_eq!(

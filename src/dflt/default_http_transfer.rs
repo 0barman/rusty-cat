@@ -356,6 +356,31 @@ async fn download_prepare(
 
     // Use local persisted length as resume start to avoid sparse gaps.
     let start = local_len;
+    if let Some(total) = download.total_size_hint(task) {
+        if start > total {
+            crate::meow_flow_log!(
+                "download_prepare",
+                "invalid local length larger than hinted remote: local={} remote={}",
+                start,
+                total
+            );
+            return Err(MeowError::from_code_str(
+                InnerErrorCode::InvalidRange,
+                "local file larger than hinted remote total size",
+            ));
+        }
+        crate::meow_flow_log!(
+            "download_prepare",
+            "prepared from total_size_hint: start={} remote_total={}",
+            start,
+            total
+        );
+        return Ok(PrepareOutcome {
+            next_offset: start.min(total),
+            total_size: total,
+        });
+    }
+
     let head_url = download.head_url(task);
     let mut head_headers = task.headers().clone();
     download.merge_head_headers(DownloadHeadCtx {

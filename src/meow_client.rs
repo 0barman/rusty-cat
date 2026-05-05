@@ -36,13 +36,13 @@ pub type GlobalProgressListener = ProgressCb;
 /// # Lifecycle contract: you **must** call [`Self::close`]
 ///
 /// The background scheduler runs on a dedicated [`std::thread`] that drives
-/// its own Tokio runtime. That thread is **detached**: there is no handle
-/// stored anywhere to `join()` it, and the only clean shutdown protocol is
-/// an explicit `close().await` command which:
+/// its own Tokio runtime. The clean shutdown protocol is an explicit
+/// `close().await` command which:
 ///
 /// - cancels in-flight transfers,
 /// - flushes `Paused` status events to user callbacks for every known group,
-/// - breaks the worker loop and lets the runtime drop.
+/// - drains already submitted callback jobs,
+/// - joins the scheduler thread and lets the runtime drop.
 ///
 /// Forgetting to call `close` leaves the scheduler thread alive until all
 /// command senders are dropped (which does happen when `MeowClient` is
@@ -145,7 +145,8 @@ impl MeowClient {
 
     /// Returns a `reqwest::Client` aligned with this client's configuration.
     ///
-    /// - If [`MeowConfig::with_http_client`] injected a custom client, this
+    /// - If [`MeowConfigBuilder::http_client`](crate::api::MeowConfigBuilder::http_client)
+    ///   injected a custom client, this
     ///   returns its clone.
     /// - Otherwise, this builds a new client from `http_timeout` and
     ///   `tcp_keepalive`.
@@ -273,7 +274,7 @@ impl MeowClient {
     where
         F: Fn(FileTransferRecord) + Send + Sync + 'static,
     {
-        let id = GlobalProgressListenerId::new_v4();
+        let id = GlobalProgressListenerId::new();
         crate::meow_flow_log!("listener", "register global listener: id={:?}", id);
         let mut guard = self.global_progress_listener.write().map_err(|e| {
             MeowError::from_code(
@@ -649,9 +650,25 @@ impl MeowClient {
 
     /// Closes this client and its underlying executor.
     ///
+    /// `close` is the terminal lifecycle operation for a `MeowClient`. After
+    /// it succeeds, this client stays permanently closed; submit more work by
+    /// constructing a new `MeowClient` and enqueueing tasks there.
+    ///
     /// After a successful close:
-    /// - New task operations are rejected.
-    /// - Existing runtime resources are released.
+    ///
+    /// - New task and control operations on this client are rejected with
+    ///   `ClientClosed`.
+    /// - All known unfinished task groups (queued, paused, or active) receive
+    ///   a `Paused` progress notification through their task callback and all
+    ///   registered global listeners.
+    /// - In-flight transfers are cancelled and the scheduler state is cleared.
+    /// - Already submitted callback jobs are drained before returning.
+    /// - The internal scheduler thread is joined, which drops its Tokio
+    ///   runtime and releases SDK-owned background execution resources.
+    ///
+    /// `Paused` is used for shutdown notifications rather than `Canceled` so
+    /// callers can recreate a client later and re-enqueue the same logical
+    /// transfer when they want to resume from available breakpoint state.
     ///
     /// # Idempotency
     ///
@@ -660,7 +677,7 @@ impl MeowClient {
     /// # Retry behavior
     ///
     /// If executor close fails, the closed flag is rolled back so caller can
-    /// retry close.
+    /// retry close. A successful close is not restartable.
     ///
     /// # Errors
     ///
@@ -711,12 +728,10 @@ impl MeowClient {
     /// ```no_run
     /// use rusty_cat::api::{MeowClient, MeowConfig};
     ///
-    /// # async fn run() {
     /// let client = MeowClient::new(MeowConfig::default());
-    /// let _closed = client.is_closed().await;
-    /// # }
+    /// let _closed = client.is_closed();
     /// ```
-    pub async fn is_closed(&self) -> bool {
+    pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }
 }

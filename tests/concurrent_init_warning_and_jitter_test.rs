@@ -63,7 +63,13 @@ async fn concurrent_first_init_does_not_emit_executor_drop_warn_or_multi_start_j
 
     let payload = b"concurrent-init-log-check".repeat(4096);
     let server = dev_server::DevFileServer::spawn(payload.clone());
-    let client = Arc::new(MeowClient::new(MeowConfig::new(4, 4)));
+    let client = Arc::new(MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(4)
+            .max_download_concurrency(4)
+            .build()
+            .expect("valid config"),
+    ));
 
     let task_count = 8usize;
     let mut handles = Vec::with_capacity(task_count);

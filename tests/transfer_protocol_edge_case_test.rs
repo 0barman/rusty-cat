@@ -52,7 +52,13 @@ async fn upload_prepare_http_non_success_hits_response_status_error() {
     let src = temp_path("upload_prepare_500_src");
     fs::write(&src, b"abc").expect("write upload source");
 
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
     let statuses_cb = statuses.clone();
     let task = UploadPounceBuilder::new("u.bin", &src, 1024)
@@ -99,7 +105,13 @@ async fn upload_prepare_invalid_json_hits_response_parse_error() {
     let src = temp_path("upload_prepare_bad_json_src");
     fs::write(&src, b"abc").expect("write upload source");
 
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
     let statuses_cb = statuses.clone();
     let task = UploadPounceBuilder::new("u.bin", &src, 1024)
@@ -149,7 +161,13 @@ async fn upload_prepare_completed_file_id_branch_finishes_without_chunk_http() {
     let src = temp_path("upload_prepare_completed_src");
     fs::write(&src, b"abcdef").expect("write upload source");
 
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
     let statuses_cb = statuses.clone();
     let task = UploadPounceBuilder::new("u.bin", &src, 1024)
@@ -191,7 +209,13 @@ async fn download_prepare_missing_content_length_hits_error_branch() {
         "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_string(),
     ]);
     let path = temp_path("download_head_no_len");
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
     let statuses_cb = statuses.clone();
     let task = DownloadPounceBuilder::new(
@@ -243,7 +267,13 @@ async fn download_prepare_local_larger_than_remote_hits_invalid_range_branch() {
     let path = temp_path("download_local_gt_remote");
     fs::write(&path, vec![0u8; 16]).expect("write oversized local file");
 
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
     let statuses_cb = statuses.clone();
     let task = DownloadPounceBuilder::new(
@@ -293,7 +323,13 @@ async fn download_chunk_total_changed_and_empty_body_error_branches() {
         "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/9\r\nContent-Length: 4\r\nConnection: close\r\n\r\nabcd".to_string(),
     ]);
     let path_a = temp_path("download_total_changed");
-    let client_a = MeowClient::new(MeowConfig::new(1, 1));
+    let client_a = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let statuses_a: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
     let statuses_a_cb = statuses_a.clone();
     let task_a = DownloadPounceBuilder::new(
@@ -331,7 +367,13 @@ async fn download_chunk_total_changed_and_empty_body_error_branches() {
         "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/8\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
     ]);
     let path_b = temp_path("download_empty_body");
-    let client_b = MeowClient::new(MeowConfig::new(1, 1));
+    let client_b = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let statuses_b: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
     let statuses_b_cb = statuses_b.clone();
     let task_b = DownloadPounceBuilder::new(

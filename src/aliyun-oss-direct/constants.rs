@@ -1,0 +1,9 @@
+pub(crate) const OSS_UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
+pub(crate) const DEFAULT_RANGE_ACCEPT: &str = "application/octet-stream";
+pub(crate) const DEFAULT_UPLOAD_CONTENT_TYPE: &str = "application/xml";
+pub(crate) const OSS_COMPLETE_ALL_HEADER: &str = "x-oss-complete-all";
+pub(crate) const OSS_COMPLETE_ALL_VALUE: &str = "yes";
+pub(crate) const OSS_COMPLETE_ADDITIONAL_HEADERS: &str = "content-type;x-oss-complete-all";
+pub(crate) const OSS_LIST_MAX_UPLOADS: &str = "1000";
+pub(crate) const OSS_LIST_MAX_PARTS: &str = "1000";
+pub(crate) const MAX_OSS_PART_NUMBER: u64 = 10_000;

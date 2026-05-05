@@ -332,8 +332,9 @@ pub(crate) async fn download_one_chunk(
         base: &mut headers,
     })?;
 
+    let range_url = download.range_url(task);
     let mut resp = client
-        .get(task.url())
+        .get(range_url)
         .headers(headers)
         .send()
         .await
@@ -579,19 +580,21 @@ mod tests {
     use super::parse_content_range;
 
     #[test]
-    fn parse_content_range_ok() {
-        let (start, end, total) = parse_content_range("bytes 10-99/1000").unwrap();
+    fn parse_content_range_ok() -> Result<(), crate::error::MeowError> {
+        let (start, end, total) = parse_content_range("bytes 10-99/1000")?;
         assert_eq!(start, 10);
         assert_eq!(end, 99);
         assert_eq!(total, Some(1000));
+        Ok(())
     }
 
     #[test]
-    fn parse_content_range_unknown_total_ok() {
-        let (start, end, total) = parse_content_range("bytes 0-1023/*").unwrap();
+    fn parse_content_range_unknown_total_ok() -> Result<(), crate::error::MeowError> {
+        let (start, end, total) = parse_content_range("bytes 0-1023/*")?;
         assert_eq!(start, 0);
         assert_eq!(end, 1023);
         assert_eq!(total, None);
+        Ok(())
     }
 
     #[test]
@@ -626,7 +629,12 @@ mod tests {
                 prop_assume!(end < total);
 
                 let header = format!("bytes {start}-{end}/{total}");
-                let (ps, pe, pt) = parse_content_range(&header).expect("parse ok");
+                let parsed = parse_content_range(&header);
+                prop_assert!(parsed.is_ok());
+                let (ps, pe, pt) = match parsed {
+                    Ok(v) => v,
+                    Err(_) => return Ok(()),
+                };
                 prop_assert_eq!(ps, start);
                 prop_assert_eq!(pe, end);
                 prop_assert_eq!(pt, Some(total));
@@ -640,7 +648,12 @@ mod tests {
             ) {
                 let end = start.saturating_add(len - 1);
                 let header = format!("bytes {start}-{end}/*");
-                let (ps, pe, pt) = parse_content_range(&header).expect("parse ok");
+                let parsed = parse_content_range(&header);
+                prop_assert!(parsed.is_ok());
+                let (ps, pe, pt) = match parsed {
+                    Ok(v) => v,
+                    Err(_) => return Ok(()),
+                };
                 prop_assert_eq!(ps, start);
                 prop_assert_eq!(pe, end);
                 prop_assert!(pt.is_none());

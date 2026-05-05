@@ -28,7 +28,13 @@ async fn test_download() {
     let server = dev_server::DevFileServer::spawn(payload.clone());
 
     let local_path = temp_download_path();
-    let client = MeowClient::new(MeowConfig::new(1, 2));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(2)
+            .build()
+            .expect("valid config"),
+    );
     let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
     let statuses_for_cb = statuses.clone();
 

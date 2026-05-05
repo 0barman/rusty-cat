@@ -36,7 +36,13 @@ fn assert_code_in(err: &rusty_cat::MeowError, allowed: &[InnerErrorCode]) {
 async fn concurrent_pause_resume_cancel_on_same_task_do_not_break_state_machine() {
     let payload = b"control-race-same-task".repeat(1024 * 128);
     let server = dev_server::DevFileServer::spawn(payload);
-    let client = Arc::new(MeowClient::new(MeowConfig::new(1, 1)));
+    let client = Arc::new(MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    ));
     let path = temp_download_path("same_task");
 
     let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
@@ -117,7 +123,13 @@ async fn concurrent_pause_resume_cancel_on_same_task_do_not_break_state_machine(
 async fn close_racing_with_enqueue_pause_resume_is_semantically_stable() {
     let payload = b"control-race-close".repeat(4096);
     let server = dev_server::DevFileServer::spawn(payload);
-    let client = Arc::new(MeowClient::new(MeowConfig::new(0, 0)));
+    let client = Arc::new(MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    ));
     let path = temp_download_path("close_race_anchor");
 
     let anchor = DownloadPounceBuilder::new(
@@ -200,10 +212,7 @@ async fn close_racing_with_enqueue_pause_resume_is_semantically_stable() {
         );
     }
 
-    assert!(
-        client.is_closed().await,
-        "client should be closed after race"
-    );
+    assert!(client.is_closed(), "client should be closed after race");
 
     let post_close_err = client
         .snapshot()
@@ -220,7 +229,13 @@ async fn close_racing_with_enqueue_pause_resume_is_semantically_stable() {
 async fn pause_resume_cancel_right_after_completion_have_stable_errors() {
     let payload = b"terminal-then-control".repeat(128);
     let server = dev_server::DevFileServer::spawn(payload.clone());
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let path = temp_download_path("post_terminal");
 
     let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));

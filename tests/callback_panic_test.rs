@@ -55,7 +55,13 @@ async fn task_callback_panic_does_not_break_scheduler() {
     let path = temp_download_path("task_cb");
     fs::write(&path, b"abcd").expect("write local prefix");
 
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
     let statuses_for_global = statuses.clone();
     client
@@ -111,7 +117,13 @@ async fn global_callback_panic_does_not_break_scheduler() {
     let path = temp_download_path("global_cb");
     fs::write(&path, b"abcd").expect("write local prefix");
 
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let should_panic_once = Arc::new(AtomicBool::new(true));
     let panic_flag = should_panic_once.clone();
     client
@@ -167,7 +179,13 @@ async fn complete_callback_panic_does_not_break_scheduler() {
     let path = temp_download_path("complete_cb");
     fs::write(&path, b"abcd").expect("write local prefix");
 
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
     let statuses_for_task = statuses.clone();
     let should_panic_once = Arc::new(AtomicBool::new(true));

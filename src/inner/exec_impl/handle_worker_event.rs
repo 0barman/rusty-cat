@@ -57,6 +57,7 @@ pub(crate) async fn handle_worker_event(event: WorkerEvent, state: &mut Schedule
                 );
                 if let Some(cb) = group.entry().callbacks().complete_cb() {
                     crate::inner::exec_impl::emit::invoke_complete_cb(
+                        state,
                         cb,
                         task_id,
                         completion_payload,
