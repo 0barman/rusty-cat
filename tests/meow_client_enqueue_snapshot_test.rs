@@ -29,7 +29,13 @@ async fn enqueue_rejects_empty_task_with_parameter_empty() {
     // 1) 构造一个 file_name/url 为空的下载任务；
     // 2) 调用 enqueue 应立即失败（不依赖网络），错误码必须是 ParameterEmpty；
     // 3) 该用例保证输入校验边界稳定，避免空任务进入调度层。
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let path = temp_download_path("empty_task");
     let empty_task = DownloadPounceBuilder::new("", &path, 1024, "").build();
 
@@ -38,10 +44,7 @@ async fn enqueue_rejects_empty_task_with_parameter_empty() {
         .await
         .expect_err("empty task should be rejected");
     assert_eq!(err.code(), InnerErrorCode::ParameterEmpty as i32);
-    assert!(
-        !client.is_closed().await,
-        "client should stay open on bad input"
-    );
+    assert!(!client.is_closed(), "client should stay open on bad input");
 }
 
 #[tokio::test]
@@ -52,7 +55,13 @@ async fn snapshot_reports_activity_and_returns_to_zero_after_completion() {
     // 3) 任务完成后 snapshot 应回到 active=0/queued=0（证明状态能收敛）。
     let payload = b"snapshot-observe-payload".repeat(4096);
     let server = dev_server::DevFileServer::spawn(payload.clone());
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let path = temp_download_path("snapshot");
     let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
     let statuses_cb = statuses.clone();

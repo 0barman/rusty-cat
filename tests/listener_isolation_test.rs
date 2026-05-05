@@ -70,7 +70,13 @@ async fn run_download_and_wait_complete(
 async fn panic_in_one_global_listener_does_not_block_other_listeners() {
     let payload = b"listener-panic-isolation".repeat(2048);
     let server = dev_server::DevFileServer::spawn(payload);
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
 
     let panic_once = Arc::new(AtomicBool::new(true));
     let panic_once_cb = panic_once.clone();
@@ -118,7 +124,13 @@ async fn panic_in_one_global_listener_does_not_block_other_listeners() {
 async fn listeners_can_unregister_self_and_each_other_inside_callback() {
     let payload = b"listener-self-and-mutual-unregister".repeat(2048);
     let server = dev_server::DevFileServer::spawn(payload);
-    let client = Arc::new(MeowClient::new(MeowConfig::new(1, 1)));
+    let client = Arc::new(MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    ));
 
     let a_hits = Arc::new(AtomicUsize::new(0));
     let b_hits = Arc::new(AtomicUsize::new(0));

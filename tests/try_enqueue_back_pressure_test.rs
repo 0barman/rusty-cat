@@ -1,15 +1,15 @@
 //! 验证 `MeowClient::try_enqueue` 的 **非阻塞背压** 语义：
 //!
-//! - 当内部命令队列（由 [`rusty_cat::meow_config::MeowConfig::with_command_queue_capacity`]
+//! - 当内部命令队列（由 [`rusty_cat::meow_config::MeowConfigBuilder::command_queue_capacity`]
 //!   控制）被打满时，`try_enqueue` 会立即返回 `CommandSendFailed` 而非挂起
 //!   调用方。
 //! - 重新让出调度、等待后台消费后，再次 `try_enqueue` 可以成功。
 //!
 //! 复现思路：
-//! 1. 调度并发设为 0，保证任务一旦入队就停留在 queued 队列，不会被
-//!    消费掉；
-//! 2. 命令队列容量设为 1，提交第 1 个 enqueue 后队列已满；
-//! 3. 连续提交第 2 个 enqueue，应在一瞬间拿到 `CommandSendFailed`。
+//! 1. 命令队列容量设为 1；
+//! 2. 在同一轮中连续提交多个 enqueue；
+//! 3. 只要生产速度瞬时超过 worker drain 速度，就应在一瞬间拿到
+//!    `CommandSendFailed`。
 //!
 //! 参考文档：`MeowClient::try_enqueue` doc 中的 “Back-pressure semantics” 节。
 
@@ -48,7 +48,6 @@ fn make_task(i: usize, base_url: &str) -> rusty_cat::api::PounceTask {
 
 #[tokio::test]
 async fn try_enqueue_returns_command_send_failed_when_queue_is_full() {
-    // 并发=0 → 调度器不会消费 queued 任务；
     // command_queue_capacity=1 → 命令通道只能缓冲一条命令。
     // 第 1 条 Enqueue 命令被立刻消费（worker 处理 Enqueue 会把 task 放进 queued），
     // 第 2 条 Enqueue 在极短时间窗口内如果赶上“worker 尚未 recv”那一刻，
@@ -57,9 +56,13 @@ async fn try_enqueue_returns_command_send_failed_when_queue_is_full() {
     let payload = b"try-enqueue-back-pressure".repeat(8);
     let server = dev_server::DevFileServer::spawn(payload);
     let client = MeowClient::new(
-        MeowConfig::new(0, 0)
-            .with_command_queue_capacity(1)
-            .with_worker_event_queue_capacity(1),
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .command_queue_capacity(1)
+            .worker_event_queue_capacity(1)
+            .build()
+            .expect("valid config"),
     );
 
     // 把一批 Enqueue 命令几乎在同一 tick 内发出去，worker 只能消费 1 条/tick，
@@ -100,9 +103,13 @@ async fn try_enqueue_is_fail_fast_not_waiting_for_queue_capacity() {
     let payload = b"fail-fast".repeat(8);
     let server = dev_server::DevFileServer::spawn(payload);
     let client = MeowClient::new(
-        MeowConfig::new(0, 0)
-            .with_command_queue_capacity(1)
-            .with_worker_event_queue_capacity(1),
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .command_queue_capacity(1)
+            .worker_event_queue_capacity(1)
+            .build()
+            .expect("valid config"),
     );
 
     // 通过一轮并发 burst 把队列挤满。只要其中任何一次 enqueue 失败，

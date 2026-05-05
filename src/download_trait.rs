@@ -59,6 +59,16 @@ pub struct DownloadRangeGetCtx<'a> {
 /// }
 /// ```
 pub trait BreakpointDownload: Send + Sync {
+    /// Returns known remote total size and skips the HEAD prepare request when
+    /// present.
+    ///
+    /// This is useful for presigned URL downloads where a GET URL cannot be
+    /// reused as HEAD, or where the application server already returned object
+    /// metadata together with the presigned range URL.
+    fn total_size_hint(&self, _task: &TransferTask) -> Option<u64> {
+        None
+    }
+
     /// Returns full URL for HEAD request.
     ///
     /// Default implementation returns [`TransferTask::url`].
@@ -78,6 +88,14 @@ pub trait BreakpointDownload: Send + Sync {
     /// }
     /// ```
     fn head_url(&self, task: &TransferTask) -> String {
+        task.url().to_string()
+    }
+
+    /// Returns full URL for range GET requests.
+    ///
+    /// Default implementation returns [`TransferTask::url`]. Presigned
+    /// protocols can override this when HEAD and GET use different URLs.
+    fn range_url(&self, task: &TransferTask) -> String {
         task.url().to_string()
     }
 

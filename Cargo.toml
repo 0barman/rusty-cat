@@ -1,6 +1,6 @@
 [package]
 name = "rusty-cat"
-version = "0.1.6"
+version = "0.2.0"
 edition = "2021"
 description = "Async HTTP client for resumable file upload and download."
 license = "MIT"
@@ -8,10 +8,26 @@ repository = "https://github.com/0barman/rusty-cat"
 readme = "README.md"
 keywords = ["async", "download", "http", "upload", "resume"]
 categories = ["asynchronous", "network-programming"]
-include = ["src/**/*.rs", "Cargo.toml", "README.md", "LICENSE*"]
+include = ["src/**", "Cargo.toml", "README.md", "LICENSE*"]
+
+[features]
+default = []
+all = [
+    "aliyun-oss-direct",
+    "aliyun-oss-presigned",
+    "azure-blob-direct",
+    "azure-blob-sas",
+]
+presigned = []
+aliyun-oss-direct = ["dep:hmac", "dep:sha2", "dep:time"]
+aliyun-oss-presigned = ["presigned"]
+azure-blob-direct = ["dep:base64", "dep:hmac", "dep:sha2", "dep:time"]
+azure-blob-sas = ["presigned", "dep:base64"]
+aliyun-oss = ["aliyun-oss-presigned"]
+azure-blob = ["azure-blob-sas"]
+oss-providers = ["aliyun-oss", "azure-blob"]
 
 [dependencies]
-uuid = { version = "1.23.0", features = ["v4"] }
 tokio = { version = "1.50.0", default-features = false, features = [
     "rt-multi-thread",
     "sync",
@@ -24,16 +40,24 @@ reqwest = { version = "0.12.28", default-features = false, features = [
     "rustls-tls",
 ] }
 async-trait = "0.1.89"
-tokio-util = "0.7.18"
-serde = { version = "1.0.219", features = ["derive"] }
+tokio-util = { version = "0.7.18", default-features = false }
+serde = { version = "1.0.219", default-features = false, features = ["derive"] }
 serde_json = "1.0.140"
-md5 = "0.7"
-bytes = "1"
+md5 = { version = "0.7", default-features = false }
+bytes = { version = "1", default-features = false }
+base64 = { version = "0.22.1", optional = true }
+hmac = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
+time = { version = "0.3", optional = true }
 
 [dev-dependencies]
-async-trait = "0.1.89"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 criterion = { version = "0.5.1", features = ["html_reports"] }
+hmac = "0.12"
+hex = "0.4"
+indicatif = "0.17"
 proptest = "1.5"
+sha2 = "0.10"
 # 集成测试里使用 tokio::time::sleep；库代码本身不需要 time feature
 tokio = { version = "1.50.0", default-features = false, features = [
     "rt-multi-thread",
@@ -44,3 +68,37 @@ tokio = { version = "1.50.0", default-features = false, features = [
 [[bench]]
 name = "transfer_hotspots"
 harness = false
+
+[[example]]
+name = "http_local_chunk_transfer"
+path = "examples/http_local_chunk_transfer.rs"
+
+[[example]]
+name = "aliyun_oss_direct_chunk_transfer"
+path = "examples/aliyun_oss_direct_chunk_transfer.rs"
+required-features = ["aliyun-oss-direct"]
+
+[[example]]
+name = "aliyun_oss_direct_custom_chunk_transfer"
+path = "examples/aliyun_oss_direct_custom_chunk_transfer.rs"
+required-features = ["aliyun-oss-direct"]
+
+[[example]]
+name = "aliyun_oss_presigned_chunk_transfer"
+path = "examples/aliyun_oss_presigned_chunk_transfer.rs"
+required-features = ["aliyun-oss-presigned"]
+
+[[example]]
+name = "azure_blob_direct_chunk_transfer"
+path = "examples/azure_blob_direct_chunk_transfer.rs"
+required-features = ["azure-blob-direct"]
+
+[[example]]
+name = "azure_blob_direct_custom_chunk_transfer"
+path = "examples/azure_blob_direct_custom_chunk_transfer.rs"
+required-features = ["azure-blob-direct"]
+
+[[example]]
+name = "azure_blob_sas_chunk_transfer"
+path = "examples/azure_blob_sas_chunk_transfer.rs"
+required-features = ["azure-blob-sas"]

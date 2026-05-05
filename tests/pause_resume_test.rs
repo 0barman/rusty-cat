@@ -167,7 +167,13 @@ async fn pause_then_resume_keeps_same_task_id_and_finishes() {
     // 创建本地下载目标路径。
     let path = temp_download_path("happy_path");
     // 初始化客户端，单并发便于简化时序判断。
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     // 存储回调里观察到的状态轨迹。
     let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
     // 在回调里共享状态轨迹容器。

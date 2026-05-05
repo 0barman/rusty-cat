@@ -11,14 +11,30 @@
 //! ```no_run
 //! use rusty_cat::api::{MeowClient, MeowConfig, UploadPounceBuilder};
 //!
-//! let client = MeowClient::new(MeowConfig::new(2, 2));
+//! let config = MeowConfig::builder()
+//!     .max_upload_concurrency(2)
+//!     .max_download_concurrency(2)
+//!     .build()?;
+//! let client = MeowClient::new(config);
 //! let _task = UploadPounceBuilder::new("file.bin", "./file.bin", 1024 * 1024)
 //!     .with_url("https://example.com/upload")
-//!     .build()
-//!     .expect("source file must exist for this example");
+//!     .build();
 //! let _ = client;
+//! # Ok::<(), rusty_cat::api::MeowError>(())
 //! ```
+#[cfg(feature = "aliyun-oss-direct")]
+#[path = "aliyun-oss-direct/mod.rs"]
+pub mod aliyun_oss_direct;
+#[cfg(feature = "aliyun-oss-presigned")]
+#[path = "aliyun-oss-presigned/mod.rs"]
+pub mod aliyun_oss_presigned;
 pub mod api;
+#[cfg(feature = "azure-blob-direct")]
+#[path = "azure-blob-direct/mod.rs"]
+pub mod azure_blob_direct;
+#[cfg(feature = "azure-blob-sas")]
+#[path = "azure-blob-sas/mod.rs"]
+pub mod azure_blob_sas;
 pub mod chunk_outcome;
 pub(crate) mod dflt;
 pub mod direction;
@@ -34,6 +50,8 @@ pub mod meow_client;
 pub mod meow_config;
 pub mod pounce_task;
 pub mod prepare_outcome;
+#[cfg(feature = "presigned")]
+pub mod presigned;
 pub mod transfer_executor_trait;
 pub mod transfer_snapshot;
 pub mod transfer_status;

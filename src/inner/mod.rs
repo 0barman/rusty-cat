@@ -4,6 +4,7 @@ use crate::direction::Direction;
 pub(crate) type UniqueId = (Direction, String);
 
 pub(crate) mod active_state;
+pub(crate) mod cb_dispatcher;
 pub(crate) mod exec_impl;
 pub(crate) mod executor;
 pub(crate) mod group_state;

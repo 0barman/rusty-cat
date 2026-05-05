@@ -53,7 +53,13 @@ async fn file_transfer_record_getters_return_expected_values_from_callback() {
     // 3) 覆盖 file_transfer_record.rs 的 getter 分支。
     let payload = b"record-getter-payload".repeat(2048);
     let server = dev_server::DevFileServer::spawn(payload.clone());
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let path = temp_path("record_getter");
 
     let latest_record: Arc<Mutex<Option<FileTransferRecord>>> = Arc::new(Mutex::new(None));

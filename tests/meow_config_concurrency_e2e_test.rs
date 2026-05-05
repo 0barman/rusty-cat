@@ -49,7 +49,13 @@ async fn meow_config_concurrency_limits_and_queue_behavior_work() {
     // 用较大载荷 + 小 chunk，拉长传输窗口，提升并发与排队观察稳定性。
     let download_payload = b"meow-config-concurrency-download".repeat(32 * 1024);
     let server = dev_server::DevFileServer::spawn(download_payload);
-    let client = MeowClient::new(MeowConfig::new(max_upload, max_download));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(max_upload)
+            .max_download_concurrency(max_download)
+            .build()
+            .expect("valid config"),
+    );
 
     let observe = Arc::new(Mutex::new(ObserveState::default()));
     let observe_cb = observe.clone();

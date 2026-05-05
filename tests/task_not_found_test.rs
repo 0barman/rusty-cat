@@ -7,7 +7,13 @@ use rusty_cat::MeowClient;
 #[tokio::test]
 async fn cancel_unknown_task_returns_task_not_found() {
     // 先创建一个真实 task_id，避免依赖内部构造函数。
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let task = DownloadPounceBuilder::new(
         "task-not-found.bin",
         std::env::temp_dir().join("task-not-found.bin"),
@@ -39,7 +45,13 @@ async fn cancel_unknown_task_returns_task_not_found() {
 #[tokio::test]
 async fn pause_unknown_task_returns_task_not_found() {
     // 先创建一个真实 task_id，后续通过 cancel 使其变成未知任务。
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let task = DownloadPounceBuilder::new(
         "task-not-found-pause.bin",
         std::env::temp_dir().join("task-not-found-pause.bin"),
@@ -68,7 +80,13 @@ async fn pause_unknown_task_returns_task_not_found() {
 #[tokio::test]
 async fn resume_unknown_task_returns_task_not_found() {
     // 先创建一个真实 task_id，再通过 cancel 让它进入“未知”状态。
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let task = DownloadPounceBuilder::new(
         "task-not-found-resume.bin",
         std::env::temp_dir().join("task-not-found-resume.bin"),

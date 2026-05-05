@@ -1,6 +1,7 @@
 use crate::error::{InnerErrorCode, MeowError};
 use crate::file_transfer_record::FileTransferRecord;
 use crate::ids::{GlobalProgressListenerId, TaskId};
+use crate::inner::cb_dispatcher;
 use crate::inner::group_state::{GroupState, RecordEntry};
 use crate::inner::inner_task::InnerTask;
 use crate::inner::scheduler_state::SchedulerState;
@@ -13,7 +14,8 @@ use crate::transfer_snapshot::TransferSnapshot;
 use crate::transfer_status::TransferStatus;
 use crate::transfer_task::TransferTask;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::thread::JoinHandle;
 use tokio::sync::mpsc;
 
 pub(crate) enum TransferCmd {
@@ -53,10 +55,22 @@ fn worker_loop(
     worker_tx: mpsc::Sender<WorkerEvent>,
     mut state: SchedulerState,
     executor: Arc<dyn TransferTrait>,
-) -> Result<(), MeowError> {
+    mut cb_join: cb_dispatcher::CbDispatcherJoin,
+) -> Result<JoinHandle<()>, MeowError> {
+    fn shutdown_callback_dispatcher(
+        state: &mut SchedulerState,
+        cb_join: &mut cb_dispatcher::CbDispatcherJoin,
+    ) {
+        // Drop the scheduler's only callback sender before joining. This is
+        // required on every worker exit path; otherwise the dispatcher can
+        // wait forever for more jobs while the worker waits in join().
+        drop(state.take_cb_submit());
+        cb_join.join();
+    }
+
     crate::meow_flow_log!("worker_loop", "starting scheduler worker thread");
     let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel::<Result<(), MeowError>>(1);
-    std::thread::spawn(move || {
+    let handle = std::thread::spawn(move || {
         let runtime_ret = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build();
@@ -69,7 +83,10 @@ fn worker_loop(
                         tokio::select! {
                             biased;
                             maybe_cmd = cmd_rx.recv() => {
-                                let Some(cmd) = maybe_cmd else { break; };
+                                let Some(cmd) = maybe_cmd else {
+                                    shutdown_callback_dispatcher(&mut state, &mut cb_join);
+                                    break;
+                                };
                                 match cmd {
                                     TransferCmd::Enqueue { inner, callbacks } => {
                                         let key = inner.dedupe_key();
@@ -92,6 +109,7 @@ fn worker_loop(
                                             );
                                             if let Some(cb) = &callbacks.progress_cb() {
                                                 crate::inner::exec_impl::emit::invoke_progress_cb(
+                                                    &state,
                                                     cb,
                                                     dup_dto.clone(),
                                                 );
@@ -285,6 +303,8 @@ fn worker_loop(
                                         for (_, active) in state.active().iter() {
                                             active.cancel().cancel();
                                         }
+                                        // emit Paused 时仍走 dispatcher（终态必送），保证回调线程把这些
+                                        // 终态收进队列；下一步关闭 channel 后线程会先 drain 再退出。
                                         for (key, group) in state.groups().iter() {
                                             let current = state.offsets().get(key).copied().unwrap_or(0);
                                             crate::inner::exec_impl::emit::emit_status(
@@ -302,6 +322,10 @@ fn worker_loop(
                                         state.queued_set_mut().clear();
                                         state.paused_set_mut().clear();
                                         state.offsets_mut().clear();
+                                        // 关闭回调 channel：drop 唯一持有的 sender。
+                                        // 之后阻塞 join 分发线程，确保所有终态回调（包括上面刚 emit
+                                        // 的 Paused）在 close().await 返回前已经被回放完毕。
+                                        shutdown_callback_dispatcher(&mut state, &mut cb_join);
                                         crate::meow_flow_log!("cmd_close", "close finished, worker loop exiting");
                                         let _ = respond_to.send(Ok(()));
                                         break;
@@ -341,7 +365,8 @@ fn worker_loop(
             InnerErrorCode::RuntimeCreationFailedError,
             format!("runtime startup handshake failed: {}", e),
         )
-    })?
+    })??;
+    Ok(handle)
 }
 async fn pause_group(state: &mut SchedulerState, key: &UniqueId) {
     crate::meow_flow_log!(
@@ -517,9 +542,10 @@ fn task_not_found_error(task_id: TaskId) -> MeowError {
 
 /// Handle to the background scheduler worker.
 ///
-/// The worker itself lives on a **detached [`std::thread`]** which in turn
-/// drives a dedicated Tokio multi-thread runtime. The worker only shuts down
-/// when one of the following happens:
+/// The worker itself lives on a dedicated [`std::thread`] which in turn
+/// drives a dedicated Tokio multi-thread runtime. The join handle is retained
+/// so explicit [`Executor::close`] can wait until that thread has fully
+/// exited. The worker only shuts down when one of the following happens:
 ///
 /// 1. An explicit [`Executor::close`] command is processed and the loop
 ///    breaks cleanly (preferred path, drains state and emits `Paused`
@@ -527,14 +553,18 @@ fn task_not_found_error(task_id: TaskId) -> MeowError {
 /// 2. All [`TransferCmd`] senders are dropped, in which case `cmd_rx.recv()`
 ///    returns `None` and the loop breaks naturally (fallback path).
 ///
-/// Because path (1) is the only way to guarantee clean shutdown and deliver
-/// terminal status events to user callbacks, `close()` is treated as a
-/// **required** part of the lifecycle. The [`Drop`] impl below performs a
-/// best-effort shutdown (plus a warning log) for the case where users forget
-/// it, but must not be relied upon for correctness.
+/// Because path (1) is the only way to guarantee clean shutdown, deliver
+/// terminal status events to user callbacks, drain the callback dispatcher,
+/// and join the scheduler thread, `close()` is treated as a **required** part
+/// of the lifecycle. The [`Drop`] impl below performs a best-effort shutdown
+/// (plus a warning log) for the case where users forget it, but must not be
+/// relied upon for correctness.
 #[derive(Debug)]
 pub(crate) struct Executor {
     cmd_tx: tokio::sync::mpsc::Sender<TransferCmd>,
+    /// Scheduler thread join handle. Explicit `close()` takes and joins it so
+    /// close becomes a hard resource-release barrier.
+    worker_join: Mutex<Option<JoinHandle<()>>>,
     /// Set to `true` by [`Executor::close`] after the worker acknowledges
     /// shutdown. Read by [`Drop`] to decide whether a best-effort shutdown
     /// is still required.
@@ -557,7 +587,11 @@ impl Executor {
         let worker_event_queue_capacity = config.worker_event_queue_capacity();
         let (cmd_tx, cmd_rx) = mpsc::channel::<TransferCmd>(command_queue_capacity);
         let (worker_tx, worker_rx) = mpsc::channel::<WorkerEvent>(worker_event_queue_capacity);
-        worker_loop(
+        // 在调度循环启动前就把回调分发线程拉起来，并把 sender 注入 SchedulerState。
+        // 这样 worker_loop 一开始就处于"回调物理隔离"的状态，第一条进度也走分发线程。
+        // 队列容量在 cb_dispatcher 内部锁定（CALLBACK_QUEUE_CAPACITY），不对外暴露。
+        let (cb_submit, cb_join) = cb_dispatcher::start()?;
+        let worker_join = worker_loop(
             cmd_rx,
             worker_rx,
             worker_tx,
@@ -565,12 +599,15 @@ impl Executor {
                 config.max_upload_concurrency(),
                 config.max_download_concurrency(),
                 global_progress_listener,
+                cb_submit,
             ),
             executor,
+            cb_join,
         )?;
         crate::meow_flow_log!("executor", "executor worker started");
         Ok(Self {
             cmd_tx,
+            worker_join: Mutex::new(Some(worker_join)),
             close_invoked: AtomicBool::new(false),
         })
     }
@@ -639,6 +676,35 @@ impl Drop for Executor {
 }
 
 impl Executor {
+    async fn join_worker_thread(&self) -> Result<(), MeowError> {
+        let handle = {
+            let mut guard = self.worker_join.lock().map_err(|e| {
+                MeowError::from_code(
+                    InnerErrorCode::LockPoisoned,
+                    format!("worker join handle lock poisoned: {}", e),
+                )
+            })?;
+            guard.take()
+        };
+        let Some(handle) = handle else {
+            return Ok(());
+        };
+        tokio::task::spawn_blocking(move || handle.join())
+            .await
+            .map_err(|e| {
+                MeowError::from_code(
+                    InnerErrorCode::Unknown,
+                    format!("worker thread join task failed: {}", e),
+                )
+            })?
+            .map_err(|_| {
+                MeowError::from_code_str(
+                    InnerErrorCode::Unknown,
+                    "worker thread panicked during shutdown",
+                )
+            })
+    }
+
     /// Non-blocking command submission for an `Enqueue` request.
     ///
     /// This deliberately uses [`tokio::sync::mpsc::Sender::try_send`] rather
@@ -836,6 +902,7 @@ impl Executor {
         // handshake above failed, keep `close_invoked = false` so `Drop`
         // still performs its best-effort shutdown path.
         if result.is_ok() {
+            self.join_worker_thread().await?;
             self.close_invoked.store(true, Ordering::SeqCst);
         }
         result

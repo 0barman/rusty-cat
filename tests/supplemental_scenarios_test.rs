@@ -7,7 +7,7 @@
 //!    错误码稳定（`CommandSendFailed`），不致污染后续任务。
 //! 3) 慢回调：进度回调中阻塞数十毫秒，验证调度器仍能收敛到 Complete，不会丢事件或卡死。
 //! 4) 未显式 close 的 Drop：直接丢弃 MeowClient，验证 worker/线程无死锁、测试进程可正常退出。
-//! 5) 自定义 `reqwest::Client` 注入：通过 `with_http_client` 注入外部 client，端到端完成
+//! 5) 自定义 `reqwest::Client` 注入：通过 config builder 注入外部 client，端到端完成
 //!    一次下载，并验证数据内容一致。
 //! 6) 大 chunk_size 内存压力：单片覆盖整个文件，验证 upload buffer 复用无越界且能完成。
 
@@ -67,7 +67,13 @@ async fn wait_terminal(
 async fn concurrent_first_use_enqueue_does_not_corrupt_executor_state() {
     let payload = b"concurrent-first-use-payload".repeat(1024);
     let server = dev_server::DevFileServer::spawn(payload.clone());
-    let client = Arc::new(MeowClient::new(MeowConfig::new(4, 4)));
+    let client = Arc::new(MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(4)
+            .max_download_concurrency(4)
+            .build()
+            .expect("valid config"),
+    ));
 
     let task_count = 6usize;
     let mut handles = Vec::with_capacity(task_count);
@@ -142,9 +148,11 @@ async fn concurrent_first_use_enqueue_does_not_corrupt_executor_state() {
 async fn small_command_queue_capacity_yields_command_send_failed_on_burst() {
     // capacity=1：在 worker 未及时消费时瞬发 enqueue 会立刻打满命令队列。
     let client = MeowClient::new(
-        MeowConfig::default()
-            .with_command_queue_capacity(1)
-            .with_worker_event_queue_capacity(32),
+        MeowConfig::builder()
+            .command_queue_capacity(1)
+            .worker_event_queue_capacity(32)
+            .build()
+            .expect("valid config"),
     );
 
     // 用一个不可达的 URL，任务会很快在 prepare 阶段失败而不是占满执行资源；
@@ -211,7 +219,13 @@ async fn small_command_queue_capacity_yields_command_send_failed_on_burst() {
 async fn slow_progress_callback_does_not_prevent_completion() {
     let payload = b"slow-callback-payload".repeat(4096);
     let server = dev_server::DevFileServer::spawn(payload.clone());
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
 
     let path = temp_path("slow_cb");
     let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
@@ -291,7 +305,13 @@ async fn drop_client_without_close_does_not_deadlock() {
 
     // 最长允许 3 秒完成“入队 -> 终态 -> drop”，避免测试被卡死时超时不明显。
     let run = async {
-        let client = MeowClient::new(MeowConfig::new(1, 1));
+        let client = MeowClient::new(
+            MeowConfig::builder()
+                .max_upload_concurrency(1)
+                .max_download_concurrency(1)
+                .build()
+                .expect("valid config"),
+        );
         let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
         let statuses_cb = statuses.clone();
         let task = DownloadPounceBuilder::new(
@@ -334,7 +354,7 @@ async fn drop_client_without_close_does_not_deadlock() {
 // 场景 5：自定义 reqwest::Client 注入
 // ----------------------------------------------------------------------------
 
-/// 通过 `with_http_client` 注入外部 reqwest::Client，验证端到端下载仍成功，
+/// 通过 config builder 注入外部 reqwest::Client，验证端到端下载仍成功，
 /// 且数据与服务端一致（说明注入的 client 被真实使用且未破坏协议约定）。
 #[tokio::test]
 async fn injecting_custom_reqwest_client_completes_download() {
@@ -350,10 +370,14 @@ async fn injecting_custom_reqwest_client_completes_download() {
         .expect("build custom reqwest client");
 
     let client = MeowClient::new(
-        MeowConfig::new(1, 1)
-            .with_http_client(custom_client)
-            .with_http_timeout(Duration::from_secs(10))
-            .with_tcp_keepalive(Duration::from_secs(30)),
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .http_client(custom_client)
+            .http_timeout(Duration::from_secs(10))
+            .tcp_keepalive(Duration::from_secs(30))
+            .build()
+            .expect("valid config"),
     );
 
     let path = temp_path("custom_client");
@@ -408,7 +432,13 @@ async fn oversized_chunk_single_shot_upload_completes_and_matches_total() {
     fs::write(&upload_path, &upload_bytes).expect("write oversized upload source");
 
     let server = dev_server::DevFileServer::spawn(Vec::new());
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
 
     let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
     let statuses_cb = statuses.clone();

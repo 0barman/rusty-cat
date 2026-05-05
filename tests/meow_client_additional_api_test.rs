@@ -38,7 +38,13 @@ async fn snapshot_on_fresh_client_reports_zero_groups() {
     // 1) 在“尚未 enqueue 任何任务”的 fresh client 上直接调用 snapshot；
     // 2) snapshot 会触发 executor 初始化，但应返回空态（queued=0, active=0）；
     // 3) 覆盖 meow_client::snapshot + get_exec 初始化分支的空队列路径。
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let snap = client.snapshot().await.expect("snapshot on fresh client");
     assert_eq!(snap.queued_groups, 0);
     assert_eq!(snap.active_groups, 0);
@@ -55,7 +61,13 @@ fn meow_client_set_debug_log_listener_wrapper_supports_set_and_clear() {
     // 1) 通过 MeowClient::set_debug_log_listener(Some(...)) 设置监听器；
     // 2) active 应该变为 true；
     // 3) 再调用 set_debug_log_listener(None) 可取消注册，active 变回 false。
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     client
         .set_debug_log_listener(Some(Arc::new(|_log: Log| {})))
         .expect("set debug listener");
@@ -81,7 +93,13 @@ fn meow_client_set_debug_log_listener_replaces_previous_listener() {
     // 1) 先设置监听器 A 并 emit 一次，A 计数应+1；
     // 2) 再设置监听器 B（替换）并 emit 一次；
     // 3) 第二次 emit 只应命中 B，证明是覆盖而不是叠加。
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     client
         .set_debug_log_listener(None)
         .expect("clear listener before replacement test");
@@ -91,16 +109,20 @@ fn meow_client_set_debug_log_listener_replaces_previous_listener() {
 
     let a_ref = a.clone();
     client
-        .set_debug_log_listener(Some(Arc::new(move |_log: Log| {
-            a_ref.fetch_add(1, Ordering::Relaxed);
+        .set_debug_log_listener(Some(Arc::new(move |log: Log| {
+            if log.tag() == "replace_test" {
+                a_ref.fetch_add(1, Ordering::Relaxed);
+            }
         })))
         .expect("set listener A");
     log::emit(Log::debug("replace_test", "first emit"));
 
     let b_ref = b.clone();
     client
-        .set_debug_log_listener(Some(Arc::new(move |_log: Log| {
-            b_ref.fetch_add(1, Ordering::Relaxed);
+        .set_debug_log_listener(Some(Arc::new(move |log: Log| {
+            if log.tag() == "replace_test" {
+                b_ref.fetch_add(1, Ordering::Relaxed);
+            }
         })))
         .expect("replace listener with B");
     log::emit(Log::debug("replace_test", "second emit"));
@@ -136,7 +158,13 @@ async fn upload_file_deleted_after_build_hits_file_not_found_branch() {
         .expect("build upload task before deletion");
     fs::remove_file(&src).expect("remove source before enqueue");
 
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let err = client
         .try_enqueue(task, |_record: FileTransferRecord| {}, |_, _| {})
         .await
@@ -152,7 +180,13 @@ async fn task_and_listener_id_debug_format_paths_are_observable() {
     // 3) 对两个 id 做 Debug 格式化，覆盖 ids.rs 中 Debug 实现路径。
     let payload = b"id-format-payload".repeat(1024);
     let server = dev_server::DevFileServer::spawn(payload);
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
 
     let listener_id = client
         .register_global_progress_listener(|_record: FileTransferRecord| {})
@@ -192,7 +226,13 @@ fn meow_client_debug_impl_exposes_config_and_hides_listener_details() {
     // 1) 直接格式化 MeowClient 的 Debug 输出；
     // 2) 验证输出包含结构名和 config 字段；
     // 3) 验证 global_progress_listener 被占位为 ".."（避免泄露闭包细节）。
-    let client = MeowClient::new(MeowConfig::new(3, 7));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(3)
+            .max_download_concurrency(7)
+            .build()
+            .expect("valid config"),
+    );
     let text = format!("{client:?}");
     assert!(
         text.contains("MeowClient"),

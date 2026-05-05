@@ -56,7 +56,13 @@ async fn unregister_global_listener_stops_future_events() {
     // 3) listener1 计数应保持不变，listener2 继续增长，证明 unregister 生效。
     let payload = b"listener-unregister-payload".repeat(4096);
     let server = dev_server::DevFileServer::spawn(payload);
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
 
     let l1_count = Arc::new(AtomicUsize::new(0));
     let l2_count = Arc::new(AtomicUsize::new(0));
@@ -125,7 +131,13 @@ async fn clear_global_listener_removes_all_registered_callbacks() {
     // 3) 后续任务执行时，所有全局监听器都不应再收到任何事件。
     let payload = b"listener-clear-payload".repeat(2048);
     let server = dev_server::DevFileServer::spawn(payload);
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
 
     let l1_count = Arc::new(AtomicUsize::new(0));
     let l2_count = Arc::new(AtomicUsize::new(0));

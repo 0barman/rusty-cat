@@ -10,7 +10,13 @@ fn unregister_same_listener_twice_second_time_returns_false() {
     // 1) 注册一个全局监听器，首次 unregister 应返回 true；
     // 2) 对同一个 id 再次 unregister，应返回 false（miss 分支）；
     // 3) 该用例覆盖 unregister_global_progress_listener 中“未命中 id”路径。
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let counter = Arc::new(AtomicUsize::new(0));
     let c = counter.clone();
 

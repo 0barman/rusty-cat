@@ -46,7 +46,7 @@ impl InnerTask {
         default_upload: Arc<dyn BreakpointUpload + Send + Sync>,
         default_download: Arc<dyn BreakpointDownload + Send + Sync>,
     ) -> Result<Self, MeowError> {
-        let task_id = TaskId::new_v4();
+        let task_id = TaskId::new();
         crate::meow_flow_log!("inner_task", "from_pounce start: task_id={:?}", task_id);
 
         let PounceTask {

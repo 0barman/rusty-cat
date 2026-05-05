@@ -35,7 +35,13 @@ async fn upload_record_file_sign_matches_source_md5() {
     fs::write(&upload_path, &payload).expect("write upload source fixture");
 
     let server = dev_server::DevFileServer::spawn(Vec::new());
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
 
     let terminal: Arc<Mutex<Option<TransferStatus>>> = Arc::new(Mutex::new(None));
     let observed_signs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -109,7 +115,13 @@ async fn second_upload_with_same_sign_hits_duplicate_branch() {
     fs::write(&upload_path, &payload).expect("write upload source fixture");
 
     let server = dev_server::DevFileServer::spawn(Vec::new());
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
 
     let statuses2: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
     let s2 = statuses2.clone();

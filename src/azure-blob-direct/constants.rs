@@ -1,0 +1,9 @@
+pub(crate) const DEFAULT_RANGE_ACCEPT: &str = "application/octet-stream";
+pub(crate) const DEFAULT_BLOCK_CONTENT_TYPE: &str = "application/octet-stream";
+pub(crate) const BLOCK_LIST_CONTENT_TYPE: &str = "application/xml";
+pub(crate) const MS_VERSION: &str = "2023-11-03";
+pub(crate) const HEADER_MS_DATE: &str = "x-ms-date";
+pub(crate) const HEADER_MS_VERSION: &str = "x-ms-version";
+pub(crate) const HEADER_AUTHORIZATION: &str = "authorization";
+pub(crate) const MAX_AZURE_BLOCKS: usize = 50_000;
+pub(crate) const MAX_AZURE_BLOCK_BYTES: u64 = 4_000 * 1024 * 1024;

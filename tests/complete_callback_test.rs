@@ -56,7 +56,13 @@ async fn complete_callback_receives_payload_from_upload_protocol() {
     let upload_path = temp_upload_path("payload");
     fs::write(&upload_path, b"payload-upload-data").expect("write upload source fixture");
 
-    let client = MeowClient::new(MeowConfig::new(1, 1));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(1)
+            .max_download_concurrency(1)
+            .build()
+            .expect("valid config"),
+    );
     let complete_calls: Arc<Mutex<Vec<(TaskId, Option<String>)>>> =
         Arc::new(Mutex::new(Vec::new()));
     let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));

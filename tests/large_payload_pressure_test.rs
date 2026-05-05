@@ -60,7 +60,13 @@ async fn large_file_upload_and_download_complete_under_pressure() {
     let upload_server = dev_server::DevFileServer::spawn(Vec::new());
     let download_server = dev_server::DevFileServer::spawn(download_payload.clone());
 
-    let client = MeowClient::new(MeowConfig::new(2, 2));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(2)
+            .max_download_concurrency(2)
+            .build()
+            .expect("valid config"),
+    );
 
     let up_statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
     let up_statuses_cb = up_statuses.clone();
@@ -131,7 +137,13 @@ async fn large_file_upload_and_download_complete_under_pressure() {
 async fn high_concurrency_large_chunks_and_slow_callbacks_still_converge() {
     let payload = b"high-concurrency-large-chunk".repeat(64 * 1024); // ~1.6MB
     let server = dev_server::DevFileServer::spawn(payload.clone());
-    let client = MeowClient::new(MeowConfig::new(4, 4));
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_upload_concurrency(4)
+            .max_download_concurrency(4)
+            .build()
+            .expect("valid config"),
+    );
 
     let total_tasks = 8usize;
     let mut statuses_list = Vec::with_capacity(total_tasks);

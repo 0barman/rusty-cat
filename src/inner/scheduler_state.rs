@@ -4,6 +4,7 @@ use std::sync::{Arc, RwLock};
 use crate::ids::{GlobalProgressListenerId, TaskId};
 
 use super::active_state::ActiveState;
+use super::cb_dispatcher::CbSubmit;
 use super::group_state::GroupState;
 use super::task_callbacks::ProgressCb;
 use super::UniqueId;
@@ -30,6 +31,11 @@ pub(crate) struct SchedulerState {
     active: HashMap<UniqueId, ActiveState>,
     /// 每个去重键的当前传输偏移（断点进度）；用于进度回调、失败恢复与重启续传。
     offsets: HashMap<UniqueId, u64>,
+    /// 用户回调投递句柄；调度路径只通过它把 `(cb, dto)` 推到独立的回调线程，
+    /// 不再在调度循环中同步调用闭包。
+    /// 在 `Close` 命令处理路径中会被 `take()` 后 drop，从而关闭分发 channel
+    /// 并触发分发线程退出，实现 close 与回调回放的同步。
+    cb_submit: Option<CbSubmit>,
 }
 
 impl SchedulerState {
@@ -37,6 +43,7 @@ impl SchedulerState {
         max_upload_concurrency: usize,
         max_download_concurrency: usize,
         global_progress_listener: Arc<RwLock<Vec<(GlobalProgressListenerId, ProgressCb)>>>,
+        cb_submit: CbSubmit,
     ) -> Self {
         Self {
             max_upload_concurrency,
@@ -49,6 +56,7 @@ impl SchedulerState {
             paused_set: HashSet::new(),
             active: HashMap::new(),
             offsets: HashMap::new(),
+            cb_submit: Some(cb_submit),
         }
     }
 
@@ -120,5 +128,22 @@ impl SchedulerState {
 
     pub(crate) fn task_id_to_dedupe_mut(&mut self) -> &mut HashMap<TaskId, UniqueId> {
         &mut self.task_id_to_dedupe
+    }
+
+    /// 借用回调投递句柄。
+    ///
+    /// 在 `Close` 命令处理后半段（[`Self::take_cb_submit`] 之后）会返回 `None`，
+    /// 调用方此时不应再发任何回调（事实上也不再有用户可见事件需要投递）。
+    pub(crate) fn cb_submit(&self) -> Option<&CbSubmit> {
+        self.cb_submit.as_ref()
+    }
+
+    /// 取出回调投递句柄并立即 drop。
+    ///
+    /// 调用后调度状态对该 channel 的所有 sender 引用都会被释放，分发线程在
+    /// drain 完队列后自然退出。`worker_loop` 紧接着 `join` 该线程即可获得
+    /// "close 时所有终态回调已完成"的同步语义。
+    pub(crate) fn take_cb_submit(&mut self) -> Option<CbSubmit> {
+        self.cb_submit.take()
     }
 }
