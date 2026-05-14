@@ -267,6 +267,8 @@ impl BreakpointUpload for PresignedMultipartUpload {
         let uploaded_parts = self.uploaded_parts.lock().await.clone();
         let body = if let Some(body) = &req.body {
             Some(body.clone())
+        } else if let Some(builder) = &self.plan.complete_body_builder {
+            Some(builder.build_body(&self.plan, &uploaded_parts)?)
         } else if req.uploaded_parts_json_body {
             Some(self.completion_json_body(&uploaded_parts)?)
         } else {

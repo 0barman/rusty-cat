@@ -7,6 +7,7 @@
 //!
 //! This module intentionally does not generate cloud-provider signatures.
 
+mod completion_body_builder;
 mod completion_request;
 mod headers;
 mod multipart_upload;
@@ -18,8 +19,9 @@ mod time;
 mod upload_part;
 mod uploaded_part;
 
+pub use completion_body_builder::PresignedCompletionBodyBuilder;
 pub use completion_request::CompletionRequest;
-pub use headers::headers_from_pairs;
+pub use headers::{headers_from_iter, headers_from_pairs};
 pub use multipart_upload::PresignedMultipartUpload;
 pub use multipart_upload_plan::PresignedMultipartUploadPlan;
 pub use range_download::PresignedRangeDownload;

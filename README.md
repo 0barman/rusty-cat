@@ -106,6 +106,8 @@ rusty-cat = { version = "0.1.1", features = ["aliyun-oss-direct"] }
 | `presigned` | Provider-neutral presigned multipart/range primitives. |
 | `all` | Enables all provider features. Use it for examples, not minimal production builds. |
 
+For a focused comparison of direct credentials versus presigned/SAS URLs, see [Provider feature flags: direct vs presigned/SAS](docs/provider-feature-flags.md).
+
 ### Complete end-to-end example
 
 This example starts from `MeowConfig`, creates a `MeowClient`, registers listeners, builds a task, submits it, waits for the completion/failure signal, inspects a snapshot, and closes the client. It uses an HTTP range download task because that path works without cloud credentials; the same client lifecycle applies to upload tasks and OSS/Azure provider tasks.
@@ -314,6 +316,8 @@ Download HTTP methods are intentionally not configurable. Resumable HTTP downloa
 ## OSS upload/download developer guides
 
 OSS and Blob workflows are provider-specific, so detailed beginner guides live in separate documents. The SDK does not persist your keys, secrets, account keys, tokens, presigned URLs, or SAS URLs in a built-in database or credential store. Some values are held in memory while executing tasks. You must provide them from your application or trusted backend, and you should avoid logging them in progress callbacks or debug listeners.
+
+If you are deciding which provider feature to enable first, start with [Provider feature flags: direct vs presigned/SAS](docs/provider-feature-flags.md).
 
 | Guide | Feature flag | Example source |
 |---|---|---|

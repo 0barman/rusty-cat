@@ -1,5 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock};
+
+use tokio::sync::oneshot;
 
 use crate::dflt::default_http_transfer::{default_breakpoint_arcs, DefaultHttpTransfer};
 use crate::error::{InnerErrorCode, MeowError};
@@ -12,6 +14,7 @@ use crate::log::{set_debug_log_listener, DebugLogListener, DebugLogListenerError
 use crate::meow_config::MeowConfig;
 use crate::pounce_task::PounceTask;
 use crate::transfer_snapshot::TransferSnapshot;
+use crate::transfer_status::TransferStatus;
 
 /// Callback type for globally observing task progress events.
 ///
@@ -96,6 +99,18 @@ pub type GlobalProgressListener = ProgressCb;
 ///     let _ = client_for_task; // use the shared client here
 /// });
 /// ```
+/// Outcome of a task that reached [`TransferStatus::Complete`].
+///
+/// Returned by [`MeowClient::enqueue_and_wait`].
+#[derive(Debug, Clone)]
+pub struct TaskOutcome {
+    /// Task identifier returned by the underlying scheduler.
+    pub task_id: TaskId,
+    /// Provider-defined payload returned by upload protocol's `complete_upload`.
+    /// Download tasks usually receive `None`.
+    pub payload: Option<String>,
+}
+
 pub struct MeowClient {
     /// Lazily initialized task executor.
     ///
@@ -529,6 +544,127 @@ impl MeowClient {
         Ok(task_id)
     }
 
+    /// Enqueues a task and `await`s until it reaches a terminal status.
+    ///
+    /// Wraps [`Self::try_enqueue`] with an internal oneshot channel so callers
+    /// do not have to write the channel + double-callback + single-send-guard
+    /// boilerplate themselves.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(TaskOutcome)` when the task reaches [`TransferStatus::Complete`].
+    /// - `Err(MeowError)` carrying the underlying failure for
+    ///   [`TransferStatus::Failed`].
+    /// - `Err(MeowError)` with code [`InnerErrorCode::TaskCanceled`] for
+    ///   [`TransferStatus::Canceled`].
+    ///
+    /// # Progress
+    ///
+    /// `progress_cb` receives every [`FileTransferRecord`] update, identical to
+    /// the per-task progress callback in [`Self::try_enqueue`].
+    ///
+    /// # Cancellation / timeout
+    ///
+    /// Dropping the returned future does **not** cancel the underlying transfer;
+    /// the task continues running in the executor. Use [`Self::cancel`] with
+    /// the task id (obtainable from `progress_cb`'s `record.task_id()`) to
+    /// abort an in-flight transfer.
+    ///
+    /// To cap wall-clock waiting time, wrap this future:
+    ///
+    /// ```ignore
+    /// let outcome = tokio::time::timeout(
+    ///     std::time::Duration::from_secs(60),
+    ///     client.enqueue_and_wait(task, |_| {}),
+    /// )
+    /// .await??;
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// In addition to the terminal-status errors above, propagates any error
+    /// from [`Self::try_enqueue`] (e.g. `ClientClosed`, `ParameterEmpty`,
+    /// `CommandSendFailed`).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rusty_cat::api::{DownloadPounceBuilder, MeowClient, MeowConfig};
+    ///
+    /// # async fn run() -> Result<(), rusty_cat::api::MeowError> {
+    /// let client = MeowClient::new(MeowConfig::default());
+    /// let task = DownloadPounceBuilder::new(
+    ///     "example.bin",
+    ///     "./downloads/example.bin",
+    ///     1024 * 1024,
+    ///     "https://example.com/example.bin",
+    /// )
+    /// .build();
+    ///
+    /// let outcome = client
+    ///     .enqueue_and_wait(task, |record| {
+    ///         println!(
+    ///             "task={} progress={:.2}",
+    ///             record.task_id(),
+    ///             record.progress()
+    ///         );
+    ///     })
+    ///     .await?;
+    /// println!("task {} complete, payload={:?}", outcome.task_id, outcome.payload);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn enqueue_and_wait<PCB>(
+        &self,
+        task: PounceTask,
+        progress_cb: PCB,
+    ) -> Result<TaskOutcome, MeowError>
+    where
+        PCB: Fn(FileTransferRecord) + Send + Sync + 'static,
+    {
+        type TerminalMsg = Result<(TaskId, Option<String>), MeowError>;
+        let (tx, rx) = oneshot::channel::<TerminalMsg>();
+        let tx_slot: Arc<StdMutex<Option<oneshot::Sender<TerminalMsg>>>> =
+            Arc::new(StdMutex::new(Some(tx)));
+        let progress_slot = Arc::clone(&tx_slot);
+        let complete_slot = tx_slot;
+
+        self.try_enqueue(
+            task,
+            move |record: FileTransferRecord| {
+                progress_cb(record.clone());
+                match record.status() {
+                    TransferStatus::Failed(err) => {
+                        send_terminal_once(&progress_slot, Err(err.clone()));
+                    }
+                    TransferStatus::Canceled => {
+                        send_terminal_once(
+                            &progress_slot,
+                            Err(MeowError::from_code_str(
+                                InnerErrorCode::TaskCanceled,
+                                "task was canceled",
+                            )),
+                        );
+                    }
+                    _ => {}
+                }
+            },
+            move |task_id, payload| {
+                send_terminal_once(&complete_slot, Ok((task_id, payload)));
+            },
+        )
+        .await?;
+
+        match rx.await {
+            Ok(Ok((task_id, payload))) => Ok(TaskOutcome { task_id, payload }),
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err(MeowError::from_code_str(
+                InnerErrorCode::CommandResponseFailed,
+                "transfer terminal channel closed without notification",
+            )),
+        }
+    }
+
     // pub async fn get_task_status(&self, task_id: TaskId)-> Result<FileTransferRecord, MeowError> {
     //     todo!(arman) -
     // }
@@ -733,5 +869,16 @@ impl MeowClient {
     /// ```
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
+    }
+}
+
+fn send_terminal_once(
+    slot: &Arc<StdMutex<Option<oneshot::Sender<Result<(TaskId, Option<String>), MeowError>>>>>,
+    msg: Result<(TaskId, Option<String>), MeowError>,
+) {
+    if let Ok(mut guard) = slot.lock() {
+        if let Some(sender) = guard.take() {
+            let _ = sender.send(msg);
+        }
     }
 }

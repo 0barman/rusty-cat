@@ -12,3 +12,10 @@ pub struct PresignedUploadedPart {
     /// Optional ETag returned by providers such as Aliyun OSS/S3.
     pub etag: Option<String>,
 }
+
+impl PresignedUploadedPart {
+    /// Returns the ETag without surrounding double quotes.
+    pub fn etag_unquoted(&self) -> Option<&str> {
+        self.etag.as_deref().map(|etag| etag.trim_matches('"'))
+    }
+}
