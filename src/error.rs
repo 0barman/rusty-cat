@@ -46,6 +46,8 @@ pub enum InnerErrorCode {
     LockPoisoned = 118,
     /// Failed to build internal HTTP client.
     HttpClientBuildFailed = 119,
+    /// Task was canceled before reaching `Complete`.
+    TaskCanceled = 120,
 }
 
 /// Library error type returned by most public APIs.

@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
+use serde_json::json;
+
 use super::{
-    headers_from_pairs, PresignedMultipartUpload, PresignedMultipartUploadPlan,
+    headers_from_iter, headers_from_pairs, PresignedMultipartUpload, PresignedMultipartUploadPlan,
     PresignedRangeDownload, PresignedRangeDownloadPlan, PresignedUploadPart, PresignedUploadedPart,
 };
 
@@ -86,6 +88,85 @@ fn test_completion_json_contains_uploaded_parts() {
     assert!(json.contains("u-1"));
     assert!(json.contains("etag-1"));
     assert!(json.contains("block-1"));
+}
+
+#[test]
+fn test_custom_completion_body_builder_can_match_backend_contract() {
+    let upload = PresignedMultipartUpload::new(
+        PresignedMultipartUploadPlan::new(
+            5,
+            5,
+            vec![PresignedUploadPart::put(1, 0, 5, "https://example.com/1")
+                .with_provider_part_id("azure-block-1")],
+        )
+        .with_upload_id("u-1")
+        .with_metadata("key", "prefix/file.bin")
+        .with_complete_body_builder(Arc::new(|plan: &PresignedMultipartUploadPlan, parts: &[PresignedUploadedPart]| {
+            let completed = parts
+                .iter()
+                .map(|part| {
+                    json!({
+                        "part_number": part.part_number,
+                        "etag": part.provider_part_id.as_deref().or_else(|| part.etag_unquoted()).unwrap_or_default(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::to_vec(&json!({
+                "key": plan.metadata.get("key"),
+                "upload_id": plan.upload_id,
+                "parts": completed,
+            }))
+            .map_err(|e| crate::MeowError::from_code(
+                crate::InnerErrorCode::ResponseParseError,
+                format!("serialize test body failed: {e}"),
+            ))
+        })),
+    );
+
+    let builder = upload
+        .plan()
+        .complete_body_builder
+        .as_ref()
+        .expect("custom body builder");
+    let body = builder
+        .build_body(
+            upload.plan(),
+            &[PresignedUploadedPart {
+                part_number: 1,
+                provider_part_id: Some("azure-block-1".to_string()),
+                offset: 0,
+                size: 5,
+                etag: Some("\"etag-1\"".to_string()),
+            }],
+        )
+        .expect("completion body");
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(value["key"], "prefix/file.bin");
+    assert_eq!(value["upload_id"], "u-1");
+    assert_eq!(value["parts"][0]["part_number"], 1);
+    assert_eq!(value["parts"][0]["etag"], "azure-block-1");
+}
+
+#[test]
+fn test_headers_from_iter_accepts_dynamic_headers() {
+    let headers = headers_from_iter(vec![(
+        "x-ms-blob-type".to_string(),
+        "BlockBlob".to_string(),
+    )])
+    .expect("headers");
+    assert_eq!(headers.get("x-ms-blob-type").unwrap(), "BlockBlob");
+}
+
+#[test]
+fn test_uploaded_part_etag_unquoted() {
+    let part = PresignedUploadedPart {
+        part_number: 1,
+        provider_part_id: None,
+        offset: 0,
+        size: 5,
+        etag: Some("\"etag-1\"".to_string()),
+    };
+    assert_eq!(part.etag_unquoted(), Some("etag-1"));
 }
 
 #[tokio::test]
