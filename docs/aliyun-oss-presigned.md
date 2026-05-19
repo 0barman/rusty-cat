@@ -23,7 +23,7 @@ The client receives only temporary URLs and metadata. `rusty-cat` does not persi
 
 ```toml
 [dependencies]
-rusty-cat = { version = "0.1.1", features = ["aliyun-oss-presigned"] }
+rusty-cat = { version = "0.2.2", features = ["aliyun-oss-presigned"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

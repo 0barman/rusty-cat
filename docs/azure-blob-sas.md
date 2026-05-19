@@ -21,7 +21,7 @@ For upload, the SAS token generally needs write (`w`) permission, and create (`c
 
 ```toml
 [dependencies]
-rusty-cat = { version = "0.1.1", features = ["azure-blob-sas"] }
+rusty-cat = { version = "0.2.2", features = ["azure-blob-sas"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

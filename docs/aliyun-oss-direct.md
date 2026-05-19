@@ -25,7 +25,7 @@ For untrusted desktop/mobile clients, prefer a backend-generated presigned URL f
 
 ```toml
 [dependencies]
-rusty-cat = { version = "0.1.1", features = ["aliyun-oss-direct"] }
+rusty-cat = { version = "0.2.2", features = ["aliyun-oss-direct"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
