@@ -21,7 +21,7 @@ Existing module paths still work, but `rusty_cat::api::*` is the stable, beginne
 | Item | Value |
 |---|---|
 | Crate | `rusty-cat` |
-| Version | `0.1.1` |
+| Version | `0.2.2` |
 | Rust edition | 2021 |
 | Runtime | Tokio-based async runtime hosted by an internal scheduler thread |
 | HTTP stack | `reqwest` with `rustls-tls` |
@@ -86,7 +86,7 @@ Add the crate:
 
 ```toml
 [dependencies]
-rusty-cat = "0.1.1"
+rusty-cat = "0.2.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -94,7 +94,7 @@ For OSS providers, enable only what you need. Keeping the feature list small red
 
 ```toml
 [dependencies]
-rusty-cat = { version = "0.1.1", features = ["aliyun-oss-direct"] }
+rusty-cat = { version = "0.2.2", features = ["aliyun-oss-direct"] }
 ```
 
 | Feature | Purpose |
