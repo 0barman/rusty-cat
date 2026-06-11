@@ -338,3 +338,24 @@ macro_rules! meow_flow_log {
         });
     };
 }
+
+/// Internal warning logging macro.
+///
+/// Same lazy evaluation semantics as [`meow_flow_log`], but emits at
+/// [`LogLevel::Warn`]. Use it for non-fatal failures that a consumer would want
+/// to surface even when filtering out debug noise — for example a remote cleanup
+/// (multipart abort) that failed and may leave billable orphaned parts behind.
+///
+/// # Examples
+///
+/// ```
+/// rusty_cat::meow_warn_log!("cleanup", "abort failed for key={}", 7);
+/// ```
+#[macro_export]
+macro_rules! meow_warn_log {
+    ($tag:expr, $($arg:tt)*) => {
+        $crate::log::emit_lazy(|| {
+            $crate::log::Log::new($crate::log::LogLevel::Warn, $tag, format!($($arg)*))
+        });
+    };
+}

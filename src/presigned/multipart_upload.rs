@@ -194,6 +194,9 @@ impl BreakpointUpload for PresignedMultipartUpload {
         Ok(UploadResumeInfo {
             completed_file_id: None,
             next_byte: Some(ctx.local_offset),
+            // Surface the provider multipart upload id (if the plan carries one)
+            // so callers can persist it for out-of-band orphan cleanup.
+            provider_upload_id: self.plan.upload_id.clone(),
         })
     }
 
@@ -253,6 +256,7 @@ impl BreakpointUpload for PresignedMultipartUpload {
         Ok(UploadResumeInfo {
             completed_file_id: None,
             next_byte: Some(ctx.offset + ctx.chunk.len() as u64),
+            provider_upload_id: self.plan.upload_id.clone(),
         })
     }
 

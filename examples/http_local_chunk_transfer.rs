@@ -31,6 +31,7 @@ impl rusty_cat::api::BreakpointUpload for BinaryUpload {
         Ok(UploadResumeInfo {
             completed_file_id: None,
             next_byte: Some(0),
+            provider_upload_id: None,
         })
     }
 
@@ -66,6 +67,7 @@ impl rusty_cat::api::BreakpointUpload for BinaryUpload {
         Ok(UploadResumeInfo {
             completed_file_id: None,
             next_byte: Some(ctx.offset + ctx.chunk.len() as u64),
+            provider_upload_id: None,
         })
     }
 }

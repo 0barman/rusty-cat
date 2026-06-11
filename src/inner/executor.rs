@@ -504,7 +504,12 @@ async fn cancel_group(
         // 对上传协议触发可选的远端取消语义（例如 OSS AbortMultipartUpload）。
         let task_view = TransferTask::from_inner(group.leader_inner());
         if let Err(err) = executor.cancel(&task_view).await {
-            crate::meow_flow_log!(
+            // Abort/cleanup failure is billing-relevant: orphaned multipart parts
+            // or uncommitted blocks may keep accruing storage cost. Surface it at
+            // WARN (not debug) so consumers filtering out debug noise still see it.
+            // The error message carries the provider session id (e.g. OSS uploadId)
+            // for out-of-band cleanup. We continue local teardown regardless.
+            crate::meow_warn_log!(
                 "cancel_group",
                 "protocol abort failed but continue cleanup: key={:?} err={}",
                 key,

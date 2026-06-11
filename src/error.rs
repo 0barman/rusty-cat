@@ -48,6 +48,11 @@ pub enum InnerErrorCode {
     HttpClientBuildFailed = 119,
     /// Task was canceled before reaching `Complete`.
     TaskCanceled = 120,
+    /// Local disk ran out of space (`ENOSPC` / `ERROR_DISK_FULL`).
+    DiskFull = 121,
+    /// Local source/target file was removed or replaced while a transfer was
+    /// in progress (for example the user deleted it mid-download).
+    LocalFileRemoved = 122,
 }
 
 /// Library error type returned by most public APIs.
@@ -217,6 +222,68 @@ impl MeowError {
             source: Some(Arc::new(source)),
         }
     }
+
+    /// Creates an error from a local I/O error, automatically classifying
+    /// common failure modes into more specific codes:
+    ///
+    /// - out-of-space (`ENOSPC` on Unix / `ERROR_DISK_FULL` on Windows) maps to
+    ///   [`InnerErrorCode::DiskFull`];
+    /// - a missing target (`std::io::ErrorKind::NotFound`) maps to
+    ///   [`InnerErrorCode::LocalFileRemoved`], which is what surfaces when a
+    ///   source/target file is deleted while a transfer is running;
+    /// - anything else falls back to [`InnerErrorCode::IoError`].
+    ///
+    /// The original [`std::io::Error`] is preserved in the error source chain so
+    /// callers can still inspect `raw_os_error()` / `kind()` if needed.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rusty_cat::api::{InnerErrorCode, MeowError};
+    ///
+    /// let not_found = std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
+    /// let err = MeowError::from_io("download file missing", not_found);
+    /// assert_eq!(err.code(), InnerErrorCode::LocalFileRemoved as i32);
+    /// ```
+    pub fn from_io(msg: impl Into<String>, source: std::io::Error) -> Self {
+        let code = classify_io_error(&source);
+        Self::from_source(code, msg, source)
+    }
+}
+
+/// Classifies a local I/O error into the most specific SDK error code.
+///
+/// Used by [`MeowError::from_io`]; kept as a standalone function so the mapping
+/// can be unit-tested in isolation.
+pub(crate) fn classify_io_error(e: &std::io::Error) -> InnerErrorCode {
+    if is_disk_full(e) {
+        InnerErrorCode::DiskFull
+    } else if e.kind() == std::io::ErrorKind::NotFound {
+        InnerErrorCode::LocalFileRemoved
+    } else {
+        InnerErrorCode::IoError
+    }
+}
+
+/// Detects "no space left on device" across platforms via raw OS error codes.
+///
+/// `std::io::ErrorKind` does not expose a stable out-of-space variant across the
+/// toolchains this crate targets, so the raw OS error number is checked instead:
+/// `ENOSPC` (28) on Unix-like systems, and `ERROR_DISK_FULL` (112) /
+/// `ERROR_HANDLE_DISK_FULL` (39) on Windows.
+fn is_disk_full(e: &std::io::Error) -> bool {
+    if let Some(code) = e.raw_os_error() {
+        #[cfg(unix)]
+        if code == 28 {
+            return true;
+        }
+        #[cfg(windows)]
+        if code == 112 || code == 39 {
+            return true;
+        }
+        let _ = code;
+    }
+    false
 }
 
 impl PartialEq for MeowError {
@@ -262,5 +329,43 @@ mod tests {
         let io = std::io::Error::other("disk io");
         let err = MeowError::from_source(InnerErrorCode::IoError, "io failed", io);
         assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn from_io_classifies_not_found_as_local_file_removed() {
+        let not_found = std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
+        let err = MeowError::from_io("target file missing", not_found);
+        assert_eq!(err.code(), InnerErrorCode::LocalFileRemoved as i32);
+        // Original io error is preserved for callers that want to inspect it.
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn from_io_classifies_generic_error_as_io_error() {
+        let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let err = MeowError::from_io("write failed", denied);
+        assert_eq!(err.code(), InnerErrorCode::IoError as i32);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn from_io_classifies_out_of_space_as_disk_full() {
+        // ENOSPC on Unix, ERROR_DISK_FULL on Windows.
+        #[cfg(unix)]
+        let full = std::io::Error::from_raw_os_error(28);
+        #[cfg(windows)]
+        let full = std::io::Error::from_raw_os_error(112);
+
+        let err = MeowError::from_io("write download file failed", full);
+        assert_eq!(err.code(), InnerErrorCode::DiskFull as i32);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn from_io_classifies_handle_disk_full_as_disk_full() {
+        // ERROR_HANDLE_DISK_FULL (39) is the other Windows out-of-space code.
+        let full = std::io::Error::from_raw_os_error(39);
+        let err = MeowError::from_io("write download file failed", full);
+        assert_eq!(err.code(), InnerErrorCode::DiskFull as i32);
     }
 }

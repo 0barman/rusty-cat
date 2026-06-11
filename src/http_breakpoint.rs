@@ -21,6 +21,21 @@ pub struct UploadResumeInfo {
     ///
     /// Range: `>= 0`.
     pub next_byte: Option<u64>,
+    /// Opaque, provider-defined identifier of the in-flight multipart/resumable
+    /// upload session (for example an Aliyun OSS multipart `UploadId`).
+    ///
+    /// This is **not** a credential and is safe to persist. Persisting it lets
+    /// callers abort an orphaned session out-of-band after a crash, so that
+    /// uncommitted parts/blocks stop accruing storage cost. Providers that have
+    /// no separate session id (such as Azure Block Blob, whose resume state is
+    /// the uncommitted block list keyed by the blob URL) leave this `None`.
+    ///
+    /// Note: the bundled executor only consumes [`UploadResumeInfo::completed_file_id`]
+    /// and [`UploadResumeInfo::next_byte`]; it does not forward this id to the
+    /// progress pipeline. To persist it, hold the protocol instance and read its
+    /// accessor (for OSS, [`crate::aliyun_oss_direct::AliOssDirectUpload::current_upload_id`]),
+    /// or consume this value from a custom executor.
+    pub provider_upload_id: Option<String>,
 }
 
 /// Upload HTTP request body payload.
@@ -96,6 +111,8 @@ fn parse_default_upload_response(body: &str) -> Result<UploadResumeInfo, MeowErr
     Ok(UploadResumeInfo {
         completed_file_id: v.file_id,
         next_byte: v.next_byte.map(|n| if n < 0 { 0u64 } else { n as u64 }),
+        // The default multipart protocol carries no provider-side session id.
+        provider_upload_id: None,
     })
 }
 

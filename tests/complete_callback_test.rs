@@ -32,6 +32,7 @@ impl BreakpointUpload for StaticPayloadUpload {
         Ok(UploadResumeInfo {
             completed_file_id: None,
             next_byte: Some(ctx.local_offset),
+            provider_upload_id: None,
         })
     }
 
@@ -39,6 +40,7 @@ impl BreakpointUpload for StaticPayloadUpload {
         Ok(UploadResumeInfo {
             completed_file_id: None,
             next_byte: Some(ctx.offset + ctx.chunk.len() as u64),
+            provider_upload_id: None,
         })
     }
 
