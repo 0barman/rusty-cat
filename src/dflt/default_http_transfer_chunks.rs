@@ -586,6 +586,13 @@ pub(crate) async fn download_one_chunk(
     }
 
     let next = offset + written_len;
+    if let Err(e) = f.flush().await {
+        rollback_download_file(f, offset, path).await;
+        return Err(MeowError::from_io(
+            format!("flush download file failed: path={}", path.display()),
+            e,
+        ));
+    }
     // Detect a file deleted/replaced while this chunk was being written. On Unix
     // such a deletion does not fail `write_all` (the handle keeps an orphaned
     // inode alive), so without this check the failure would be silent.

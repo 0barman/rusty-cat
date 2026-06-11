@@ -118,6 +118,7 @@ pub struct MeowClient {
     /// there is exactly one owner of this `OnceLock`. Share the whole client
     /// via `Arc<MeowClient>` when multi-owner access is needed.
     executor: OnceLock<Executor>,
+    executor_init: StdMutex<()>,
     /// Immutable runtime configuration.
     config: MeowConfig,
     /// Global listeners receiving progress records for all tasks.
@@ -152,6 +153,7 @@ impl MeowClient {
     pub fn new(config: MeowConfig) -> Self {
         MeowClient {
             executor: Default::default(),
+            executor_init: StdMutex::new(()),
             config,
             global_progress_listener: Arc::new(RwLock::new(Vec::new())),
             closed: Arc::new(AtomicBool::new(false)),
@@ -207,6 +209,21 @@ impl MeowClient {
             crate::meow_flow_log!("executor", "reuse existing executor");
             return Ok(exec);
         }
+
+        let _init_guard = self.executor_init.lock().map_err(|e| {
+            MeowError::from_code(
+                InnerErrorCode::LockPoisoned,
+                format!("executor init lock poisoned: {}", e),
+            )
+        })?;
+        if let Some(exec) = self.executor.get() {
+            crate::meow_flow_log!(
+                "executor",
+                "reuse executor initialized by concurrent caller"
+            );
+            return Ok(exec);
+        }
+
         let default_http_transfer = DefaultHttpTransfer::try_with_http_timeouts(
             self.config.http_timeout(),
             self.config.tcp_keepalive(),
@@ -222,7 +239,16 @@ impl MeowClient {
             Arc::new(default_http_transfer),
             self.global_progress_listener.clone(),
         )?;
-        let _ = self.executor.set(exec);
+        self.executor.set(exec).map_err(|_| {
+            crate::meow_flow_log!(
+                "executor",
+                "executor init race failed while holding init lock"
+            );
+            MeowError::from_code_str(
+                InnerErrorCode::RuntimeCreationFailedError,
+                "executor init race failed",
+            )
+        })?;
         self.executor.get().ok_or_else(|| {
             crate::meow_flow_log!(
                 "executor",
