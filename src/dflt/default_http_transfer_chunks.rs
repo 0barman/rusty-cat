@@ -41,6 +41,41 @@ async fn rollback_download_file(file: &mut File, offset: u64, path: &std::path::
     }
 }
 
+/// Verifies the local download file still exists and is consistent with what we
+/// just wrote, turning a silent "file deleted/replaced mid-transfer" into an
+/// explicit [`InnerErrorCode::LocalFileRemoved`] terminal error.
+///
+/// On Unix, deleting a file that still has an open handle merely unlinks the
+/// directory entry: subsequent writes keep succeeding against the now-orphaned
+/// inode and the bytes are lost when the handle closes, with no I/O error ever
+/// raised. Re-`stat`ing the path after each chunk catches that case (the entry
+/// is gone → `NotFound`) as well as a delete-then-recreate (the visible file is
+/// shorter than what we have written → length check).
+async fn ensure_download_file_present(
+    path: &std::path::Path,
+    expected_min_len: u64,
+) -> Result<(), MeowError> {
+    match tokio::fs::metadata(path).await {
+        Ok(meta) if meta.len() >= expected_min_len => Ok(()),
+        Ok(meta) => Err(MeowError::from_code(
+            InnerErrorCode::LocalFileRemoved,
+            format!(
+                "download file replaced during transfer: path={} expected_len>={} visible_len={}",
+                path.display(),
+                expected_min_len,
+                meta.len()
+            ),
+        )),
+        Err(e) => Err(MeowError::from_io(
+            format!(
+                "download file missing during transfer: path={}",
+                path.display()
+            ),
+            e,
+        )),
+    }
+}
+
 async fn read_error_body_preview(resp: &mut reqwest::Response, max_bytes: usize) -> String {
     let mut out = Vec::new();
     while out.len() < max_bytes {
@@ -99,9 +134,10 @@ pub(crate) async fn upload_one_chunk(
 
     let (info, uploaded_chunk_len) = match task.upload_source() {
         Some(UploadSource::File(path)) => {
-            // 复用每任务只申请一次的 Vec<u8> 缓冲做磁盘读取，再一次性构造
-            // `Bytes` 句柄：后续 reqwest `Body::from(Bytes)` 以及重试中的
-            // `Bytes::clone` 均为零拷贝，彻底避免协议层的 `to_vec` 分配。
+            // Reuse the per-task scratch Vec<u8> for the disk read, then build a
+            // single `Bytes` handle: the later reqwest `Body::from(Bytes)` and the
+            // `Bytes::clone` on retries are all zero-copy, fully avoiding the
+            // protocol layer's `to_vec` allocation.
             let chunk_bytes = {
                 let mut buf_guard = task.upload_chunk_buf().lock().await;
                 if buf_guard.len() < read_len_usize {
@@ -113,8 +149,7 @@ pub(crate) async fn upload_one_chunk(
                 let mut slot = task.upload_file_slot().lock().await;
                 if slot.is_none() {
                     let opened = File::open(path).await.map_err(|e| {
-                        MeowError::from_source(
-                            InnerErrorCode::IoError,
+                        MeowError::from_io(
                             format!("open upload source failed: {}", path.display()),
                             e,
                         )
@@ -130,8 +165,7 @@ pub(crate) async fn upload_one_chunk(
                 file.seek(std::io::SeekFrom::Start(offset))
                     .await
                     .map_err(|e| {
-                        MeowError::from_source(
-                            InnerErrorCode::IoError,
+                        MeowError::from_io(
                             format!(
                                 "seek upload source failed: offset={offset} path={}",
                                 path.display()
@@ -140,16 +174,16 @@ pub(crate) async fn upload_one_chunk(
                         )
                     })?;
                 file.read_exact(&mut buf_guard).await.map_err(|e| {
-                    MeowError::from_source(
-                        InnerErrorCode::IoError,
+                    MeowError::from_io(
                         format!("read upload source failed: path={}", path.display()),
                         e,
                     )
                 })?;
                 drop(slot);
-                // 复制一次到 Bytes，释放对 Vec<u8> 复用缓冲的持有；
-                // 这相比旧实现（协议层 `to_vec`）总分配次数不变，但 clone
-                // 与重试都变成 O(1)。
+                // Copy once into `Bytes` to release the reusable Vec<u8> buffer;
+                // compared with the old implementation (protocol-layer `to_vec`)
+                // the total allocation count is unchanged, but clone and retry
+                // both become O(1).
                 Bytes::copy_from_slice(&buf_guard[..])
             };
 
@@ -176,8 +210,8 @@ pub(crate) async fn upload_one_chunk(
                     ),
                 ));
             }
-            // 内存源是零拷贝关键路径：`Bytes::slice` 只增加 refcount，
-            // 既不复制数据也不分配新缓冲。
+            // The in-memory source is the zero-copy hot path: `Bytes::slice` only
+            // bumps the refcount, copying no data and allocating no new buffer.
             let chunk = bytes.slice(start..end);
             let chunk_len = chunk.len() as u64;
             let info = upload
@@ -406,8 +440,7 @@ pub(crate) async fn download_one_chunk(
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                    MeowError::from_source(
-                        InnerErrorCode::IoError,
+                    MeowError::from_io(
                         format!("create download parent dir failed: {}", parent.display()),
                         e,
                     )
@@ -424,8 +457,7 @@ pub(crate) async fn download_one_chunk(
             .open(path)
             .await
             .map_err(|e| {
-                MeowError::from_source(
-                    InnerErrorCode::IoError,
+                MeowError::from_io(
                     format!("create download file failed: {}", path.display()),
                     e,
                 )
@@ -438,18 +470,13 @@ pub(crate) async fn download_one_chunk(
             .open(path)
             .await
             .map_err(|e| {
-                MeowError::from_source(
-                    InnerErrorCode::IoError,
-                    format!("open download file failed: {}", path.display()),
-                    e,
-                )
+                MeowError::from_io(format!("open download file failed: {}", path.display()), e)
             })?;
         let local_len = opened
             .metadata()
             .await
             .map_err(|e| {
-                MeowError::from_source(
-                    InnerErrorCode::IoError,
+                MeowError::from_io(
                     format!("read download metadata failed: {}", path.display()),
                     e,
                 )
@@ -478,8 +505,7 @@ pub(crate) async fn download_one_chunk(
     f.seek(std::io::SeekFrom::Start(offset))
         .await
         .map_err(|e| {
-            MeowError::from_source(
-                InnerErrorCode::IoError,
+            MeowError::from_io(
                 format!(
                     "seek download file failed: offset={offset} path={}",
                     path.display()
@@ -523,8 +549,9 @@ pub(crate) async fn download_one_chunk(
         }
         if let Err(e) = f.write_all(&chunk).await {
             rollback_download_file(f, offset, path).await;
-            return Err(MeowError::from_source(
-                InnerErrorCode::IoError,
+            // `from_io` classifies out-of-space (`ENOSPC` / `ERROR_DISK_FULL`)
+            // into `DiskFull` and a vanished file into `LocalFileRemoved`.
+            return Err(MeowError::from_io(
                 format!("write download file failed: path={}", path.display()),
                 e,
             ));
@@ -559,6 +586,10 @@ pub(crate) async fn download_one_chunk(
     }
 
     let next = offset + written_len;
+    // Detect a file deleted/replaced while this chunk was being written. On Unix
+    // such a deletion does not fail `write_all` (the handle keeps an orphaned
+    // inode alive), so without this check the failure would be silent.
+    ensure_download_file_present(path, next).await?;
     crate::meow_flow_log!(
         "download_chunk",
         "chunk write success: file={} offset={} next={} total={}",
@@ -604,11 +635,73 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Property-based 测试：对 `parse_content_range` 的鲁棒性防护。
-    // 覆盖要点：
-    //   1) 合法输入（含 `*` 未知总大小）必须能被还原；
-    //   2) 不同非法输入（顺序颠倒、缺斜杠、单位非 bytes、非数字）不得 panic，
-    //      必须以 `InvalidRange` 形式返回错误。
+    // `ensure_download_file_present`: detection of a local file deleted or
+    // replaced mid-transfer. Covers three cases: file present and intact,
+    // file truncated/replaced, and file removed.
+    // ------------------------------------------------------------------
+    mod file_presence {
+        use super::super::ensure_download_file_present;
+        use crate::error::InnerErrorCode;
+
+        fn unique_temp_path(case: &str) -> std::path::PathBuf {
+            let mut p = std::env::temp_dir();
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            p.push(format!("rusty_cat_presence_{case}_{ts}.bin"));
+            p
+        }
+
+        #[tokio::test]
+        async fn present_file_with_enough_bytes_is_ok() {
+            let path = unique_temp_path("ok");
+            tokio::fs::write(&path, vec![0u8; 1024])
+                .await
+                .expect("write temp file");
+
+            // Expected length equals the actual length: should pass.
+            let result = ensure_download_file_present(&path, 1024).await;
+            assert!(result.is_ok(), "expected Ok, got {result:?}");
+
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+
+        #[tokio::test]
+        async fn replaced_shorter_file_is_local_file_removed() {
+            let path = unique_temp_path("shrank");
+            // Only 10 bytes on disk while we claim 4096 bytes "written" → the path
+            // no longer points to the inode we are writing (deleted then recreated).
+            tokio::fs::write(&path, vec![0u8; 10])
+                .await
+                .expect("write temp file");
+
+            let err = ensure_download_file_present(&path, 4096)
+                .await
+                .expect_err("expected LocalFileRemoved error");
+            assert_eq!(err.code(), InnerErrorCode::LocalFileRemoved as i32);
+
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+
+        #[tokio::test]
+        async fn missing_file_is_local_file_removed() {
+            let path = unique_temp_path("missing");
+            // Intentionally skip creating the file, simulating a mid-transfer delete.
+            let err = ensure_download_file_present(&path, 1)
+                .await
+                .expect_err("expected LocalFileRemoved error");
+            assert_eq!(err.code(), InnerErrorCode::LocalFileRemoved as i32);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Property-based tests guarding the robustness of `parse_content_range`.
+    // Key points:
+    //   1) valid inputs (including `*` for unknown total) must round-trip;
+    //   2) various invalid inputs (reversed order, missing slash, non-`bytes`
+    //      unit, non-numeric) must not panic and must return an `InvalidRange`
+    //      error.
     // ------------------------------------------------------------------
     mod prop {
         use super::super::parse_content_range;
@@ -617,7 +710,7 @@ mod tests {
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(256))]
 
-            /// 合法输入应被还原为同样的三元组。
+            /// Valid inputs should round-trip into the same triple.
             #[test]
             fn parse_content_range_roundtrip_ok(
                 start in 0u64..u64::MAX / 2,
@@ -625,7 +718,8 @@ mod tests {
                 total in 1u64..u64::MAX / 2,
             ) {
                 let end = start.saturating_add(len - 1);
-                // 跳过 end >= total 的组合，这类由上层语义处理，不属于本函数职责。
+                // Skip end >= total combinations; those are handled by upper-layer
+                // semantics and are not this function's responsibility.
                 prop_assume!(end < total);
 
                 let header = format!("bytes {start}-{end}/{total}");
@@ -640,7 +734,7 @@ mod tests {
                 prop_assert_eq!(pt, Some(total));
             }
 
-            /// 未知总大小（`*`）分支也应正确返回 `None`。
+            /// The unknown-total (`*`) branch should also correctly return `None`.
             #[test]
             fn parse_content_range_unknown_total(
                 start in 0u64..u64::MAX / 2,
@@ -659,7 +753,7 @@ mod tests {
                 prop_assert!(pt.is_none());
             }
 
-            /// end < start 必须返回错误，不能 panic。
+            /// end < start must return an error, never panic.
             #[test]
             fn parse_content_range_reversed_range_fails(
                 start in 1u64..1_000_000,
@@ -672,13 +766,13 @@ mod tests {
                 prop_assert!(parse_content_range(&header).is_err());
             }
 
-            /// 任意“随便写”的字符串不得导致 panic；要么 Ok 要么 Err。
+            /// Any arbitrary string must not cause a panic; either Ok or Err.
             #[test]
             fn parse_content_range_never_panics(s in ".{0,128}") {
                 let _ = parse_content_range(&s);
             }
 
-            /// 单位不是 `bytes` 应该失败。
+            /// A unit other than `bytes` should fail.
             #[test]
             fn parse_content_range_wrong_unit_fails(
                 unit in "[a-z]{1,8}",

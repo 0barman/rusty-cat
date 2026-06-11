@@ -1,6 +1,6 @@
 [package]
 name = "rusty-cat"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 description = "Async HTTP client for resumable file upload and download."
 license = "MIT"
@@ -34,6 +34,7 @@ tokio = { version = "1.50.0", default-features = false, features = [
     "macros",
     "io-util",
     "fs",
+    "time",
 ] }
 reqwest = { version = "0.12.28", default-features = false, features = [
     "multipart",
@@ -58,7 +59,6 @@ hex = "0.4"
 indicatif = "0.17"
 proptest = "1.5"
 sha2 = "0.10"
-# 集成测试里使用 tokio::time::sleep；库代码本身不需要 time feature
 tokio = { version = "1.50.0", default-features = false, features = [
     "rt-multi-thread",
     "macros",

@@ -223,6 +223,84 @@ impl AliOssDirectUpload {
         })?;
         Ok((url, query))
     }
+
+    /// Returns the active multipart `UploadId` for the current session, if any.
+    ///
+    /// Callers can persist this id (it is not a credential) so that an orphaned
+    /// multipart upload — for example one left behind by a process crash — can be
+    /// aborted later via [`AliOssDirectUpload::abort_multipart`], stopping the
+    /// uncommitted parts from accruing OSS storage cost. Returns `None` before
+    /// `prepare` has initiated/adopted a session, or after a successful
+    /// complete/abort.
+    pub async fn current_upload_id(&self) -> Option<String> {
+        self.session.lock().await.upload_id.clone()
+    }
+
+    /// Sends `AbortMultipartUpload` (`DELETE ?uploadId=...`) for an explicit
+    /// upload id without reading or mutating the in-memory session state.
+    ///
+    /// Use this to clean up an orphaned multipart session recovered from durable
+    /// storage (see [`AliOssDirectUpload::current_upload_id`]) after the original
+    /// task or process is gone. A `404 Not Found` is treated as success because
+    /// the session may already have expired or been aborted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MeowError`] when signing, the network request, or the server
+    /// response indicates the abort did not succeed.
+    pub async fn abort_multipart(
+        &self,
+        client: &reqwest::Client,
+        task: &TransferTask,
+        upload_id: &str,
+    ) -> Result<(), MeowError> {
+        self.send_abort_multipart(client, task, upload_id).await
+    }
+
+    /// Shared `AbortMultipartUpload` request used by both the cancel hook and the
+    /// out-of-band [`AliOssDirectUpload::abort_multipart`] cleanup path.
+    ///
+    /// The `upload_id` is an OSS multipart session id, not a credential, so it is
+    /// safe to surface in error messages to make abort failures actionable.
+    async fn send_abort_multipart(
+        &self,
+        client: &reqwest::Client,
+        task: &TransferTask,
+        upload_id: &str,
+    ) -> Result<(), MeowError> {
+        let canonical_uri = self.object_canonical_uri_from_task_url(task)?;
+        let (url, raw_query) = Self::build_query_url(task, &[("uploadId", upload_id.to_string())])?;
+        let headers = self.build_signed_headers(
+            "DELETE",
+            &canonical_uri,
+            Some(raw_query.as_str()),
+            &[],
+            None,
+        )?;
+        let resp = client
+            .request(Method::DELETE, url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| {
+                MeowError::from_source(
+                    InnerErrorCode::HttpError,
+                    format!("oss abort multipart upload failed (uploadId={upload_id})"),
+                    e,
+                )
+            })?;
+        let status = resp.status();
+        if !(status.is_success() || status == reqwest::StatusCode::NOT_FOUND) {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(MeowError::from_code(
+                InnerErrorCode::ResponseStatusError,
+                format!(
+                    "oss abort multipart upload failed: {status}, uploadId={upload_id}, body: {body}"
+                ),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -237,11 +315,12 @@ impl BreakpointUpload for AliOssDirectUpload {
                     upload_id: None,
                 };
             }
-            if state.upload_id.is_some() {
+            if let Some(upload_id) = state.upload_id.clone() {
                 validate_resume_offset(ctx.task, ctx.local_offset)?;
                 return Ok(UploadResumeInfo {
                     completed_file_id: None,
                     next_byte: Some(ctx.local_offset),
+                    provider_upload_id: Some(upload_id),
                 });
             }
         }
@@ -257,10 +336,11 @@ impl BreakpointUpload for AliOssDirectUpload {
                 validate_remote_parts_for_resume(ctx.task, ctx.local_offset, &uploaded_parts)?;
                 let mut state = self.session.lock().await;
                 state.target_url = Some(ctx.task.url().to_string());
-                state.upload_id = Some(upload_id);
+                state.upload_id = Some(upload_id.clone());
                 return Ok(UploadResumeInfo {
                     completed_file_id: None,
                     next_byte: Some(ctx.local_offset),
+                    provider_upload_id: Some(upload_id),
                 });
             }
             return Err(MeowError::from_code_str(
@@ -271,10 +351,11 @@ impl BreakpointUpload for AliOssDirectUpload {
         let upload_id = self.initiate_multipart_upload(ctx.client, ctx.task).await?;
         let mut state = self.session.lock().await;
         state.target_url = Some(ctx.task.url().to_string());
-        state.upload_id = Some(upload_id);
+        state.upload_id = Some(upload_id.clone());
         Ok(UploadResumeInfo {
             completed_file_id: None,
             next_byte: Some(0),
+            provider_upload_id: Some(upload_id),
         })
     }
 
@@ -298,7 +379,7 @@ impl BreakpointUpload for AliOssDirectUpload {
             ctx.task,
             &[
                 ("partNumber", part_number.to_string()),
-                ("uploadId", upload_id),
+                ("uploadId", upload_id.clone()),
             ],
         )?;
         let headers =
@@ -331,6 +412,7 @@ impl BreakpointUpload for AliOssDirectUpload {
         Ok(UploadResumeInfo {
             completed_file_id: None,
             next_byte: Some(ctx.offset + ctx.chunk.len() as u64),
+            provider_upload_id: Some(upload_id),
         })
     }
 
@@ -387,39 +469,13 @@ impl BreakpointUpload for AliOssDirectUpload {
         client: &reqwest::Client,
         task: &TransferTask,
     ) -> Result<(), MeowError> {
-        let canonical_uri = self.object_canonical_uri_from_task_url(task)?;
         let upload_id = self.session.lock().await.upload_id.clone();
         let Some(upload_id) = upload_id else {
             return Ok(());
         };
-        let (url, raw_query) = Self::build_query_url(task, &[("uploadId", upload_id)])?;
-        let headers = self.build_signed_headers(
-            "DELETE",
-            &canonical_uri,
-            Some(raw_query.as_str()),
-            &[],
-            None,
-        )?;
-        let resp = client
-            .request(Method::DELETE, url)
-            .headers(headers)
-            .send()
-            .await
-            .map_err(|e| {
-                MeowError::from_source(
-                    InnerErrorCode::HttpError,
-                    "oss abort multipart upload failed",
-                    e,
-                )
-            })?;
-        let status = resp.status();
-        if !(status.is_success() || status == reqwest::StatusCode::NOT_FOUND) {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(MeowError::from_code(
-                InnerErrorCode::ResponseStatusError,
-                format!("oss abort multipart upload failed: {status}, body: {body}"),
-            ));
-        }
+        // On failure the session id is intentionally kept so the upper layer can
+        // log it (see executor cancel path) and the caller can retry cleanup.
+        self.send_abort_multipart(client, task, &upload_id).await?;
         self.session.lock().await.upload_id = None;
         Ok(())
     }
@@ -481,4 +537,47 @@ fn validate_remote_parts_for_resume(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn upload() -> AliOssDirectUpload {
+        AliOssDirectUpload::new("bucket", "ak", "sk", "cn-hangzhou")
+    }
+
+    #[tokio::test]
+    async fn current_upload_id_is_none_before_prepare() {
+        // A freshly constructed protocol has no active multipart session yet.
+        assert_eq!(upload().current_upload_id().await, None);
+    }
+
+    #[tokio::test]
+    async fn current_upload_id_reflects_active_session() {
+        // The accessor exposes the in-flight UploadId so callers can persist it
+        // for later out-of-band abort.
+        let u = upload();
+        {
+            let mut state = u.session.lock().await;
+            state.upload_id = Some("test-upload-id".to_string());
+        }
+        assert_eq!(
+            u.current_upload_id().await.as_deref(),
+            Some("test-upload-id")
+        );
+    }
+
+    #[test]
+    fn provider_upload_id_round_trips_in_resume_info() {
+        // The new field carries the provider session id end to end.
+        let info = UploadResumeInfo {
+            completed_file_id: None,
+            next_byte: Some(0),
+            provider_upload_id: Some("uid-42".to_string()),
+        };
+        assert_eq!(info.provider_upload_id.as_deref(), Some("uid-42"));
+        // Default keeps it absent so providers without a session id opt out.
+        assert!(UploadResumeInfo::default().provider_upload_id.is_none());
+    }
 }

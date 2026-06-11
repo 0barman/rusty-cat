@@ -137,6 +137,9 @@ impl BreakpointUpload for AzureBlobDirectUpload {
                 return Ok(UploadResumeInfo {
                     completed_file_id: None,
                     next_byte: Some(0),
+                    // Azure Block Blob has no separate session id; resume state is
+                    // the uncommitted block list keyed by the blob URL.
+                    provider_upload_id: None,
                 });
             }
             validate_resume_offset(ctx.task, ctx.local_offset)?;
@@ -149,6 +152,7 @@ impl BreakpointUpload for AzureBlobDirectUpload {
                 return Ok(UploadResumeInfo {
                     completed_file_id: None,
                     next_byte: Some(ctx.local_offset),
+                    provider_upload_id: None,
                 });
             }
         }
@@ -161,6 +165,7 @@ impl BreakpointUpload for AzureBlobDirectUpload {
         Ok(UploadResumeInfo {
             completed_file_id: None,
             next_byte: Some(ctx.local_offset),
+            provider_upload_id: None,
         })
     }
 
@@ -219,6 +224,7 @@ impl BreakpointUpload for AzureBlobDirectUpload {
         Ok(UploadResumeInfo {
             completed_file_id: None,
             next_byte: Some(ctx.offset + ctx.chunk.len() as u64),
+            provider_upload_id: None,
         })
     }
 

@@ -97,6 +97,7 @@ impl InspectUploadProtocol {
         Ok(UploadResumeInfo {
             completed_file_id: file_id,
             next_byte,
+            provider_upload_id: None,
         })
     }
 }

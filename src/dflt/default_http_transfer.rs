@@ -344,10 +344,11 @@ async fn download_prepare(
     let path = task.file_path();
     let local_len = match tokio::fs::metadata(path).await {
         Ok(meta) => meta.len(),
+        // A missing file here simply means "no local progress yet"; treat it as
+        // a fresh download rather than a mid-transfer removal.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0u64,
         Err(e) => {
-            return Err(MeowError::from_source(
-                InnerErrorCode::IoError,
+            return Err(MeowError::from_io(
                 format!("download_prepare stat failed: {}", path.display()),
                 e,
             ));

@@ -63,6 +63,7 @@ impl rusty_cat::api::BreakpointUpload for AliyunDirectUpload {
                 return Ok(UploadResumeInfo {
                     completed_file_id: None,
                     next_byte: Some(ctx.local_offset),
+                    provider_upload_id: None,
                 });
             }
         }
@@ -74,6 +75,7 @@ impl rusty_cat::api::BreakpointUpload for AliyunDirectUpload {
                 return Ok(UploadResumeInfo {
                     completed_file_id: None,
                     next_byte: Some(ctx.local_offset),
+                    provider_upload_id: None,
                 });
             }
             return Err(rusty_cat::api::MeowError::from_code_str(
@@ -88,6 +90,7 @@ impl rusty_cat::api::BreakpointUpload for AliyunDirectUpload {
         Ok(UploadResumeInfo {
             completed_file_id: None,
             next_byte: Some(0),
+            provider_upload_id: None,
         })
     }
 
@@ -148,6 +151,7 @@ impl rusty_cat::api::BreakpointUpload for AliyunDirectUpload {
         Ok(UploadResumeInfo {
             completed_file_id: None,
             next_byte: Some(ctx.offset + ctx.chunk.len() as u64),
+            provider_upload_id: None,
         })
     }
 
