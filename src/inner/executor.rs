@@ -23,6 +23,13 @@ pub(crate) enum TransferCmd {
         inner: InnerTask,
         callbacks: TaskCallbacks,
     },
+    /// Imports a task in the "paused" state: registered into the scheduler but
+    /// not queued and triggering no I/O. A later Resume on the same task_id
+    /// moves it into the normal scheduling lifecycle.
+    EnqueuePaused {
+        inner: InnerTask,
+        callbacks: TaskCallbacks,
+    },
     Pause {
         task_id: TaskId,
         /// 控制命令应答通道：返回 pause 的最终结果。
@@ -173,6 +180,79 @@ fn worker_loop(
                                             &executor,
                                         )
                                         .await;
+                                    }
+                                    TransferCmd::EnqueuePaused { inner, callbacks } => {
+                                        let key = inner.dedupe_key();
+                                        crate::meow_flow_log!(
+                                            "cmd_enqueue_paused",
+                                            "received enqueue_paused: task_id={:?} key={:?} chunk_size={}",
+                                            inner.task_id(),
+                                            key,
+                                            inner.chunk_size()
+                                        );
+                                        // Same duplicate detection as Enqueue so repeated imports stay idempotent.
+                                        if let Some(existing) = state.groups().get(&key) {
+                                            let leader = existing.leader_inner();
+                                            let dup_dto = to_record_inner(
+                                                leader,
+                                                TransferStatus::Failed(MeowError::from_code1(
+                                                    InnerErrorCode::DuplicateTaskError,
+                                                )),
+                                                0,
+                                                leader.total_size(),
+                                            );
+                                            if let Some(cb) = &callbacks.progress_cb() {
+                                                crate::inner::exec_impl::emit::invoke_progress_cb(
+                                                    &state,
+                                                    cb,
+                                                    dup_dto.clone(),
+                                                );
+                                            }
+                                            crate::inner::exec_impl::emit::emit_global_progress(
+                                                &state,
+                                                dup_dto,
+                                            );
+                                            crate::meow_flow_log!(
+                                                "cmd_enqueue_paused",
+                                                "duplicate key rejected: key={:?}",
+                                                key
+                                            );
+                                            continue;
+                                        }
+
+                                        state
+                                            .task_id_to_dedupe_mut()
+                                            .insert(inner.task_id(), key.clone());
+
+                                        let entry = RecordEntry::new(inner.clone(), callbacks);
+                                        state.groups_mut().insert(
+                                            key.clone(),
+                                            GroupState::new(inner.clone(), entry),
+                                        );
+
+                                        // Register directly into paused_set: no queueing and no
+                                        // try_start_next, so an imported task performs zero network
+                                        // or file I/O until it is explicitly resumed.
+                                        state.paused_set_mut().insert(key.clone());
+                                        if let Some(group) = state.groups().get(&key) {
+                                            // offset has not been computed by prepare yet, so this
+                                            // reports 0; callers should render paused-list progress
+                                            // from their own persisted record.
+                                            let current =
+                                                state.offsets().get(&key).copied().unwrap_or(0);
+                                            crate::inner::exec_impl::emit::emit_status(
+                                                &state,
+                                                group.entry(),
+                                                TransferStatus::Paused,
+                                                current,
+                                                group.entry().inner().total_size(),
+                                            );
+                                        }
+                                        crate::meow_flow_log!(
+                                            "cmd_enqueue_paused",
+                                            "task registered as paused: key={:?}",
+                                            key
+                                        );
                                     }
                                     TransferCmd::Pause { task_id, respond_to } => {
                                         crate::meow_flow_log!(
@@ -748,6 +828,46 @@ impl Executor {
                 )
             })?;
         crate::meow_flow_log!("executor_api", "try_enqueue send ok: task_id={:?}", id);
+        Ok(id)
+    }
+
+    /// Non-blocking submission of an `EnqueuePaused` request.
+    ///
+    /// Mirrors [`Self::try_enqueue`] (fail-fast `try_send`, `CommandSendFailed`
+    /// on a full command queue) but registers the task directly in the paused
+    /// set without queueing it. The task only enters the running lifecycle once
+    /// the caller issues a matching [`Self::resume`].
+    pub(crate) fn try_enqueue_paused(
+        &self,
+        inner: InnerTask,
+        callbacks: TaskCallbacks,
+    ) -> Result<TaskId, MeowError> {
+        let id = inner.task_id();
+        crate::meow_flow_log!(
+            "executor_api",
+            "try_enqueue_paused send: task_id={:?} key={:?}",
+            id,
+            inner.dedupe_key()
+        );
+        self.cmd_tx
+            .try_send(TransferCmd::EnqueuePaused { inner, callbacks })
+            .map_err(|e| {
+                crate::meow_flow_log!(
+                    "executor_api",
+                    "try_enqueue_paused send failed: task_id={:?} err={}",
+                    id,
+                    e
+                );
+                MeowError::from_code(
+                    InnerErrorCode::CommandSendFailed,
+                    format!("try_enqueue_paused_failed: {}", e),
+                )
+            })?;
+        crate::meow_flow_log!(
+            "executor_api",
+            "try_enqueue_paused send ok: task_id={:?}",
+            id
+        );
         Ok(id)
     }
 

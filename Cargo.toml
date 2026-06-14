@@ -1,6 +1,6 @@
 [package]
 name = "rusty-cat"
-version = "0.2.4"
+version = "0.3.0"
 edition = "2021"
 description = "Async HTTP client for resumable file upload and download."
 license = "MIT"
@@ -72,6 +72,14 @@ harness = false
 [[example]]
 name = "http_local_chunk_transfer"
 path = "examples/http_local_chunk_transfer.rs"
+
+[[example]]
+name = "restore_import_paused"
+path = "examples/restore_import_paused.rs"
+
+[[example]]
+name = "resume_after_restart"
+path = "examples/resume_after_restart.rs"
 
 [[example]]
 name = "aliyun_oss_direct_chunk_transfer"

@@ -204,3 +204,104 @@ fn test_range_download_uses_refresher_near_expiry() {
     assert_eq!(plan.range_headers.get("x-refreshed").unwrap(), "yes");
     assert!(plan.range_expires_at_unix_secs.expect("expires") > expires);
 }
+
+// ---- phase 2: presigned multipart cross-restart resume (with_resumed_parts) ----
+
+fn plan_three_5b_parts() -> PresignedMultipartUploadPlan {
+    PresignedMultipartUploadPlan::new(
+        15,
+        5,
+        vec![
+            PresignedUploadPart::put(1, 0, 5, "https://example.com/1"),
+            PresignedUploadPart::put(2, 5, 5, "https://example.com/2"),
+            PresignedUploadPart::put(3, 10, 5, "https://example.com/3"),
+        ],
+    )
+}
+
+fn uploaded(part_number: u64, offset: u64, size: u64) -> PresignedUploadedPart {
+    PresignedUploadedPart {
+        part_number,
+        provider_part_id: None,
+        offset,
+        size,
+        etag: Some(format!("etag-{part_number}")),
+    }
+}
+
+#[test]
+fn test_resumed_offset_covers_full_contiguous_prefix() {
+    let up = PresignedMultipartUpload::new(plan_three_5b_parts());
+    let resumed = up.resumed_offset_from(&[uploaded(1, 0, 5), uploaded(2, 5, 5)]);
+    assert_eq!(
+        resumed, 10,
+        "two contiguous 5-byte parts resume at offset 10"
+    );
+}
+
+#[test]
+fn test_resumed_offset_stops_at_gap() {
+    // Parts at 0 and 10 leave a gap at 5; resume must stop at the gap, not skip it.
+    let up = PresignedMultipartUpload::new(plan_three_5b_parts());
+    let resumed = up.resumed_offset_from(&[uploaded(1, 0, 5), uploaded(3, 10, 5)]);
+    assert_eq!(resumed, 5);
+}
+
+#[test]
+fn test_resumed_offset_stops_on_plan_size_mismatch() {
+    // A persisted part whose size disagrees with the plan is not trusted.
+    let up = PresignedMultipartUpload::new(plan_three_5b_parts());
+    let resumed = up.resumed_offset_from(&[uploaded(1, 0, 4)]);
+    assert_eq!(resumed, 0);
+}
+
+#[test]
+fn test_resumed_offset_ignores_part_not_in_plan() {
+    // An offset the plan does not contain cannot start the contiguous prefix.
+    let up = PresignedMultipartUpload::new(plan_three_5b_parts());
+    let resumed = up.resumed_offset_from(&[uploaded(9, 3, 5)]);
+    assert_eq!(resumed, 0);
+}
+
+#[test]
+fn test_resumed_offset_empty_is_zero() {
+    let up = PresignedMultipartUpload::new(plan_three_5b_parts());
+    assert_eq!(up.resumed_offset_from(&[]), 0);
+}
+
+#[tokio::test]
+async fn test_with_resumed_parts_dedups_by_offset() {
+    // Injecting two parts for the same offset keeps only one.
+    let up = PresignedMultipartUpload::new(plan_three_5b_parts()).with_resumed_parts(vec![
+        uploaded(1, 0, 5),
+        uploaded(1, 0, 5),
+        uploaded(2, 5, 5),
+    ]);
+    let parts = up.uploaded_parts().await;
+    assert_eq!(parts.len(), 2);
+    let mut offsets: Vec<u64> = parts.iter().map(|p| p.offset).collect();
+    offsets.sort_unstable();
+    assert_eq!(offsets, vec![0, 5]);
+}
+
+#[tokio::test]
+async fn test_with_resumed_parts_empty_is_fresh_upload() {
+    let up = PresignedMultipartUpload::new(plan_three_5b_parts()).with_resumed_parts(vec![]);
+    assert!(up.uploaded_parts().await.is_empty());
+    assert_eq!(up.resumed_offset_from(&[]), 0);
+}
+
+#[test]
+fn test_sort_dedup_completion_parts_orders_by_part_number_and_drops_dup_offset() {
+    let mut parts = vec![
+        uploaded(3, 10, 5),
+        uploaded(1, 0, 5),
+        uploaded(2, 5, 5),
+        uploaded(2, 5, 5), // duplicate offset 5
+    ];
+    PresignedMultipartUpload::sort_dedup_completion_parts(&mut parts);
+    let pns: Vec<u64> = parts.iter().map(|p| p.part_number).collect();
+    let offsets: Vec<u64> = parts.iter().map(|p| p.offset).collect();
+    assert_eq!(pns, vec![1, 2, 3], "ascending part numbers");
+    assert_eq!(offsets, vec![0, 5, 10], "duplicate offset dropped");
+}

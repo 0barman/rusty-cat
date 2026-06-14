@@ -39,6 +39,25 @@ impl PresignedMultipartUpload {
         self
     }
 
+    /// Seeds parts that a previous process already uploaded, loaded from the
+    /// caller's own persistence. Use this after a restart so that
+    /// `complete_upload` includes those parts and `prepare` resumes past the
+    /// already-uploaded contiguous prefix.
+    ///
+    /// Parts are de-duplicated by `offset` (last occurrence wins). They are not
+    /// validated against the plan here; `prepare` validates the contiguous
+    /// prefix and resumes from the first gap or mismatch, so resume never skips
+    /// bytes that were not verifiably uploaded.
+    pub fn with_resumed_parts(mut self, parts: Vec<PresignedUploadedPart>) -> Self {
+        let mut by_offset: std::collections::BTreeMap<u64, PresignedUploadedPart> =
+            std::collections::BTreeMap::new();
+        for part in parts {
+            by_offset.insert(part.offset, part);
+        }
+        self.uploaded_parts = Arc::new(Mutex::new(by_offset.into_values().collect()));
+        self
+    }
+
     /// Returns the immutable plan.
     pub fn plan(&self) -> &PresignedMultipartUploadPlan {
         &self.plan
@@ -115,6 +134,28 @@ impl PresignedMultipartUpload {
         Ok(refreshed)
     }
 
+    /// Computes the resume offset from already-uploaded parts: the end of the
+    /// longest prefix that is contiguous from byte 0 and matches the plan.
+    /// Stops at the first gap, overlap, or part that does not match the plan,
+    /// so resume never skips bytes that were not verifiably uploaded.
+    pub(crate) fn resumed_offset_from(&self, parts: &[PresignedUploadedPart]) -> u64 {
+        let mut sorted: Vec<&PresignedUploadedPart> = parts.iter().collect();
+        sorted.sort_by_key(|p| p.offset);
+        let mut running = 0u64;
+        for p in sorted {
+            if p.offset != running {
+                break;
+            }
+            match self.plan.part_for_offset(p.offset) {
+                Some(plan_part) if plan_part.size == p.size => {
+                    running = running.saturating_add(p.size);
+                }
+                _ => break,
+            }
+        }
+        running
+    }
+
     async fn send_callback(
         client: &reqwest::Client,
         req: &CompletionRequest,
@@ -138,6 +179,14 @@ impl PresignedMultipartUpload {
             ));
         }
         Ok(if body.is_empty() { None } else { Some(body) })
+    }
+
+    /// Normalizes the completion part list: drop duplicate offsets and order by
+    /// ascending part number, as required by S3/OSS-style multipart completion.
+    pub(crate) fn sort_dedup_completion_parts(parts: &mut Vec<PresignedUploadedPart>) {
+        parts.sort_by_key(|p| (p.offset, p.part_number));
+        parts.dedup_by_key(|p| p.offset);
+        parts.sort_by_key(|p| p.part_number);
     }
 
     pub(crate) fn completion_json_body(
@@ -191,9 +240,16 @@ impl BreakpointUpload for PresignedMultipartUpload {
                 ),
             ));
         }
+        // Resume past any already-uploaded contiguous prefix, e.g. parts
+        // re-injected via `with_resumed_parts` after a restart. The executor
+        // still merges this with its own local_offset.
+        let resumed = {
+            let parts = self.uploaded_parts.lock().await;
+            self.resumed_offset_from(&parts)
+        };
         Ok(UploadResumeInfo {
             completed_file_id: None,
-            next_byte: Some(ctx.local_offset),
+            next_byte: Some(ctx.local_offset.max(resumed)),
             // Surface the provider multipart upload id (if the plan carries one)
             // so callers can persist it for out-of-band orphan cleanup.
             provider_upload_id: self.plan.upload_id.clone(),
@@ -268,7 +324,10 @@ impl BreakpointUpload for PresignedMultipartUpload {
         let Some(req) = &self.plan.complete_request else {
             return Ok(None);
         };
-        let uploaded_parts = self.uploaded_parts.lock().await.clone();
+        let mut uploaded_parts = self.uploaded_parts.lock().await.clone();
+        // Normalize defensively before completing so a resumed upload never
+        // submits an out-of-order or duplicated part list.
+        Self::sort_dedup_completion_parts(&mut uploaded_parts);
         let body = if let Some(body) = &req.body {
             Some(body.clone())
         } else if let Some(builder) = &self.plan.complete_body_builder {
