@@ -570,6 +570,126 @@ impl MeowClient {
         Ok(task_id)
     }
 
+    /// Imports a transfer task in the **paused** state without scheduling it.
+    ///
+    /// This is the restart/restore entry point for callers that persist their
+    /// own transfer records: rebuild a [`PounceTask`] from your database, import
+    /// it here, and the task is registered into the scheduler as
+    /// [`TransferStatus::Paused`] **without** queueing, so it performs **zero
+    /// network or file I/O** until you explicitly start it.
+    ///
+    /// To start a previously imported task, call [`Self::resume`] with the
+    /// returned [`TaskId`]. A typical "restore N, start a user-selected subset"
+    /// flow imports every task with `try_enqueue_paused` and then calls
+    /// [`Self::resume`] only for the ids the user chose; the rest stay paused.
+    ///
+    /// # Difference from [`Self::try_enqueue`]
+    ///
+    /// - `try_enqueue` schedules immediately (the task becomes `Pending` and may
+    ///   start transferring as soon as a concurrency slot is free).
+    /// - `try_enqueue_paused` registers the task as `Paused` and never queues it
+    ///   until [`Self::resume`] is called.
+    ///
+    /// Back-pressure is identical: this method uses
+    /// [`tokio::sync::mpsc::Sender::try_send`] and fails fast with
+    /// `CommandSendFailed` if the command queue is full (see
+    /// [`Self::try_enqueue`] for the rationale behind the `try_` prefix).
+    ///
+    /// # Resume semantics after import
+    ///
+    /// When the imported task is later resumed, the resume point is recomputed
+    /// by the executor, **not** taken from any value passed here:
+    ///
+    /// - **Download**: resumes from the on-disk partial file length, so the
+    ///   partial file must still exist at the task's `file_path`.
+    /// - **Upload**: resumes from the server-reported `next_byte` during the
+    ///   upload `prepare` stage.
+    ///
+    /// # Progress reporting while paused
+    ///
+    /// The single `Paused` [`FileTransferRecord`] emitted on import reports
+    /// progress `0.0` because no `prepare` has run yet. Render the imported
+    /// task's real progress from your own persisted record; the SDK corrects it
+    /// after the first resume.
+    ///
+    /// # Parameters
+    ///
+    /// Same as [`Self::try_enqueue`]: a built `task`, a per-task `progress_cb`,
+    /// and a `complete_cb` fired once on terminal `Complete`.
+    ///
+    /// # Errors
+    ///
+    /// - `ClientClosed` if the client was closed.
+    /// - `ParameterEmpty` if the task is invalid/empty.
+    /// - `CommandSendFailed` if the scheduler command queue is full.
+    /// - Any runtime initialization errors from the executor.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rusty_cat::api::{DownloadPounceBuilder, MeowClient, MeowConfig};
+    ///
+    /// # async fn run() -> Result<(), rusty_cat::api::MeowError> {
+    /// let client = MeowClient::new(MeowConfig::default());
+    /// let task = DownloadPounceBuilder::new(
+    ///     "example.bin",
+    ///     "./downloads/example.bin",
+    ///     1024 * 1024,
+    ///     "https://example.com/example.bin",
+    /// )
+    /// .build();
+    ///
+    /// // Import without starting it (no HTTP request, no file open).
+    /// let task_id = client
+    ///     .try_enqueue_paused(task, |_record| {}, |_id, _payload| {})
+    ///     .await?;
+    ///
+    /// // Later, when the user chooses to start this one:
+    /// client.resume(task_id).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn try_enqueue_paused<PCB, CCB>(
+        &self,
+        task: PounceTask,
+        progress_cb: PCB,
+        complete_cb: CCB,
+    ) -> Result<TaskId, MeowError>
+    where
+        PCB: Fn(FileTransferRecord) + Send + Sync + 'static,
+        CCB: Fn(TaskId, Option<String>) + Send + Sync + 'static,
+    {
+        self.ensure_open()?;
+        if task.is_empty() {
+            crate::meow_flow_log!("try_enqueue_paused", "reject empty task");
+            return Err(MeowError::from_code1(InnerErrorCode::ParameterEmpty));
+        }
+
+        crate::meow_flow_log!("try_enqueue_paused", "task={:?}", task);
+
+        let progress: ProgressCb = Arc::new(progress_cb);
+        let complete: Option<CompleteCb> = Some(Arc::new(complete_cb) as CompleteCb);
+        let callbacks = TaskCallbacks::new(Some(progress), complete);
+
+        let (def_up, def_down) = default_breakpoint_arcs();
+        let inner = InnerTask::from_pounce(
+            task,
+            self.config.breakpoint_download_http().clone(),
+            self.config.http_client_ref().cloned(),
+            def_up,
+            def_down,
+        )
+        .await?;
+
+        let task_id = self.get_exec()?.try_enqueue_paused(inner, callbacks)?;
+        crate::meow_flow_log!(
+            "try_enqueue_paused",
+            "try_enqueue_paused success: task_id={:?}",
+            task_id
+        );
+        Ok(task_id)
+    }
+
     /// Enqueues a task and `await`s until it reaches a terminal status.
     ///
     /// Wraps [`Self::try_enqueue`] with an internal oneshot channel so callers

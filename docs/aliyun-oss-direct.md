@@ -25,7 +25,7 @@ For untrusted desktop/mobile clients, prefer a backend-generated presigned URL f
 
 ```toml
 [dependencies]
-rusty-cat = { version = "0.2.2", features = ["aliyun-oss-direct"] }
+rusty-cat = { version = "0.2.4", features = ["aliyun-oss-direct"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -161,6 +161,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 2. Persist credential references, not raw secrets, whenever possible.
 3. On restart, recreate the same `AliOssDirectUpload` or `AliOssDirectDownload` protocol and rebuild the same logical task.
 4. Call `try_enqueue(...)` again. The provider implementation and executor will use available local and remote state to continue where possible.
+
+The direct upload protocol exposes the in-flight OSS multipart `UploadId` via `AliOssDirectUpload::current_upload_id()`. Persisting it lets you abort an orphaned multipart session out of band (so uncommitted parts stop accruing storage cost) if the user abandons the upload. For the full restart/crash recovery walkthrough, see [Resuming uploads and downloads after a restart](resume-after-restart.md).
 
 Do not store raw `access_key_secret` values in the same transfer table unless your security policy explicitly allows it. A safer pattern is to store a credential reference and resolve the actual secret from a secret manager when the task is rebuilt.
 

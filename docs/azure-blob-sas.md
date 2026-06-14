@@ -21,7 +21,7 @@ For upload, the SAS token generally needs write (`w`) permission, and create (`c
 
 ```toml
 [dependencies]
-rusty-cat = { version = "0.2.2", features = ["azure-blob-sas"] }
+rusty-cat = { version = "0.2.4", features = ["azure-blob-sas"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -160,6 +160,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 For upload, return blob SAS URL, total file size, chunk size, SAS expiration timestamp, and optional server-side business upload ID. Your backend should be able to create a new SAS URL for the same blob if the client needs to resume later.
 
 For download, return a read-capable SAS URL, optional known blob size, SAS expiration timestamp, and optional extra headers. Returning the known blob size lets the client skip `HEAD`. If `with_total_size(...)` is not used, the URL used for preparation must permit `HEAD`.
+
+## Resuming after a restart
+
+Because `rusty-cat` stores no state across restarts, resuming a SAS block upload after a kill/crash means rebuilding the task yourself. Persist your server-side business upload id and the `PresignedUploadedPart` records as blocks complete (read them from a clone of the upload protocol via `uploaded_parts().await`). On restart, request fresh SAS URLs from your backend, rebuild the plan, and re-inject the saved parts with `with_resumed_parts(...)` before `try_enqueue`. The SDK resumes past the verified contiguous prefix and re-sends the rest.
+
+See [Resuming uploads and downloads after a restart](resume-after-restart.md) for the full walkthrough and code.
 
 ## Troubleshooting
 

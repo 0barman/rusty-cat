@@ -23,7 +23,7 @@ The client receives only temporary URLs and metadata. `rusty-cat` does not persi
 
 ```toml
 [dependencies]
-rusty-cat = { version = "0.2.2", features = ["aliyun-oss-presigned"] }
+rusty-cat = { version = "0.2.4", features = ["aliyun-oss-presigned"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -110,6 +110,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 `PresignedMultipartUploadPlan` supports `with_refresh_before_secs(...)`. When part metadata includes expiration information, the SDK can refresh before the URL expires if you provide a refresher implementation. If your URLs are short-lived and no refresher is configured, make them long enough for the expected upload duration or request a new plan from your backend and re-enqueue.
 
 For production systems, prefer short-lived URLs plus a backend refresh endpoint. Long-lived presigned URLs are easier to test but increase the impact of URL leakage.
+
+### Resuming after a restart
+
+`rusty-cat` keeps no state across process restarts, so resuming a presigned multipart upload after a kill/crash means persisting two things yourself:
+
+1. The provider **`upload_id`** your backend created (also surfaced at runtime via `UploadResumeInfo::provider_upload_id`). It is not a secret.
+2. Every `PresignedUploadedPart` as it completes — read them from a clone of the `PresignedMultipartUpload` via `uploaded_parts().await`.
+
+On restart, request a **fresh** plan from your backend (presigned URLs expire) carrying the **same** `upload_id`, then re-inject the saved parts with `PresignedMultipartUpload::new(plan).with_resumed_parts(saved_parts)` before `try_enqueue`. The SDK resumes past the verified contiguous prefix and re-sends the rest. Persisting the `upload_id` also lets you abort an orphaned multipart session out of band if the user abandons the upload.
+
+See [Resuming uploads and downloads after a restart](resume-after-restart.md) for the complete walkthrough and code.
 
 ## Download flow
 
