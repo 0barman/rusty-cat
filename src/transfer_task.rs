@@ -47,8 +47,6 @@ pub struct TransferTask {
     http_client: Option<reqwest::Client>,
     /// Task-level upload file handle slot to avoid reopening per chunk.
     upload_file_slot: Arc<Mutex<Option<File>>>,
-    /// Reused read buffer for upload chunks (same task, sequential chunks).
-    upload_chunk_buf: Arc<Mutex<Vec<u8>>>,
     /// Task-level download file handle slot to avoid reopening per chunk.
     download_file_slot: Arc<Mutex<Option<File>>>,
     /// Max retries after first failed upload prepare (`BreakpointUpload::prepare`).
@@ -98,7 +96,6 @@ impl TransferTask {
             breakpoint_download: inner.breakpoint_download().clone(),
             http_client: inner.http_client_ref().cloned(),
             upload_file_slot: Arc::new(Mutex::new(None)),
-            upload_chunk_buf: Arc::new(Mutex::new(Vec::new())),
             download_file_slot: Arc::new(Mutex::new(None)),
             max_upload_prepare_retries: inner.max_upload_prepare_retries(),
         }
@@ -285,11 +282,6 @@ impl TransferTask {
     /// Returns upload file handle slot used by executor.
     pub(crate) fn upload_file_slot(&self) -> &Arc<Mutex<Option<File>>> {
         &self.upload_file_slot
-    }
-
-    /// Returns per-task upload chunk read buffer (executor-internal reuse).
-    pub(crate) fn upload_chunk_buf(&self) -> &Arc<Mutex<Vec<u8>>> {
-        &self.upload_chunk_buf
     }
 
     /// Returns download file handle slot used by executor.

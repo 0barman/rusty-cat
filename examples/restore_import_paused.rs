@@ -28,7 +28,11 @@ async fn main() -> AnyResult<()> {
     // A small fixed payload the local server will serve for every download.
     let payload: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
     let server = LocalServer::spawn(payload.clone())?;
-    let client = MeowClient::new(MeowConfig::builder().max_download_concurrency(2).build()?);
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_download_concurrency(2)
+            .build()?,
+    );
 
     // Imagine these three tasks were rebuilt from your own database after a
     // restart. We import them ALL in the paused state first.
@@ -91,10 +95,7 @@ async fn main() -> AnyResult<()> {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let size = std::fs::metadata(&paths[i]).map(|m| m.len()).unwrap_or(0);
-        println!(
-            "'{}' completed={} ({} bytes on disk)",
-            names[i], finished, size
-        );
+        println!("'{}' completed={} ({} bytes on disk)", names[i], finished, size);
     }
 
     // "beta" was never resumed, so it is still paused and wrote no file.

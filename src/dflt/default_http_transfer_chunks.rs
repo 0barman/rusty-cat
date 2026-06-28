@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use bytes::Bytes;
+use bytes::BytesMut;
 use reqwest::header::CONTENT_RANGE;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -100,103 +100,78 @@ async fn read_error_body_preview(resp: &mut reqwest::Response, max_bytes: usize)
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Uploads exactly one chunk and returns next transfer outcome.
+/// Reads the bytes for the chunk at `offset` from the task's upload source.
 ///
-/// Reuses [`TransferTask::upload_chunk_buf`] for the read buffer so consecutive
-/// chunks on the same task avoid per-chunk `Vec` allocations.
-pub(crate) async fn upload_one_chunk(
-    client: &reqwest::Client,
+/// Returns `Some((chunk_bytes, uploaded_len))`, or `None` when `offset` is at or
+/// past `total` (nothing left to upload at this offset). For the file source it
+/// reads straight into a per-chunk [`bytes::BytesMut`] and `freeze()`s it into a
+/// `Bytes` body with no extra copy, holding the per-task file slot lock only
+/// across the `seek + read` (released before the caller's network upload). For
+/// the in-memory source it slices the shared `Bytes` (a refcount bump, no copy).
+///
+/// Shared by the serial [`upload_one_chunk`] and the parallel
+/// [`upload_one_chunk_part`] paths so the read logic cannot drift between them.
+async fn read_upload_chunk(
     task: &TransferTask,
-    upload: Arc<dyn BreakpointUpload + Send + Sync>,
     offset: u64,
     chunk_size: u64,
-) -> Result<ChunkOutcome, MeowError> {
+) -> Result<Option<(bytes::Bytes, u64)>, MeowError> {
     let total = task.total_size();
     if offset >= total {
-        return Ok(ChunkOutcome {
-            next_offset: offset,
-            total_size: total,
-            done: true,
-            completion_payload: None,
-        });
+        return Ok(None);
     }
     let read_len = chunk_size.min(total - offset);
     if read_len == 0 {
-        return Ok(ChunkOutcome {
-            next_offset: offset,
-            total_size: total,
-            done: true,
-            completion_payload: None,
-        });
+        return Ok(None);
     }
-
     let read_len_usize = read_len as usize;
 
-    let (info, uploaded_chunk_len) = match task.upload_source() {
+    match task.upload_source() {
         Some(UploadSource::File(path)) => {
-            // Reuse the per-task scratch Vec<u8> for the disk read, then build a
-            // single `Bytes` handle: the later reqwest `Body::from(Bytes)` and the
-            // `Bytes::clone` on retries are all zero-copy, fully avoiding the
-            // protocol layer's `to_vec` allocation.
-            let chunk_bytes = {
-                let mut buf_guard = task.upload_chunk_buf().lock().await;
-                if buf_guard.len() < read_len_usize {
-                    buf_guard.resize(read_len_usize, 0);
-                } else {
-                    buf_guard.truncate(read_len_usize);
-                }
+            // Read straight into a per-chunk `BytesMut`, then `freeze()` it into a
+            // `Bytes` handle with no extra copy: `freeze` reuses the same
+            // allocation, so the reqwest `Body::from(Bytes)` and the `Bytes::clone`
+            // on retries are all O(1).
+            let mut buf = BytesMut::with_capacity(read_len_usize);
+            buf.resize(read_len_usize, 0);
 
-                let mut slot = task.upload_file_slot().lock().await;
-                if slot.is_none() {
-                    let opened = File::open(path).await.map_err(|e| {
-                        MeowError::from_io(
-                            format!("open upload source failed: {}", path.display()),
-                            e,
-                        )
-                    })?;
-                    *slot = Some(opened);
-                }
-                let file = slot.as_mut().ok_or_else(|| {
-                    MeowError::from_code_str(
-                        InnerErrorCode::IoError,
-                        "upload file slot unexpectedly empty after open",
-                    )
-                })?;
-                file.seek(std::io::SeekFrom::Start(offset))
-                    .await
-                    .map_err(|e| {
-                        MeowError::from_io(
-                            format!(
-                                "seek upload source failed: offset={offset} path={}",
-                                path.display()
-                            ),
-                            e,
-                        )
-                    })?;
-                file.read_exact(&mut buf_guard).await.map_err(|e| {
+            let mut slot = task.upload_file_slot().lock().await;
+            if slot.is_none() {
+                let opened = File::open(path).await.map_err(|e| {
                     MeowError::from_io(
-                        format!("read upload source failed: path={}", path.display()),
+                        format!("open upload source failed: {}", path.display()),
                         e,
                     )
                 })?;
-                drop(slot);
-                // Copy once into `Bytes` to release the reusable Vec<u8> buffer;
-                // compared with the old implementation (protocol-layer `to_vec`)
-                // the total allocation count is unchanged, but clone and retry
-                // both become O(1).
-                Bytes::copy_from_slice(&buf_guard[..])
-            };
-
-            let chunk_len = chunk_bytes.len() as u64;
-            let info = upload
-                .upload_chunk(UploadChunkCtx {
-                    client,
-                    task,
-                    chunk: chunk_bytes,
-                    offset,
-                })
-                .await?;
-            (info, chunk_len)
+                *slot = Some(opened);
+            }
+            let file = slot.as_mut().ok_or_else(|| {
+                MeowError::from_code_str(
+                    InnerErrorCode::IoError,
+                    "upload file slot unexpectedly empty after open",
+                )
+            })?;
+            file.seek(std::io::SeekFrom::Start(offset))
+                .await
+                .map_err(|e| {
+                    MeowError::from_io(
+                        format!(
+                            "seek upload source failed: offset={offset} path={}",
+                            path.display()
+                        ),
+                        e,
+                    )
+                })?;
+            file.read_exact(&mut buf[..]).await.map_err(|e| {
+                MeowError::from_io(
+                    format!("read upload source failed: path={}", path.display()),
+                    e,
+                )
+            })?;
+            drop(slot);
+            let chunk = buf.freeze();
+            let chunk_len = chunk.len() as u64;
+            Ok(Some((chunk, chunk_len)))
         }
         Some(UploadSource::Bytes(bytes)) => {
             let start = offset as usize;
@@ -214,23 +189,93 @@ pub(crate) async fn upload_one_chunk(
             // bumps the refcount, copying no data and allocating no new buffer.
             let chunk = bytes.slice(start..end);
             let chunk_len = chunk.len() as u64;
-            let info = upload
-                .upload_chunk(UploadChunkCtx {
-                    client,
-                    task,
-                    chunk,
-                    offset,
-                })
-                .await?;
-            (info, chunk_len)
+            Ok(Some((chunk, chunk_len)))
         }
-        None => {
-            return Err(MeowError::from_code_str(
-                InnerErrorCode::ParameterEmpty,
-                "upload task missing upload source",
-            ));
-        }
+        None => Err(MeowError::from_code_str(
+            InnerErrorCode::ParameterEmpty,
+            "upload task missing upload source",
+        )),
+    }
+}
+
+/// Uploads exactly one chunk WITHOUT finalizing the upload, returning this part's
+/// next offset.
+///
+/// This is the parallel-parts path: the upload is finalized exactly once by the
+/// scheduler (via `TransferTrait::complete`) after every part has been uploaded
+/// as a contiguous prefix, so an individual part must never call
+/// `complete_upload` nor treat a server `completed_file_id` as terminal — doing
+/// so from whichever part reaches the end first would commit a torn object while
+/// lower parts are still in flight. The returned `next_offset`/`done` describe
+/// only THIS part; the scheduler's window keys completion on dispatched offsets,
+/// not on these fields.
+pub(crate) async fn upload_one_chunk_part(
+    client: &reqwest::Client,
+    task: &TransferTask,
+    upload: Arc<dyn BreakpointUpload + Send + Sync>,
+    offset: u64,
+    chunk_size: u64,
+) -> Result<ChunkOutcome, MeowError> {
+    let total = task.total_size();
+    let Some((chunk_bytes, uploaded_chunk_len)) =
+        read_upload_chunk(task, offset, chunk_size).await?
+    else {
+        return Ok(ChunkOutcome {
+            next_offset: offset,
+            total_size: total,
+            done: true,
+            completion_payload: None,
+        });
     };
+    let info = upload
+        .upload_chunk(UploadChunkCtx {
+            client,
+            task,
+            chunk: chunk_bytes,
+            offset,
+        })
+        .await?;
+    let next = info.next_byte.unwrap_or(offset + uploaded_chunk_len).min(total);
+    Ok(ChunkOutcome {
+        next_offset: next,
+        total_size: total,
+        done: next >= total,
+        // Never finalize from a part: completion is hoisted to the scheduler.
+        completion_payload: None,
+    })
+}
+
+/// Uploads exactly one chunk and returns next transfer outcome.
+///
+/// Reads the chunk straight into a per-chunk [`bytes::BytesMut`] and `freeze()`s
+/// it into the request `Bytes` body with no extra copy: `freeze` reuses the same
+/// allocation, and retries clone that `Bytes` (refcount only).
+pub(crate) async fn upload_one_chunk(
+    client: &reqwest::Client,
+    task: &TransferTask,
+    upload: Arc<dyn BreakpointUpload + Send + Sync>,
+    offset: u64,
+    chunk_size: u64,
+) -> Result<ChunkOutcome, MeowError> {
+    let total = task.total_size();
+    let Some((chunk_bytes, uploaded_chunk_len)) =
+        read_upload_chunk(task, offset, chunk_size).await?
+    else {
+        return Ok(ChunkOutcome {
+            next_offset: offset,
+            total_size: total,
+            done: true,
+            completion_payload: None,
+        });
+    };
+    let info = upload
+        .upload_chunk(UploadChunkCtx {
+            client,
+            task,
+            chunk: chunk_bytes,
+            offset,
+        })
+        .await?;
     if info.completed_file_id.is_some() {
         return Ok(ChunkOutcome {
             next_offset: total,

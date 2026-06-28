@@ -35,6 +35,18 @@ pub(crate) enum ChunkRetryResult {
     Failed(MeowError),
 }
 
+/// 选择本次重试驱动的底层分片操作：
+/// - `Whole`：串行路径，调 [`TransferTrait::transfer_chunk`]（到达末尾时内联收尾）；
+/// - `Part`：单文件并发路径，调 [`TransferTrait::transfer_chunk_part`]（**绝不**内联收尾，
+///   收尾由调度器在全部分片汇合后恰好执行一次）。
+///
+/// 仅决定调用哪个 executor 方法；退避、取消协作、错误分类等重试语义两种模式完全一致。
+#[derive(Clone, Copy)]
+pub(crate) enum ChunkTransferMode {
+    Whole,
+    Part,
+}
+
 /// 对单个分片执行“带退避的重试”。
 ///
 /// 设计目标：
@@ -59,6 +71,7 @@ pub(crate) enum ChunkRetryResult {
 /// - **`max_chunk_retries`**：在**首次尝试失败之后**允许的最大重试次数；语义与退避逻辑绑定：
 ///   - **`0`**：不重试，任意失败立即返回 [`ChunkRetryResult::Failed`]
 ///   - **`N > 0`**：最多再重试 `N` 次（总尝试次数上界为 **`1 + N`**）
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn transfer_chunk_with_retry(
     executor: &Arc<dyn TransferTrait>,
     task: &TransferTask,
@@ -68,6 +81,7 @@ pub(crate) async fn transfer_chunk_with_retry(
     chunk_size: u64,
     known_total: u64,
     max_chunk_retries: u32,
+    mode: ChunkTransferMode,
 ) -> ChunkRetryResult {
     // 尝试次数约定：
     // - attempt=0 表示首次执行（非重试）；
@@ -86,11 +100,18 @@ pub(crate) async fn transfer_chunk_with_retry(
             return ChunkRetryResult::Cancelled;
         }
 
-        // 真正执行一次分片传输。
-        match executor
-            .transfer_chunk(task, offset, chunk_size, known_total)
-            .await
-        {
+        // 真正执行一次分片传输。两种模式仅调用的 executor 方法不同，重试语义一致。
+        let transfer = match mode {
+            ChunkTransferMode::Whole => {
+                executor.transfer_chunk(task, offset, chunk_size, known_total).await
+            }
+            ChunkTransferMode::Part => {
+                executor
+                    .transfer_chunk_part(task, offset, chunk_size, known_total)
+                    .await
+            }
+        };
+        match transfer {
             Ok(outcome) => {
                 // 若经过重试后成功，额外记录一次“重试恢复成功”日志。
                 if attempt > 0 {
@@ -174,9 +195,28 @@ pub(crate) async fn transfer_chunk_with_retry(
 ///
 /// 目前按“错误码边界常量”判定；后续如需动态配置可在此处平滑接入配置表。
 pub(crate) fn is_transport_retryable(err: &MeowError) -> bool {
-    RETRYABLE_CHUNK_ERROR_CODES
-        .iter()
-        .any(|code| *code == err.code())
+    let code = err.code();
+    if !RETRYABLE_CHUNK_ERROR_CODES.contains(&code) {
+        return false;
+    }
+    // 当错误来自非 2xx 响应时会带上 HTTP 状态码：硬客户端错误（多数 4xx）重发同一请求也
+    // 无法恢复，故快速失败；瞬时状态（5xx 及 408/429）与“无状态码”的错误保持可重试，
+    // 不改变既有行为。
+    if code == InnerErrorCode::ResponseStatusError as i32 {
+        if let Some(status) = err.http_status() {
+            return is_retryable_http_status(status);
+        }
+    }
+    true
+}
+
+/// 判断某个 HTTP 响应状态码是否值得重试。
+///
+/// 可重试：服务端瞬时失败（5xx），以及两个“稍后重试可能成功”的状态
+/// `408 Request Timeout` 与 `429 Too Many Requests`。其余客户端错误（4xx）视为
+/// 不可恢复并快速失败；非 2xx 的 3xx 同样按不可重试处理。
+pub(crate) fn is_retryable_http_status(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500..=599)
 }
 
 /// 仅连接/请求栈层面的错误（[`InnerErrorCode::HttpError`]），用于 `prepare` 外层的有限重试：
@@ -207,4 +247,64 @@ pub(crate) fn calc_backoff_with_jitter_ms(attempt: u32) -> u64 {
     let ratio_percent = 100 - CHUNK_RETRY_JITTER_PERCENT + (nanos % (jitter_span + 1));
 
     capped.saturating_mul(ratio_percent) / 100
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_retryable_http_status, is_transport_retryable};
+    use crate::error::{InnerErrorCode, MeowError};
+
+    fn response_status_err(status: Option<u16>) -> MeowError {
+        let err = MeowError::from_code(InnerErrorCode::ResponseStatusError, "status".to_string());
+        match status {
+            Some(s) => err.with_http_status(s),
+            None => err,
+        }
+    }
+
+    #[test]
+    fn retryable_status_covers_5xx_and_throttle_codes() {
+        for s in [500u16, 502, 503, 504, 408, 429] {
+            assert!(is_retryable_http_status(s), "{s} should be retryable");
+        }
+    }
+
+    #[test]
+    fn non_retryable_status_covers_hard_4xx_and_3xx() {
+        for s in [400u16, 401, 403, 404, 409, 410, 422, 301, 302] {
+            assert!(!is_retryable_http_status(s), "{s} should not be retryable");
+        }
+    }
+
+    #[test]
+    fn transport_retryable_fast_fails_hard_4xx_response_status() {
+        assert!(!is_transport_retryable(&response_status_err(Some(403))));
+        assert!(!is_transport_retryable(&response_status_err(Some(404))));
+    }
+
+    #[test]
+    fn transport_retryable_keeps_5xx_and_throttle_response_status() {
+        assert!(is_transport_retryable(&response_status_err(Some(500))));
+        assert!(is_transport_retryable(&response_status_err(Some(503))));
+        assert!(is_transport_retryable(&response_status_err(Some(429))));
+    }
+
+    #[test]
+    fn transport_retryable_keeps_status_less_response_status() {
+        // Backward compatible: a ResponseStatusError without an attached status
+        // (e.g. produced by a non-HTTP code path) stays retryable as before.
+        assert!(is_transport_retryable(&response_status_err(None)));
+    }
+
+    #[test]
+    fn transport_retryable_keeps_http_error_and_rejects_others() {
+        // Connection-layer HttpError stays retryable regardless of status.
+        assert!(is_transport_retryable(&MeowError::from_code1(
+            InnerErrorCode::HttpError
+        )));
+        // A code outside the retryable set is never retried.
+        assert!(!is_transport_retryable(&MeowError::from_code1(
+            InnerErrorCode::InvalidRange
+        )));
+    }
 }

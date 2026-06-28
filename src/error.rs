@@ -64,6 +64,10 @@ pub struct MeowError {
     msg: String,
     /// Optional chained source error.
     source: Option<Arc<dyn StdError + Send + Sync>>,
+    /// Optional HTTP status code, set when the error was produced from a
+    /// non-success HTTP response. Lets the retry layer distinguish a
+    /// non-retryable client error (4xx) from a transient server error (5xx).
+    http_status: Option<u16>,
 }
 
 impl MeowError {
@@ -85,6 +89,7 @@ impl MeowError {
             code,
             msg,
             source: None,
+            http_status: None,
         }
     }
 
@@ -119,6 +124,31 @@ impl MeowError {
         &self.msg
     }
 
+    /// Returns the HTTP status code when this error came from a non-success HTTP
+    /// response, or `None` otherwise.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rusty_cat::api::{InnerErrorCode, MeowError};
+    ///
+    /// let err = MeowError::from_code_str(InnerErrorCode::ParameterEmpty, "bad");
+    /// assert_eq!(err.http_status(), None);
+    /// ```
+    pub fn http_status(&self) -> Option<u16> {
+        self.http_status
+    }
+
+    /// Attaches the originating HTTP status code, returning the updated error.
+    ///
+    /// Used by transport code that turns a non-success HTTP response into a
+    /// [`MeowError`], so the retry layer can fast-fail non-retryable client
+    /// errors (4xx) while still retrying transient server errors (5xx).
+    pub(crate) fn with_http_status(mut self, status: u16) -> Self {
+        self.http_status = Some(status);
+        self
+    }
+
     /// Creates an error from [`InnerErrorCode`] with empty message.
     ///
     /// # Examples
@@ -137,6 +167,7 @@ impl MeowError {
             code: code as i32,
             msg: String::new(),
             source: None,
+            http_status: None,
         }
     }
 
@@ -161,6 +192,7 @@ impl MeowError {
             code: code as i32,
             msg,
             source: None,
+            http_status: None,
         }
     }
 
@@ -185,6 +217,7 @@ impl MeowError {
             code: code as i32,
             msg: msg.to_string(),
             source: None,
+            http_status: None,
         }
     }
 
@@ -220,6 +253,7 @@ impl MeowError {
             code: code as i32,
             msg,
             source: Some(Arc::new(source)),
+            http_status: None,
         }
     }
 

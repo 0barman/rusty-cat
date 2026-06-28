@@ -176,7 +176,8 @@ impl PresignedMultipartUpload {
             return Err(MeowError::from_code(
                 InnerErrorCode::ResponseStatusError,
                 format!("{label} failed: {status}, body: {body}"),
-            ));
+            )
+            .with_http_status(status.as_u16()));
         }
         Ok(if body.is_empty() { None } else { Some(body) })
     }
@@ -290,7 +291,8 @@ impl BreakpointUpload for PresignedMultipartUpload {
             return Err(MeowError::from_code(
                 InnerErrorCode::ResponseStatusError,
                 format!("presigned upload part failed: {status}, body: {body}"),
-            ));
+            )
+            .with_http_status(status.as_u16()));
         }
 
         let mut uploaded = self.uploaded_parts.lock().await;
@@ -350,5 +352,15 @@ impl BreakpointUpload for PresignedMultipartUpload {
         };
         Self::send_callback(client, req, req.body.clone(), "presigned abort callback").await?;
         Ok(())
+    }
+
+    /// Presigned multipart is out-of-order safe: parts are accounted by `offset`
+    /// in a `Mutex<Vec<…>>` (so concurrent uploads never collide), resume takes
+    /// the longest contiguous prefix and tolerates holes, and the completion
+    /// manifest is re-sorted by `part_number` regardless of upload order. A
+    /// re-uploaded part at the same offset updates in place rather than
+    /// duplicating.
+    fn supports_parallel_parts(&self) -> bool {
+        true
     }
 }

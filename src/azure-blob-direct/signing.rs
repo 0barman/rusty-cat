@@ -13,14 +13,21 @@ use crate::{InnerErrorCode, MeowError};
 
 type HmacSha256 = Hmac<Sha256>;
 
-pub(crate) fn signed_headers(
+/// Builds Azure SharedKey signed headers from an already base64-decoded account
+/// key, skipping the per-call base64 decode.
+///
+/// The block-upload path caches the decoded key and calls this directly; the
+/// range-download path still goes through [`apply_signed_headers`], which decodes
+/// per call.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn signed_headers_with_key(
     method: &str,
     url: &Url,
     content_length: Option<usize>,
     content_type: Option<&str>,
     extra_headers: &[(&str, &str)],
     account_name: &str,
-    account_key_b64: &str,
+    account_key: &[u8],
 ) -> Result<HeaderMap, MeowError> {
     let mut headers = HeaderMap::new();
     insert_header(&mut headers, HEADER_MS_VERSION, MS_VERSION)?;
@@ -34,9 +41,21 @@ pub(crate) fn signed_headers(
     for (k, v) in extra_headers {
         insert_header(&mut headers, k, v)?;
     }
-    let authorization = build_authorization(method, url, &headers, account_name, account_key_b64)?;
+    let authorization =
+        build_authorization_with_key(method, url, &headers, account_name, account_key)?;
     insert_header(&mut headers, HEADER_AUTHORIZATION, authorization.as_str())?;
     Ok(headers)
+}
+
+/// Base64-decodes an Azure account key once, so callers can cache the bytes and
+/// avoid re-decoding per block.
+pub(crate) fn decode_account_key(account_key_b64: &str) -> Result<Vec<u8>, MeowError> {
+    BASE64_STANDARD.decode(account_key_b64).map_err(|e| {
+        MeowError::from_code(
+            InnerErrorCode::ParameterEmpty,
+            format!("decode azure account key failed: {e}"),
+        )
+    })
 }
 
 pub(crate) fn apply_signed_headers(
@@ -66,6 +85,17 @@ fn build_authorization(
     account_name: &str,
     account_key_b64: &str,
 ) -> Result<String, MeowError> {
+    let key = decode_account_key(account_key_b64)?;
+    build_authorization_with_key(method, url, headers, account_name, &key)
+}
+
+fn build_authorization_with_key(
+    method: &str,
+    url: &Url,
+    headers: &HeaderMap,
+    account_name: &str,
+    account_key: &[u8],
+) -> Result<String, MeowError> {
     let canonicalized_headers = canonicalized_headers(headers)?;
     let canonicalized_resource = canonicalized_resource(url, account_name);
     let string_to_sign = format!(
@@ -82,13 +112,7 @@ fn build_authorization(
         header_map_value(headers, "if-unmodified-since"),
         header_map_value(headers, "range"),
     );
-    let key = BASE64_STANDARD.decode(account_key_b64).map_err(|e| {
-        MeowError::from_code(
-            InnerErrorCode::ParameterEmpty,
-            format!("decode azure account key failed: {e}"),
-        )
-    })?;
-    let mut mac = HmacSha256::new_from_slice(&key).map_err(|e| {
+    let mut mac = HmacSha256::new_from_slice(account_key).map_err(|e| {
         MeowError::from_code(
             InnerErrorCode::ParameterEmpty,
             format!("build HMAC-SHA256 failed: {e}"),
@@ -189,4 +213,43 @@ pub(crate) fn header_value(v: &str) -> Result<HeaderValue, MeowError> {
             format!("invalid header value: {e}"),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_account_key_roundtrips_and_rejects_garbage() {
+        let key_bytes = [7u8; 32];
+        let b64 = BASE64_STANDARD.encode(key_bytes);
+        assert_eq!(decode_account_key(&b64).expect("decode"), key_bytes);
+        assert!(decode_account_key("not valid base64 !!!").is_err());
+    }
+
+    #[test]
+    fn signed_headers_with_key_produces_sharedkey_auth() {
+        let key_bytes = [7u8; 32];
+        let url = Url::parse(
+            "https://acct.blob.core.windows.net/container/blob?comp=block&blockid=AAAAAAAA",
+        )
+        .expect("url");
+        let headers = signed_headers_with_key(
+            "PUT",
+            &url,
+            Some(10),
+            Some("application/octet-stream"),
+            &[],
+            "acct",
+            &key_bytes,
+        )
+        .expect("sign");
+        let auth = headers
+            .get(HEADER_AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(auth.starts_with("SharedKey acct:"), "auth was: {auth}");
+        assert!(headers.contains_key(HEADER_MS_DATE));
+        assert!(headers.contains_key(HEADER_MS_VERSION));
+    }
 }

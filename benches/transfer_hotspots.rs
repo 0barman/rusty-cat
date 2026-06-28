@@ -7,7 +7,7 @@ use std::sync::{Arc, RwLock};
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 
-/// 对齐 `upload_one_chunk` 中对 `upload_chunk_buf` 的 resize/truncate 模式（无磁盘 I/O）。
+/// 分片读缓冲准备的 resize/truncate 微基准（无磁盘 I/O）。
 fn bench_chunk_buffer_prepare(c: &mut Criterion) {
     let chunk_size = 2048usize;
     let mut group = c.benchmark_group("chunk_buffer");

@@ -263,6 +263,8 @@ impl DownloadPounceBuilder {
             breakpoint_download_http: self.breakpoint_download_http,
             max_chunk_retries: self.max_chunk_retries,
             max_upload_prepare_retries: PounceTask::DEFAULT_MAX_UPLOAD_PREPARE_RETRIES,
+            // Download never fans out into parallel parts; keep the serial default.
+            max_parts_in_flight: PounceTask::DEFAULT_MAX_PARTS_IN_FLIGHT,
         }
     }
 }

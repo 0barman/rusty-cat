@@ -9,8 +9,13 @@ use super::constants::{
     DEFAULT_UPLOAD_CONTENT_TYPE, MAX_OSS_PART_NUMBER, OSS_COMPLETE_ADDITIONAL_HEADERS,
     OSS_COMPLETE_ALL_HEADER, OSS_COMPLETE_ALL_VALUE, OSS_LIST_MAX_PARTS, OSS_LIST_MAX_UPLOADS,
 };
+use std::sync::Mutex as StdMutex;
+
 use super::multipart_session::MultipartSession;
-use super::signing::{header_value, param_error, signed_headers};
+use super::signing::{
+    current_date, derive_signing_key, header_value, param_error, signed_headers_with_key,
+    SecretKeyBytes,
+};
 use super::xml::{extract_part_numbers, extract_upload_ids_for_key, extract_xml_tag};
 use crate::http_breakpoint::UploadResumeInfo;
 use crate::upload_trait::{UploadChunkCtx, UploadPrepareCtx};
@@ -24,6 +29,11 @@ pub struct AliOssDirectUpload {
     access_key_secret: String,
     region: String,
     session: Arc<Mutex<MultipartSession>>,
+    /// Cached OSS v4 signing key for the current UTC day, keyed by its `YYYYMMDD`
+    /// date string. The 4-step derivation depends only on (secret, date, region);
+    /// caching it skips 4 HMACs per part. Uses a `std` mutex because the critical
+    /// section is tiny and synchronous (no `.await`).
+    signing_key_cache: Arc<StdMutex<Option<(String, SecretKeyBytes)>>>,
 }
 
 impl AliOssDirectUpload {
@@ -39,6 +49,7 @@ impl AliOssDirectUpload {
             access_key_secret: access_key_secret.into(),
             region: region.into(),
             session: Arc::new(Mutex::new(MultipartSession::default())),
+            signing_key_cache: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -64,16 +75,41 @@ impl AliOssDirectUpload {
         sign_pairs: &[(&str, &str)],
         additional_headers: Option<&str>,
     ) -> Result<reqwest::header::HeaderMap, MeowError> {
-        signed_headers(
+        let (now, date) = current_date();
+        let signing_key = self.signing_key_for(&date);
+        signed_headers_with_key(
             method,
             canonical_uri,
             raw_query,
             sign_pairs,
             additional_headers,
             self.access_key_id.as_str(),
-            self.access_key_secret.as_str(),
             self.region.as_str(),
+            now,
+            &signing_key,
         )
+    }
+
+    /// Returns the OSS v4 signing key for `date`, deriving and caching it on a UTC
+    /// day change.
+    ///
+    /// The cache holds a single `(date, key)` entry; a new UTC day — or a backward
+    /// clock jump that changes the date string — recomputes it (passive
+    /// invalidation, no timer). The cached material is secret-derived, hence the
+    /// non-`Debug` [`SecretKeyBytes`] wrapper.
+    fn signing_key_for(&self, date: &str) -> SecretKeyBytes {
+        let mut guard = self
+            .signing_key_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((cached_date, key)) = guard.as_ref() {
+            if cached_date == date {
+                return key.clone();
+            }
+        }
+        let key = derive_signing_key(self.access_key_secret.as_str(), date, self.region.as_str());
+        *guard = Some((date.to_string(), key.clone()));
+        key
     }
 
     async fn initiate_multipart_upload(
@@ -105,7 +141,8 @@ impl AliOssDirectUpload {
             return Err(MeowError::from_code(
                 InnerErrorCode::ResponseStatusError,
                 format!("oss initiate multipart failed: {status}, body: {body}"),
-            ));
+            )
+            .with_http_status(status.as_u16()));
         }
         extract_xml_tag(&body, "UploadId").ok_or_else(|| {
             MeowError::from_code(
@@ -160,7 +197,8 @@ impl AliOssDirectUpload {
             return Err(MeowError::from_code(
                 InnerErrorCode::ResponseStatusError,
                 format!("oss list multipart uploads failed: {status}, body: {body}"),
-            ));
+            )
+            .with_http_status(status.as_u16()));
         }
         let ids = extract_upload_ids_for_key(&body, &object_key);
         if ids.len() > 1 {
@@ -202,7 +240,8 @@ impl AliOssDirectUpload {
             return Err(MeowError::from_code(
                 InnerErrorCode::ResponseStatusError,
                 format!("oss list parts failed: {status}, body: {body}"),
-            ));
+            )
+            .with_http_status(status.as_u16()));
         }
         Ok(extract_part_numbers(&body))
     }
@@ -297,7 +336,8 @@ impl AliOssDirectUpload {
                 format!(
                     "oss abort multipart upload failed: {status}, uploadId={upload_id}, body: {body}"
                 ),
-            ));
+            )
+            .with_http_status(status.as_u16()));
         }
         Ok(())
     }
@@ -401,7 +441,8 @@ impl BreakpointUpload for AliOssDirectUpload {
             return Err(MeowError::from_code(
                 InnerErrorCode::ResponseStatusError,
                 format!("oss upload part failed: {status}, body: {body}"),
-            ));
+            )
+            .with_http_status(status.as_u16()));
         }
         if !etag_present {
             return Err(MeowError::from_code_str(
@@ -458,7 +499,8 @@ impl BreakpointUpload for AliOssDirectUpload {
             return Err(MeowError::from_code(
                 InnerErrorCode::ResponseStatusError,
                 format!("oss complete multipart upload failed: {status}, body: {body}"),
-            ));
+            )
+            .with_http_status(status.as_u16()));
         }
         self.session.lock().await.upload_id = None;
         Ok(None)
@@ -478,6 +520,17 @@ impl BreakpointUpload for AliOssDirectUpload {
         self.send_abort_multipart(client, task, &upload_id).await?;
         self.session.lock().await.upload_id = None;
         Ok(())
+    }
+
+    /// OSS multipart is out-of-order safe: a part's number is a pure function of
+    /// its chunk index (`part_number = offset / chunk_size + 1`), the in-flight
+    /// `UploadId` plus part set live behind a `Mutex`, and the committed order is
+    /// fixed at completion by OSS (`x-oss-complete-all`, i.e. all uploaded parts
+    /// merged by ascending part number) — never by Upload Part arrival order.
+    /// Re-uploading the same part number overwrites idempotently. So parts of one
+    /// file may be uploaded concurrently and out of order.
+    fn supports_parallel_parts(&self) -> bool {
+        true
     }
 }
 
@@ -566,6 +619,18 @@ mod tests {
             u.current_upload_id().await.as_deref(),
             Some("test-upload-id")
         );
+    }
+
+    #[test]
+    fn oss_direct_advertises_parallel_parts() {
+        use crate::upload_trait::BreakpointUpload;
+        // OSS multipart part identity is offset-derived (`part_number =
+        // offset/chunk + 1`, see `upload_chunk`), completion merges all uploaded
+        // parts by ascending part number (`x-oss-complete-all`), and re-upload of
+        // the same part number is idempotent — so it is out-of-order safe and must
+        // advertise intra-file parallel parts (mirrors the Azure-direct / presigned
+        // `supports_parallel_parts` guards).
+        assert!(upload().supports_parallel_parts());
     }
 
     #[test]

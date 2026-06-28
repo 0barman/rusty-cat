@@ -35,6 +35,11 @@ pub struct UploadPounceBuilder {
     ///
     /// Effective range: `>= 0`; `0` means "do not retry prepare".
     max_upload_prepare_retries: u32,
+    /// Maximum number of chunks of this file uploaded concurrently.
+    ///
+    /// Default `1` (strict serial). Normalized so `0` collapses to `1`. Only
+    /// honored for out-of-order-safe upload protocols; otherwise serial.
+    max_parts_in_flight: usize,
 }
 
 impl UploadPounceBuilder {
@@ -63,6 +68,7 @@ impl UploadPounceBuilder {
             breakpoint_upload: None,
             max_chunk_retries: PounceTask::DEFAULT_MAX_CHUNK_RETRIES,
             max_upload_prepare_retries: PounceTask::DEFAULT_MAX_UPLOAD_PREPARE_RETRIES,
+            max_parts_in_flight: PounceTask::DEFAULT_MAX_PARTS_IN_FLIGHT,
         }
     }
 
@@ -83,6 +89,7 @@ impl UploadPounceBuilder {
             breakpoint_upload: None,
             max_chunk_retries: PounceTask::DEFAULT_MAX_CHUNK_RETRIES,
             max_upload_prepare_retries: PounceTask::DEFAULT_MAX_UPLOAD_PREPARE_RETRIES,
+            max_parts_in_flight: PounceTask::DEFAULT_MAX_PARTS_IN_FLIGHT,
         }
     }
 
@@ -215,6 +222,28 @@ impl UploadPounceBuilder {
         self
     }
 
+    /// Configures the maximum number of chunks of this file uploaded
+    /// concurrently (intra-file parallel parts). Default `1` (strict serial).
+    ///
+    /// A value `> 1` is only honored when the chosen upload protocol proves
+    /// out-of-order safety (e.g. presigned multipart, Azure block blob); for any
+    /// other protocol the upload stays serial regardless of this value. `0` is
+    /// normalized to `1`. Peak upload memory for a file source is
+    /// `max_parts_in_flight * chunk_size`, so keep it bounded.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rusty_cat::api::UploadPounceBuilder;
+    ///
+    /// let _builder = UploadPounceBuilder::new("a.bin", "./a.bin", 1024 * 1024)
+    ///     .with_max_parts_in_flight(4);
+    /// ```
+    pub fn with_max_parts_in_flight(mut self, max_parts_in_flight: usize) -> Self {
+        self.max_parts_in_flight = PounceTask::normalized_max_parts_in_flight(max_parts_in_flight);
+        self
+    }
+
     /// Builds upload [`PounceTask`].
     ///
     /// # Errors
@@ -253,6 +282,42 @@ impl UploadPounceBuilder {
             breakpoint_download_http: None,
             max_chunk_retries: self.max_chunk_retries,
             max_upload_prepare_retries: self.max_upload_prepare_retries,
+            max_parts_in_flight: self.max_parts_in_flight,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UploadPounceBuilder;
+
+    #[test]
+    fn max_parts_in_flight_defaults_to_one() {
+        let task = UploadPounceBuilder::from_bytes("f.bin", vec![0u8; 10], 4)
+            .with_url("http://x")
+            .build()
+            .expect("build");
+        assert_eq!(task.max_parts_in_flight, 1);
+    }
+
+    #[test]
+    fn with_max_parts_in_flight_round_trips() {
+        let task = UploadPounceBuilder::from_bytes("f.bin", vec![0u8; 10], 4)
+            .with_url("http://x")
+            .with_max_parts_in_flight(4)
+            .build()
+            .expect("build");
+        assert_eq!(task.max_parts_in_flight, 4);
+    }
+
+    #[test]
+    fn with_max_parts_in_flight_normalizes_zero_to_one() {
+        // A misconfigured 0 must collapse to serial (1), never disable progress.
+        let task = UploadPounceBuilder::from_bytes("f.bin", vec![0u8; 10], 4)
+            .with_url("http://x")
+            .with_max_parts_in_flight(0)
+            .build()
+            .expect("build");
+        assert_eq!(task.max_parts_in_flight, 1);
     }
 }
