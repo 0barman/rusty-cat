@@ -35,6 +35,8 @@ pub(crate) struct InnerTask {
     max_chunk_retries: u32,
     /// 上传 prepare（`BreakpointUpload::prepare`）首次失败后的最大重试次数。
     max_upload_prepare_retries: u32,
+    /// 单文件内并发上传的最大在飞分片数；默认 `1`（严格串行）。
+    max_parts_in_flight: usize,
     http_client: Option<reqwest::Client>,
 }
 
@@ -65,6 +67,7 @@ impl InnerTask {
             breakpoint_download_http,
             max_chunk_retries,
             max_upload_prepare_retries,
+            max_parts_in_flight,
         } = pounce;
 
         let upload_source = upload_source.or_else(|| {
@@ -176,6 +179,7 @@ impl InnerTask {
             breakpoint_download_http,
             max_chunk_retries,
             max_upload_prepare_retries,
+            max_parts_in_flight,
             http_client,
         })
     }
@@ -263,6 +267,10 @@ impl InnerTask {
 
     pub(crate) fn max_upload_prepare_retries(&self) -> u32 {
         self.max_upload_prepare_retries
+    }
+
+    pub(crate) fn max_parts_in_flight(&self) -> usize {
+        self.max_parts_in_flight
     }
 
     pub(crate) fn http_client_ref(&self) -> Option<&reqwest::Client> {

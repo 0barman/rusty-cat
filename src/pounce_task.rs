@@ -51,6 +51,13 @@ pub struct PounceTask {
     ///
     /// Used only for upload direction; download tasks carry the default but do not consult it.
     pub(crate) max_upload_prepare_retries: u32,
+    /// Maximum number of chunks of THIS file uploaded concurrently (intra-file
+    /// parallel parts). Default `1` keeps the strict-serial path. Values `> 1`
+    /// are only honored for upload protocols that prove out-of-order safety via
+    /// [`crate::http_breakpoint::BreakpointUpload::supports_parallel_parts`];
+    /// any other protocol stays serial. Peak upload memory for a file source is
+    /// `max_parts_in_flight * chunk_size`.
+    pub(crate) max_parts_in_flight: usize,
 }
 
 impl fmt::Debug for PounceTask {
@@ -86,6 +93,7 @@ impl fmt::Debug for PounceTask {
                 "max_upload_prepare_retries",
                 &self.max_upload_prepare_retries,
             )
+            .field("max_parts_in_flight", &self.max_parts_in_flight)
             .finish()
     }
 }
@@ -96,6 +104,10 @@ impl PounceTask {
 
     /// Default maximum retry count after the first failed upload prepare.
     pub const DEFAULT_MAX_UPLOAD_PREPARE_RETRIES: u32 = 3;
+
+    /// Default number of concurrent in-flight parts per file: `1` (strict
+    /// serial, byte-for-byte the legacy upload path).
+    pub const DEFAULT_MAX_PARTS_IN_FLIGHT: usize = 1;
 
     /// Normalizes chunk size input.
     ///
@@ -119,6 +131,14 @@ impl PounceTask {
     /// Normalizes upload prepare retry count input (same rules as chunk retries).
     pub(crate) fn normalized_max_upload_prepare_retries(max_upload_prepare_retries: u32) -> u32 {
         max_upload_prepare_retries
+    }
+
+    /// Normalizes the concurrent in-flight parts count.
+    ///
+    /// `0` collapses to `1` (serial) so a misconfigured value can never disable
+    /// progress; other values are used as-is.
+    pub(crate) fn normalized_max_parts_in_flight(max_parts_in_flight: usize) -> usize {
+        max_parts_in_flight.max(1)
     }
 
     /// Checks whether required task fields are missing/invalid.

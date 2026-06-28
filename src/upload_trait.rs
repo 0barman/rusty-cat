@@ -175,4 +175,33 @@ pub trait BreakpointUpload: Send + Sync {
     ) -> Result<(), MeowError> {
         Ok(())
     }
+
+    /// Whether this protocol is safe to upload chunks of one file **concurrently
+    /// and out of order** (intra-file parallel parts).
+    ///
+    /// The default is `false`, which keeps every protocol on the strict-serial
+    /// upload path. Returning `true` is an **opt-in contract**: the executor may
+    /// then dispatch up to `max_parts_in_flight` chunks of the same file at once,
+    /// in any completion order. Only override this to `true` when ALL of the
+    /// following hold, or out-of-order uploads will silently corrupt data:
+    ///
+    /// - **Offset-derived part identity.** Each chunk's server-side identity
+    ///   (part number / block id) is a pure function of its `offset`, never an
+    ///   incrementing counter or arrival-order sequence.
+    /// - **No server single-cursor.** The protocol does not rely on a
+    ///   server-maintained "next expected byte" that assumes sequential arrival.
+    /// - **Idempotent re-upload.** Re-uploading a part at the same offset (which
+    ///   happens on resume for any part above the persisted contiguous prefix)
+    ///   overwrites rather than duplicates.
+    /// - **Completion gated by the executor.** [`Self::complete_upload`] is only
+    ///   invoked once, after the executor confirms the whole file arrived as a
+    ///   contiguous prefix and every in-flight part has joined; the protocol does
+    ///   not finalize off a single chunk.
+    ///
+    /// `&self` is shared across all concurrent part calls, so any per-part
+    /// bookkeeping the protocol keeps must already be interior-mutable and
+    /// thread-safe.
+    fn supports_parallel_parts(&self) -> bool {
+        false
+    }
 }

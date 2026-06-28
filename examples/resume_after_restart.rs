@@ -55,10 +55,16 @@ async fn main() -> AnyResult<()> {
     // In a real application the SDK already wrote these bytes to disk before the
     // process died. They MUST be the correct leading bytes of the object.
     std::fs::write(&path, &payload[..PRESEED])?;
-    println!("simulated crashed run: {PRESEED} of {TOTAL} bytes already on disk",);
+    println!(
+        "simulated crashed run: {PRESEED} of {TOTAL} bytes already on disk",
+    );
 
     // ---- "New process after restart": rebuild the SAME task and resume it ----
-    let client = MeowClient::new(MeowConfig::builder().max_download_concurrency(1).build()?);
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_download_concurrency(1)
+            .build()?,
+    );
 
     let done = Arc::new(AtomicBool::new(false));
     let done_cb = done.clone();
@@ -99,17 +105,11 @@ async fn main() -> AnyResult<()> {
 
     println!("completed = {finished}");
     println!("server first served from byte offset = {observed_resume} (0 would mean no resume)");
-    println!(
-        "final size on disk = {} bytes (expected {TOTAL})",
-        on_disk.len()
-    );
+    println!("final size on disk = {} bytes (expected {TOTAL})", on_disk.len());
     println!("byte-exact match = {}", on_disk == payload);
 
     assert!(finished, "download did not finish in time");
-    assert_eq!(
-        on_disk, payload,
-        "resumed file does not match the original object"
-    );
+    assert_eq!(on_disk, payload, "resumed file does not match the original object");
     assert_eq!(
         observed_resume, PRESEED as u64,
         "expected the resume to start from the partial-file length",

@@ -52,6 +52,64 @@ fn test_plan_finds_part_by_offset() {
 }
 
 #[test]
+fn presigned_multipart_advertises_parallel_parts() {
+    use crate::upload_trait::BreakpointUpload;
+    // Presigned multipart accounts parts by offset under a Mutex and reorders
+    // the manifest by part_number at completion, so it is out-of-order safe.
+    let upload = PresignedMultipartUpload::new(PresignedMultipartUploadPlan::new(
+        10,
+        5,
+        vec![
+            PresignedUploadPart::put(1, 0, 5, "https://example.com/1"),
+            PresignedUploadPart::put(2, 5, 5, "https://example.com/2"),
+        ],
+    ));
+    assert!(upload.supports_parallel_parts());
+}
+
+#[test]
+fn presigned_accounting_is_order_independent() {
+    // Parts completing out of order (the whole point of parallel parts) must
+    // still reduce to the correct contiguous prefix and an ascending,
+    // part_number-ordered completion manifest.
+    let plan = PresignedMultipartUploadPlan::new(
+        20,
+        5,
+        vec![
+            PresignedUploadPart::put(1, 0, 5, "https://example.com/1"),
+            PresignedUploadPart::put(2, 5, 5, "https://example.com/2"),
+            PresignedUploadPart::put(3, 10, 5, "https://example.com/3"),
+            PresignedUploadPart::put(4, 15, 5, "https://example.com/4"),
+        ],
+    );
+    let upload = PresignedMultipartUpload::new(plan);
+
+    let mk = |part_number, offset, etag: &str| PresignedUploadedPart {
+        part_number,
+        provider_part_id: None,
+        offset,
+        size: 5,
+        etag: Some(etag.to_string()),
+    };
+    // Recorded in scrambled completion order.
+    let scrambled = vec![
+        mk(3, 10, "e3"),
+        mk(1, 0, "e1"),
+        mk(4, 15, "e4"),
+        mk(2, 5, "e2"),
+    ];
+
+    // Contiguous prefix is order-independent: full file -> 20.
+    assert_eq!(upload.resumed_offset_from(&scrambled), 20);
+
+    // Completion manifest is always ascending by part_number.
+    let mut to_complete = scrambled.clone();
+    PresignedMultipartUpload::sort_dedup_completion_parts(&mut to_complete);
+    let part_numbers: Vec<_> = to_complete.iter().map(|p| p.part_number).collect();
+    assert_eq!(part_numbers, vec![1, 2, 3, 4]);
+}
+
+#[test]
 fn test_plan_validate_rejects_duplicate_offsets() {
     let plan = PresignedMultipartUploadPlan::new(
         10,
@@ -233,10 +291,7 @@ fn uploaded(part_number: u64, offset: u64, size: u64) -> PresignedUploadedPart {
 fn test_resumed_offset_covers_full_contiguous_prefix() {
     let up = PresignedMultipartUpload::new(plan_three_5b_parts());
     let resumed = up.resumed_offset_from(&[uploaded(1, 0, 5), uploaded(2, 5, 5)]);
-    assert_eq!(
-        resumed, 10,
-        "two contiguous 5-byte parts resume at offset 10"
-    );
+    assert_eq!(resumed, 10, "two contiguous 5-byte parts resume at offset 10");
 }
 
 #[test]
@@ -272,11 +327,8 @@ fn test_resumed_offset_empty_is_zero() {
 #[tokio::test]
 async fn test_with_resumed_parts_dedups_by_offset() {
     // Injecting two parts for the same offset keeps only one.
-    let up = PresignedMultipartUpload::new(plan_three_5b_parts()).with_resumed_parts(vec![
-        uploaded(1, 0, 5),
-        uploaded(1, 0, 5),
-        uploaded(2, 5, 5),
-    ]);
+    let up = PresignedMultipartUpload::new(plan_three_5b_parts())
+        .with_resumed_parts(vec![uploaded(1, 0, 5), uploaded(1, 0, 5), uploaded(2, 5, 5)]);
     let parts = up.uploaded_parts().await;
     assert_eq!(parts.len(), 2);
     let mut offsets: Vec<u64> = parts.iter().map(|p| p.offset).collect();

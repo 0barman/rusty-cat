@@ -67,6 +67,7 @@ The Crates.io, Docs.rs, and License badge Markdown is shown below. These badges 
 | Callback panic isolation | Yes | User callbacks are isolated from scheduler execution; callbacks should still be fast, non-blocking, and panic-free. |
 | Chunk failure retry | Yes | `with_max_chunk_retries(...)` on upload and download builders controls additional retries after the first failed chunk transfer. |
 | Upload prepare retry | Yes | `UploadPounceBuilder::with_max_upload_prepare_retries(...)` controls additional retries after the first failed upload preparation attempt. |
+| Intra-file parallel parts | Opt-in | `UploadPounceBuilder::with_max_parts_in_flight(n)` uploads up to `n` chunks of one file concurrently. Default `1` (serial). Honored only for out-of-order-safe protocols (presigned multipart / Azure block blob); progress, resume, pause, and cancel still observe a single contiguous prefix. |
 | Transport-aware retry & backoff | Yes | Beyond the retry counts above, transient transport failures (connection reset, timeout, incomplete message) are retried with exponential backoff and jitter, while non-transient errors fail fast. |
 | Disk-full & local-file-removed detection | Yes | Local I/O failures are classified into dedicated error codes `DiskFull` and `LocalFileRemoved`, so callers can react specifically instead of treating every I/O error the same. |
 | Pause/resume/cancel | Yes | Use `pause(...)`, `resume(...)`, and `cancel(...)` with the returned `TaskId`. |
@@ -309,6 +310,7 @@ Start with `MeowConfig::default()` for a safe baseline or use `MeowConfig::build
 | `with_breakpoint_upload(upload)` | Optional | Sets a per-task custom `BreakpointUpload`, such as Aliyun/Azure direct or presigned upload. |
 | `with_max_chunk_retries(retries)` | Optional | Sets additional retries after the first failed chunk attempt. `0` disables chunk retry. Default is `3`. |
 | `with_max_upload_prepare_retries(retries)` | Optional | Sets additional retries after the first failed upload prepare attempt. Default is `3`. |
+| `with_max_parts_in_flight(n)` | Optional | Maximum chunks of this file uploaded **concurrently** (intra-file parallel parts). Default `1` (strict serial, unchanged behavior). A value `> 1` is only honored when the chosen upload protocol proves out-of-order safety (presigned multipart / Azure block blob); any other protocol stays serial regardless. `0` is normalized to `1`. Peak upload memory for a file source is `n * chunk_size`, so keep `n` bounded. |
 | `build()` | Yes | Reads file metadata for file-backed uploads and returns `PounceTask`; may return `std::io::Error`. |
 
 Beginner tips:

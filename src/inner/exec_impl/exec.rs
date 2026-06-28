@@ -247,6 +247,23 @@ async fn run_group(
             total_size: known_total,
         })
         .await;
+    // 单文件内多分片并发（opt-in，optimization ④）：仅当调用方放大了
+    // `max_parts_in_flight` 且所选协议证明乱序安全时，走窗口化并发路径；否则
+    // （默认 `==1` / 不支持的协议）落到下面逐字未变的串行 loop，行为字节一致。
+    if inner.max_parts_in_flight() > 1 && executor.supports_parallel_parts(&task) {
+        run_group_parallel(
+            key,
+            &inner,
+            &task,
+            &cancel,
+            &worker_tx,
+            &executor,
+            offset,
+            known_total,
+        )
+        .await;
+        return;
+    }
     loop {
         if cancel.is_cancelled() {
             crate::meow_flow_log!(
@@ -271,6 +288,7 @@ async fn run_group(
             inner.chunk_size(),
             known_total,
             inner.max_chunk_retries(),
+            crate::inner::exec_impl::retry::ChunkTransferMode::Whole,
         )
         .await
         {
@@ -327,6 +345,227 @@ async fn run_group(
                 })
                 .await;
             return;
+        }
+    }
+}
+
+/// Spawns one in-flight part (upload of a single chunk at `offset`) onto the
+/// JoinSet, driven through the shared per-chunk retry loop in `Part` mode so it
+/// never finalizes the upload. Each part owns cheap clones of the executor Arc,
+/// the task (its `Arc` fields — file slot, protocol — are shared so accounting
+/// is consistent), the dedupe key, and the shared cancellation token.
+#[allow(clippy::too_many_arguments)]
+fn spawn_part(
+    set: &mut tokio::task::JoinSet<(
+        u64,
+        crate::inner::exec_impl::retry::ChunkRetryResult,
+    )>,
+    executor: &Arc<dyn TransferTrait>,
+    task: &TransferTask,
+    key: &UniqueId,
+    cancel: &CancellationToken,
+    offset: u64,
+    chunk_size: u64,
+    known_total: u64,
+    max_chunk_retries: u32,
+) {
+    let executor = executor.clone();
+    let task = task.clone();
+    let key = key.clone();
+    let cancel = cancel.clone();
+    set.spawn(async move {
+        let result = crate::inner::exec_impl::retry::transfer_chunk_with_retry(
+            &executor,
+            &task,
+            &key,
+            &cancel,
+            offset,
+            chunk_size,
+            known_total,
+            max_chunk_retries,
+            crate::inner::exec_impl::retry::ChunkTransferMode::Part,
+        )
+        .await;
+        (offset, result)
+    });
+}
+
+/// Windowed concurrent driver for one file's parts (optimization ④, opt-in).
+///
+/// Confines ALL intra-file concurrency here: it keeps `run_group` the sole
+/// `worker_tx` sender for its group, emits only the contiguous-prefix watermark
+/// as Progress (so `SchedulerState.offsets` never sees a hole), and finalizes
+/// the upload exactly once after the join barrier. The scheduler,
+/// `SchedulerState`, `handle_worker_event`, the cancellation plane, and the wire
+/// protocols are all untouched.
+#[allow(clippy::too_many_arguments)]
+async fn run_group_parallel(
+    key: UniqueId,
+    inner: &InnerTask,
+    task: &TransferTask,
+    cancel: &CancellationToken,
+    worker_tx: &mpsc::Sender<WorkerEvent>,
+    executor: &Arc<dyn TransferTrait>,
+    start_offset: u64,
+    known_total: u64,
+) {
+    use crate::inner::exec_impl::part_window::PartWindow;
+    use crate::inner::exec_impl::retry::ChunkRetryResult;
+
+    crate::meow_flow_log!(
+        "run_group_parallel",
+        "begin: key={:?} task_id={:?} start_offset={} total={} max_parts={}",
+        key,
+        inner.task_id(),
+        start_offset,
+        known_total,
+        inner.max_parts_in_flight()
+    );
+
+    // Resume already at total: match the serial `offset >= total` early return,
+    // which emits Completed WITHOUT a finalize call.
+    if start_offset >= known_total {
+        let _ = worker_tx
+            .send(WorkerEvent::Completed {
+                key,
+                total_size: known_total,
+                completion_payload: None,
+            })
+            .await;
+        return;
+    }
+
+    let chunk = inner.chunk_size();
+    let max_retries = inner.max_chunk_retries();
+    let mut window = PartWindow::new(start_offset, chunk, known_total, inner.max_parts_in_flight());
+    let mut set: tokio::task::JoinSet<(u64, ChunkRetryResult)> = tokio::task::JoinSet::new();
+    let mut cancelled = false;
+    let mut failed: Option<MeowError> = None;
+
+    // Fill the window with the first batch of parts.
+    while let Some(off) = window.take_dispatch() {
+        spawn_part(
+            &mut set, executor, task, &key, cancel, off, chunk, known_total, max_retries,
+        );
+    }
+
+    // Drain the JoinSet to empty: this loop IS the join barrier. A single
+    // terminal event is emitted only after every part has settled.
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Err(join_err) => {
+                // A part task panicked. Stop siblings, drain to quiescence, and
+                // fail the whole file — a panicked part's bytes are unverified,
+                // so the object must never be completed. (The outer panic guard
+                // in `try_start_next` does not cover JoinSet children.)
+                cancel.cancel();
+                while set.join_next().await.is_some() {}
+                let err = MeowError::from_code(
+                    InnerErrorCode::Unknown,
+                    format!("upload part task panicked: {join_err}"),
+                );
+                crate::meow_flow_log!(
+                    "run_group_parallel",
+                    "part task panicked: key={:?} task_id={:?} err={}",
+                    key,
+                    inner.task_id(),
+                    err
+                );
+                let _ = worker_tx.send(WorkerEvent::Failed { key, error: err }).await;
+                return;
+            }
+            Ok((off, ChunkRetryResult::Done(_))) => {
+                if let Some(watermark) = window.on_done(off) {
+                    // Emit ONE coalesced Progress only when the contiguous
+                    // prefix advances — never a raw per-part offset.
+                    let _ = worker_tx
+                        .send(WorkerEvent::Progress {
+                            key: key.clone(),
+                            next_offset: watermark,
+                            total_size: known_total,
+                        })
+                        .await;
+                }
+                // Top up the window only while still healthy.
+                if !cancelled && failed.is_none() {
+                    while let Some(next_off) = window.take_dispatch() {
+                        spawn_part(
+                            &mut set, executor, task, &key, cancel, next_off, chunk, known_total,
+                            max_retries,
+                        );
+                    }
+                }
+            }
+            Ok((_off, ChunkRetryResult::Cancelled)) => {
+                cancelled = true;
+                window.on_settled_without_progress();
+                // Stop dispatching; keep draining the rest to quiescence.
+            }
+            Ok((_off, ChunkRetryResult::Failed(e))) => {
+                if failed.is_none() {
+                    failed = Some(e);
+                }
+                window.on_settled_without_progress();
+                // Stop dispatching new parts; let in-flight siblings settle
+                // naturally (do NOT cancel the token — that would masquerade a
+                // genuine failure as a user cancel).
+            }
+        }
+    }
+
+    // Join barrier reached (JoinSet empty). Emit exactly one terminal event,
+    // prioritizing a genuine failure over a cancel (the retry layer already maps
+    // user-cancel in-flight errors to Cancelled, so `failed` means a real error).
+    if let Some(e) = failed {
+        crate::meow_flow_log!(
+            "run_group_parallel",
+            "failed after drain: key={:?} task_id={:?} err={}",
+            key,
+            inner.task_id(),
+            e
+        );
+        let _ = worker_tx.send(WorkerEvent::Failed { key, error: e }).await;
+    } else if cancelled || cancel.is_cancelled() {
+        // FLAW-1: re-check cancel right before finalizing so `complete` can never
+        // race the `abort_upload` that `cancel_group` issues; treat a late cancel
+        // as Canceled even if every part already finished.
+        crate::meow_flow_log!(
+            "run_group_parallel",
+            "canceled after drain: key={:?} task_id={:?} watermark={}",
+            key,
+            inner.task_id(),
+            window.watermark()
+        );
+        let _ = worker_tx.send(WorkerEvent::Canceled { key }).await;
+    } else {
+        debug_assert!(window.is_complete(), "complete fired before contiguous prefix reached total");
+        match executor.complete(task).await {
+            Ok(completion_payload) => {
+                crate::meow_flow_log!(
+                    "run_group_parallel",
+                    "completed: key={:?} task_id={:?} total={}",
+                    key,
+                    inner.task_id(),
+                    known_total
+                );
+                let _ = worker_tx
+                    .send(WorkerEvent::Completed {
+                        key,
+                        total_size: known_total,
+                        completion_payload,
+                    })
+                    .await;
+            }
+            Err(e) => {
+                crate::meow_flow_log!(
+                    "run_group_parallel",
+                    "complete call failed: key={:?} task_id={:?} err={}",
+                    key,
+                    inner.task_id(),
+                    e
+                );
+                let _ = worker_tx.send(WorkerEvent::Failed { key, error: e }).await;
+            }
         }
     }
 }

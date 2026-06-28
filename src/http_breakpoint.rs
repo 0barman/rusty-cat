@@ -133,7 +133,8 @@ async fn send_upload_request(
         return Err(MeowError::from_code(
             InnerErrorCode::ResponseStatusError,
             format!("upload HTTP {status}: {body}"),
-        ));
+        )
+        .with_http_status(status.as_u16()));
     }
     Ok(body)
 }
@@ -264,3 +265,15 @@ pub(crate) fn insert_header(map: &mut HeaderMap, name: &str, value: &str) {
 pub struct StandardRangeDownload;
 
 impl BreakpointDownload for StandardRangeDownload {}
+
+#[cfg(test)]
+mod tests {
+    use super::{BreakpointUpload, DefaultStyleUpload};
+
+    #[test]
+    fn default_style_upload_is_serial_only() {
+        // The default multipart protocol trusts the server's single-cursor
+        // `nextByte`, so it must NOT advertise out-of-order safety.
+        assert!(!DefaultStyleUpload::default().supports_parallel_parts());
+    }
+}

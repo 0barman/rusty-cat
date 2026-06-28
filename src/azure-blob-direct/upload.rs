@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -10,7 +11,7 @@ use super::constants::{
     BLOCK_LIST_CONTENT_TYPE, DEFAULT_BLOCK_CONTENT_TYPE, MAX_AZURE_BLOCKS, MAX_AZURE_BLOCK_BYTES,
 };
 use super::put_block_session::PutBlockSession;
-use super::signing::signed_headers;
+use super::signing::{decode_account_key, signed_headers_with_key};
 use super::xml::{block_list_xml, parse_block_indices_from_block_list};
 use crate::http_breakpoint::UploadResumeInfo;
 use crate::upload_trait::{UploadChunkCtx, UploadPrepareCtx};
@@ -21,6 +22,11 @@ use crate::{BreakpointUpload, InnerErrorCode, MeowError, TransferTask};
 pub struct AzureBlobDirectUpload {
     account_name: String,
     account_key_b64: String,
+    /// Base64-decoded account key, decoded lazily on first sign and reused for
+    /// every block (skips per-block base64 decode). Lazy rather than in `new` so
+    /// the public constructor stays infallible. Uses a `std` mutex because the
+    /// critical section is tiny and synchronous (no `.await`).
+    decoded_key: Arc<StdMutex<Option<Vec<u8>>>>,
     session: Arc<Mutex<PutBlockSession>>,
 }
 
@@ -29,6 +35,7 @@ impl AzureBlobDirectUpload {
         Self {
             account_name: account_name.into(),
             account_key_b64: account_key_b64.into(),
+            decoded_key: Arc::new(StdMutex::new(None)),
             session: Arc::new(Mutex::new(PutBlockSession::default())),
         }
     }
@@ -73,15 +80,31 @@ impl AzureBlobDirectUpload {
         content_type: Option<&str>,
         extra_headers: &[(&str, &str)],
     ) -> Result<reqwest::header::HeaderMap, MeowError> {
-        signed_headers(
+        let key = self.account_key()?;
+        signed_headers_with_key(
             method,
             url,
             content_length,
             content_type,
             extra_headers,
             self.account_name.as_str(),
-            self.account_key_b64.as_str(),
+            &key,
         )
+    }
+
+    /// Returns the base64-decoded account key, decoding once and caching it for
+    /// reuse across all blocks.
+    fn account_key(&self) -> Result<Vec<u8>, MeowError> {
+        let mut guard = self
+            .decoded_key
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(key) = guard.as_ref() {
+            return Ok(key.clone());
+        }
+        let key = decode_account_key(self.account_key_b64.as_str())?;
+        *guard = Some(key.clone());
+        Ok(key)
     }
 
     async fn list_uncommitted_blocks(
@@ -114,7 +137,8 @@ impl AzureBlobDirectUpload {
             return Err(MeowError::from_code(
                 InnerErrorCode::ResponseStatusError,
                 format!("azure list block list failed: {status}, body: {body}"),
-            ));
+            )
+            .with_http_status(status.as_u16()));
         }
         Ok(parse_block_indices_from_block_list(body.as_str()))
     }
@@ -218,7 +242,8 @@ impl BreakpointUpload for AzureBlobDirectUpload {
             return Err(MeowError::from_code(
                 InnerErrorCode::ResponseStatusError,
                 format!("azure put block failed: {status}, body: {body}"),
-            ));
+            )
+            .with_http_status(status.as_u16()));
         }
         self.session.lock().await.uploaded_blocks.insert(idx);
         Ok(UploadResumeInfo {
@@ -266,7 +291,8 @@ impl BreakpointUpload for AzureBlobDirectUpload {
             return Err(MeowError::from_code(
                 InnerErrorCode::ResponseStatusError,
                 format!("azure put block list failed: {status}, body: {body}"),
-            ));
+            )
+            .with_http_status(status.as_u16()));
         }
         self.session.lock().await.uploaded_blocks.clear();
         Ok(None)
@@ -302,10 +328,20 @@ impl BreakpointUpload for AzureBlobDirectUpload {
             return Err(MeowError::from_code(
                 InnerErrorCode::ResponseStatusError,
                 format!("azure delete blob on cancel failed: {status}, body: {body}"),
-            ));
+            )
+            .with_http_status(status.as_u16()));
         }
         self.session.lock().await.uploaded_blocks.clear();
         Ok(())
+    }
+
+    /// Azure block blobs are out-of-order safe: a block's id is a pure function
+    /// of its chunk index (`block_id_by_index`), the uploaded-block set is a
+    /// `BTreeSet` behind a `Mutex`, and the committed order is fixed by the Block
+    /// List (built in index order) submitted at completion — never by Put Block
+    /// arrival order. Re-uploading a block id overwrites idempotently.
+    fn supports_parallel_parts(&self) -> bool {
+        true
     }
 }
 
@@ -398,9 +434,16 @@ fn validate_all_blocks_present(
 #[cfg(test)]
 mod tests {
     use super::AzureBlobDirectUpload;
+    use crate::upload_trait::BreakpointUpload;
 
     #[test]
     fn test_block_id_by_index_stable_encoding() {
         assert_eq!(AzureBlobDirectUpload::block_id_by_index(1), "MDAwMDAwMDE=");
+    }
+
+    #[test]
+    fn azure_direct_advertises_parallel_parts() {
+        let upload = AzureBlobDirectUpload::new("acct", "a2V5");
+        assert!(upload.supports_parallel_parts());
     }
 }

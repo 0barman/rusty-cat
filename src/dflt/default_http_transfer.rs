@@ -16,7 +16,9 @@ use crate::prepare_outcome::PrepareOutcome;
 use crate::transfer_executor_trait::TransferTrait;
 use crate::transfer_task::TransferTask;
 
-use super::default_http_transfer_chunks::{download_one_chunk, map_reqwest, upload_one_chunk};
+use super::default_http_transfer_chunks::{
+    download_one_chunk, map_reqwest, upload_one_chunk, upload_one_chunk_part,
+};
 
 /// Creates default breakpoint protocol instances.
 pub(crate) fn default_breakpoint_arcs() -> (
@@ -27,6 +29,62 @@ pub(crate) fn default_breakpoint_arcs() -> (
         Arc::new(DefaultStyleUpload::default()),
         Arc::new(StandardRangeDownload::default()),
     )
+}
+
+/// Maximum idle connections kept alive per host in the internal pool.
+///
+/// Connection reuse removes a TCP+TLS handshake from every chunk that follows
+/// the first one on the same host, which dominates per-chunk overhead on
+/// high-latency links. The cap stays bounded so long-lived SDK hosts do not
+/// accumulate idle sockets; callers that need a different policy can inject
+/// their own `reqwest::Client` via `MeowConfig::http_client`.
+const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 16;
+
+/// How long an idle pooled connection is retained before eviction.
+///
+/// Sequential chunks on one task are issued back-to-back (the inter-chunk gap
+/// is a local file read, i.e. milliseconds), so this comfortably keeps the
+/// connection warm within a transfer while trimming sockets left idle across a
+/// pause. A connection the server silently closed and we still reuse surfaces
+/// as `HttpError`, which every transfer path already retries, so reuse never
+/// turns a recoverable stale socket into a terminal failure.
+const DEFAULT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Upper bound applied to the connect phase when building internal clients.
+///
+/// The total request timeout (`http_timeout`) must stay large enough for a slow
+/// chunk body to finish, which would otherwise let a dead TCP/TLS handshake
+/// hang for that whole budget. Capping only the connect phase fails an
+/// unreachable peer fast without shortening a slow-but-alive transfer. The
+/// effective value is `min(http_timeout, cap)`, so small total timeouts are
+/// never exceeded and behavior is unchanged when `http_timeout <= cap`.
+const DEFAULT_CONNECT_TIMEOUT_CAP: Duration = Duration::from_secs(10);
+
+/// Builds an internal `reqwest::Client` with the library's shared transport
+/// policy: a total request timeout, a bounded connect timeout for fast failure
+/// on unreachable peers, TCP keepalive, and a bounded idle connection pool for
+/// handshake reuse across chunks.
+///
+/// Centralizing this keeps every internally created client (the transfer
+/// backend and [`crate::MeowClient::http_client`]) on the exact same policy, so
+/// they can never drift apart.
+pub(crate) fn build_internal_client(
+    http_timeout: Duration,
+    tcp_keepalive: Duration,
+) -> Result<reqwest::Client, reqwest::Error> {
+    Client::builder()
+        .timeout(http_timeout)
+        // Fail fast on an unreachable peer while leaving the total budget for
+        // slow chunk bodies; see `DEFAULT_CONNECT_TIMEOUT_CAP`.
+        .connect_timeout(http_timeout.min(DEFAULT_CONNECT_TIMEOUT_CAP))
+        .tcp_keepalive(tcp_keepalive)
+        // Reuse idle connections to drop a handshake from every subsequent
+        // chunk. A stale socket reused after a pause comes back as `HttpError`,
+        // which all transfer paths retry, so reuse is safe; the bounded cap and
+        // idle timeout only keep idle sockets in check.
+        .pool_max_idle_per_host(DEFAULT_POOL_MAX_IDLE_PER_HOST)
+        .pool_idle_timeout(Some(DEFAULT_POOL_IDLE_TIMEOUT))
+        .build()
 }
 
 /// Built-in HTTP transfer backend based on `reqwest` and async file I/O.
@@ -76,15 +134,7 @@ impl DefaultHttpTransfer {
     pub fn with_http_timeouts(http_timeout: Duration, tcp_keepalive: Duration) -> Self {
         // Keep non-fallible constructor for compatibility.
         // Prefer `try_with_http_timeouts` in new code for explicit errors.
-        let client = match Client::builder()
-            .timeout(http_timeout)
-            .tcp_keepalive(tcp_keepalive)
-            // Avoid reusing idle TCP connections after user cancel/pause: a pooled conn can be
-            // half-closed and then fail the next HEAD/GET with reset/incomplete message (flaky
-            // under pause/resume and slow range servers).
-            .pool_max_idle_per_host(0)
-            .build()
-        {
+        let client = match build_internal_client(http_timeout, tcp_keepalive) {
             Ok(c) => c,
             Err(e) => {
                 crate::meow_flow_log!(
@@ -126,11 +176,7 @@ impl DefaultHttpTransfer {
         http_timeout: Duration,
         tcp_keepalive: Duration,
     ) -> Result<Self, MeowError> {
-        let client = Client::builder()
-            .timeout(http_timeout)
-            .tcp_keepalive(tcp_keepalive)
-            .pool_max_idle_per_host(0)
-            .build()
+        let client = build_internal_client(http_timeout, tcp_keepalive)
             .map_err(|e| {
                 MeowError::from_source(
                     InnerErrorCode::HttpClientBuildFailed,
@@ -403,7 +449,8 @@ async fn download_prepare(
         return Err(MeowError::from_code(
             InnerErrorCode::ResponseStatusError,
             format!("download_prepare HEAD failed: {}", head_resp.status()),
-        ));
+        )
+        .with_http_status(head_resp.status().as_u16()));
     }
     let head_content_length = head_resp
         .headers()
@@ -512,5 +559,50 @@ impl TransferTrait for DefaultHttpTransfer {
         }
         let client = self.client_for(task);
         self.upload_arc(task).abort_upload(&client, task).await
+    }
+
+    /// Parallel parts are only offered for uploads whose resolved protocol
+    /// proves out-of-order safety; downloads always stay serial.
+    fn supports_parallel_parts(&self, task: &TransferTask) -> bool {
+        task.direction() == Direction::Upload && self.upload_arc(task).supports_parallel_parts()
+    }
+
+    /// Uploads one chunk without finalizing (parallel path). Completion is run
+    /// exactly once by the scheduler via [`Self::complete`].
+    async fn transfer_chunk_part(
+        &self,
+        task: &TransferTask,
+        offset: u64,
+        chunk_size: u64,
+        remote_total_size: u64,
+    ) -> Result<ChunkOutcome, MeowError> {
+        let client = self.client_for(task);
+        match task.direction() {
+            Direction::Upload => {
+                upload_one_chunk_part(&client, task, self.upload_arc(task), offset, chunk_size).await
+            }
+            // Download has no finalize step; behaves exactly like transfer_chunk.
+            Direction::Download => {
+                download_one_chunk(
+                    &client,
+                    task,
+                    self.download_arc(task),
+                    offset,
+                    chunk_size,
+                    remote_total_size,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Finalizes an upload after all parts have been uploaded; delegates to the
+    /// protocol's `complete_upload`.
+    async fn complete(&self, task: &TransferTask) -> Result<Option<String>, MeowError> {
+        if task.direction() != Direction::Upload {
+            return Ok(None);
+        }
+        let client = self.client_for(task);
+        self.upload_arc(task).complete_upload(&client, task).await
     }
 }

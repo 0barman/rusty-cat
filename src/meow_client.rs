@@ -3,7 +3,9 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock};
 
 use tokio::sync::oneshot;
 
-use crate::dflt::default_http_transfer::{default_breakpoint_arcs, DefaultHttpTransfer};
+use crate::dflt::default_http_transfer::{
+    build_internal_client, default_breakpoint_arcs, DefaultHttpTransfer,
+};
 use crate::error::{InnerErrorCode, MeowError};
 use crate::file_transfer_record::FileTransferRecord;
 use crate::ids::{GlobalProgressListenerId, TaskId};
@@ -187,10 +189,10 @@ impl MeowClient {
         if let Some(c) = self.config.http_client_ref() {
             return Ok(c.clone());
         }
-        reqwest::Client::builder()
-            .timeout(self.config.http_timeout())
-            .tcp_keepalive(self.config.tcp_keepalive())
-            .build()
+        // Build through the shared helper so this client carries the exact same
+        // transport policy (connect timeout + idle connection pool) as the
+        // transfer backend, rather than reqwest's bare defaults.
+        build_internal_client(self.config.http_timeout(), self.config.tcp_keepalive())
             .map_err(|e| {
                 MeowError::from_source(
                     InnerErrorCode::HttpClientBuildFailed,
