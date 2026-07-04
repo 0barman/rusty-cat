@@ -22,6 +22,25 @@
 //! let _ = client;
 //! # Ok::<(), rusty_cat::api::MeowError>(())
 //! ```
+//!
+//! # Panic policy (enforced)
+//!
+//! Production SDK code must never panic: any fallible path returns
+//! `Result<_, error::MeowError>` and logs the failure at [`log::LogLevel::Error`]
+//! (see [`meow_error_log`]). The lint block below makes a panic-trigger in
+//! non-test code a compile-time error under `cargo clippy`, freezing this
+//! guarantee. Tests, doctests and examples are exempt.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::unreachable
+    )
+)]
 #[cfg(feature = "aliyun-oss-direct")]
 #[path = "aliyun-oss-direct/mod.rs"]
 pub mod aliyun_oss_direct;

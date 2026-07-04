@@ -84,14 +84,14 @@ impl UploadRequest {
 /// Parses default upload response JSON payload into [`UploadResumeInfo`].
 fn parse_default_upload_response(body: &str) -> Result<UploadResumeInfo, MeowError> {
     if body.trim().is_empty() {
-        crate::meow_flow_log!(
+        crate::meow_trace_log!(
             "upload_protocol",
             "empty upload response body, fallback default"
         );
         return Ok(UploadResumeInfo::default());
     }
     let v: DefaultUploadResp = serde_json::from_str(body).map_err(|e| {
-        crate::meow_flow_log!(
+        crate::meow_error_log!(
             "upload_protocol",
             "upload response parse failed: body_len={} err={}",
             body.len(),
@@ -102,7 +102,7 @@ fn parse_default_upload_response(body: &str) -> Result<UploadResumeInfo, MeowErr
             format!("upload response json: {e}, body: {body}"),
         )
     })?;
-    crate::meow_flow_log!(
+    crate::meow_trace_log!(
         "upload_protocol",
         "upload response parsed: file_id_present={} next_byte={:?}",
         v.file_id.is_some(),
@@ -121,15 +121,55 @@ async fn send_upload_request(
     client: &reqwest::Client,
     req: UploadRequest,
 ) -> Result<String, MeowError> {
+    // Capture the URL for logging before it is moved into the request builder.
+    // Logging-only binding; does not change request behavior.
+    let log_url = req.url.clone();
     let mut builder = client.request(req.method, req.url).headers(req.headers);
     builder = match req.body {
         UploadBody::Multipart(form) => builder.multipart(form),
         UploadBody::Binary(bytes) => builder.body(bytes),
     };
-    let resp = builder.send().await.map_err(map_reqwest)?;
+    let resp = builder.send().await.map_err(|e| {
+        crate::log::emit_lazy(|| {
+            crate::log::Log::error(
+                "upload_send",
+                format!(
+                    "upload request send() transport error: {}",
+                    crate::log::redact_secrets(&e.to_string())
+                ),
+            )
+            .with_url(log_url.as_str())
+        });
+        map_reqwest(e)
+    })?;
     let status = resp.status();
-    let body = resp.text().await.map_err(map_reqwest)?;
+    let body = resp.text().await.map_err(|e| {
+        crate::log::emit_lazy(|| {
+            crate::log::Log::error(
+                "upload_send",
+                format!(
+                    "upload response body read error: {}",
+                    crate::log::redact_secrets(&e.to_string())
+                ),
+            )
+            .with_http_status(status.as_u16())
+            .with_url(log_url.as_str())
+        });
+        map_reqwest(e)
+    })?;
     if !status.is_success() {
+        crate::log::emit_lazy(|| {
+            crate::log::Log::error(
+                "upload_send",
+                format!(
+                    "upload HTTP non-2xx status={} body={}",
+                    status,
+                    crate::log::redact_secrets(&body)
+                ),
+            )
+            .with_http_status(status.as_u16())
+            .with_url(log_url.as_str())
+        });
         return Err(MeowError::from_code(
             InnerErrorCode::ResponseStatusError,
             format!("upload HTTP {status}: {body}"),
@@ -209,7 +249,25 @@ impl BreakpointUpload for DefaultStyleUpload {
         let part = multipart::Part::stream_with_length(body, chunk_len as u64)
             .file_name(KEY_UPLOAD_CHUNK_DATA)
             .mime_str("application/octet-stream")
-            .map_err(|e| MeowError::from_code(InnerErrorCode::HttpError, e.to_string()))?;
+            .map_err(|e| {
+                let err_text = e.to_string();
+                let offset = ctx.offset;
+                let byte_len = chunk_len as u64;
+                let url = ctx.task.url().to_string();
+                crate::log::emit_lazy(move || {
+                    crate::log::Log::error(
+                        "upload_chunk",
+                        format!(
+                            "multipart chunk Part build failed: {}",
+                            crate::log::redact_secrets(&err_text)
+                        ),
+                    )
+                    .with_offset(offset)
+                    .with_byte_len(byte_len)
+                    .with_url(url.as_str())
+                });
+                MeowError::from_code(InnerErrorCode::HttpError, e.to_string())
+            })?;
 
         let form = multipart::Form::new()
             .part(KEY_FILE, part)
@@ -264,16 +322,26 @@ pub(crate) fn insert_header(map: &mut HeaderMap, name: &str, value: &str) {
 #[derive(Debug, Clone, Default)]
 pub struct StandardRangeDownload;
 
-impl BreakpointDownload for StandardRangeDownload {}
+impl BreakpointDownload for StandardRangeDownload {
+    fn supports_parallel_parts(&self) -> bool {
+        true
+    }
+}
 
 #[cfg(test)]
 mod tests {
-    use super::{BreakpointUpload, DefaultStyleUpload};
+    use super::{BreakpointUpload, DefaultStyleUpload, StandardRangeDownload};
 
     #[test]
     fn default_style_upload_is_serial_only() {
         // The default multipart protocol trusts the server's single-cursor
         // `nextByte`, so it must NOT advertise out-of-order safety.
         assert!(!DefaultStyleUpload::default().supports_parallel_parts());
+    }
+
+    #[test]
+    fn standard_range_download_supports_parallel_parts() {
+        use crate::download_trait::BreakpointDownload;
+        assert!(StandardRangeDownload.supports_parallel_parts());
     }
 }

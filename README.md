@@ -67,7 +67,8 @@ The Crates.io, Docs.rs, and License badge Markdown is shown below. These badges 
 | Callback panic isolation | Yes | User callbacks are isolated from scheduler execution; callbacks should still be fast, non-blocking, and panic-free. |
 | Chunk failure retry | Yes | `with_max_chunk_retries(...)` on upload and download builders controls additional retries after the first failed chunk transfer. |
 | Upload prepare retry | Yes | `UploadPounceBuilder::with_max_upload_prepare_retries(...)` controls additional retries after the first failed upload preparation attempt. |
-| Intra-file parallel parts | Opt-in | `UploadPounceBuilder::with_max_parts_in_flight(n)` uploads up to `n` chunks of one file concurrently. Default `1` (serial). Honored only for out-of-order-safe protocols (presigned multipart / Azure block blob); progress, resume, pause, and cancel still observe a single contiguous prefix. |
+| Intra-file parallel parts | Opt-in | `UploadPounceBuilder::with_max_parts_in_flight(n)` uploads up to `n` chunks of one file concurrently. Default `1` (serial). Honored only for out-of-order-safe upload protocols — all four provider protocols (Aliyun OSS direct & presigned multipart, Azure Blob direct & SAS block blob); the built-in default HTTP upload stays serial. Progress, resume, pause, and cancel still observe a single contiguous prefix. See [Concurrent chunked transfer](docs/concurrent-chunk-transfer.md). |
+| Intra-file parallel download | Opt-in | `DownloadPounceBuilder::with_max_parts_in_flight(n)` fetches up to `n` range chunks of one file concurrently and writes them at absolute offsets. Default `1` (serial). Honored only for range-safe protocols (`StandardRangeDownload`) when the total size is known. Peak memory `n * chunk_size`. Interrupted concurrent downloads resume from a `<file>.rcdl` sidecar (re-fetching only missing parts); the sidecar is deleted on success. The download URL must be stable for the transfer's lifetime (no per-request re-signing on the range path). See [Concurrent chunked transfer](docs/concurrent-chunk-transfer.md). |
 | Transport-aware retry & backoff | Yes | Beyond the retry counts above, transient transport failures (connection reset, timeout, incomplete message) are retried with exponential backoff and jitter, while non-transient errors fail fast. |
 | Disk-full & local-file-removed detection | Yes | Local I/O failures are classified into dedicated error codes `DiskFull` and `LocalFileRemoved`, so callers can react specifically instead of treating every I/O error the same. |
 | Pause/resume/cancel | Yes | Use `pause(...)`, `resume(...)`, and `cancel(...)` with the returned `TaskId`. |
@@ -310,7 +311,7 @@ Start with `MeowConfig::default()` for a safe baseline or use `MeowConfig::build
 | `with_breakpoint_upload(upload)` | Optional | Sets a per-task custom `BreakpointUpload`, such as Aliyun/Azure direct or presigned upload. |
 | `with_max_chunk_retries(retries)` | Optional | Sets additional retries after the first failed chunk attempt. `0` disables chunk retry. Default is `3`. |
 | `with_max_upload_prepare_retries(retries)` | Optional | Sets additional retries after the first failed upload prepare attempt. Default is `3`. |
-| `with_max_parts_in_flight(n)` | Optional | Maximum chunks of this file uploaded **concurrently** (intra-file parallel parts). Default `1` (strict serial, unchanged behavior). A value `> 1` is only honored when the chosen upload protocol proves out-of-order safety (presigned multipart / Azure block blob); any other protocol stays serial regardless. `0` is normalized to `1`. Peak upload memory for a file source is `n * chunk_size`, so keep `n` bounded. |
+| `with_max_parts_in_flight(n)` | Optional | Maximum chunks of this file uploaded **concurrently** (intra-file parallel parts). Default `1` (strict serial, unchanged behavior). A value `> 1` is only honored when the chosen upload protocol proves out-of-order safety — all four provider protocols do (Aliyun OSS direct & presigned multipart, Azure Blob direct & SAS block blob); the built-in default HTTP upload stays serial. `0` is normalized to `1`. Peak upload memory for a file source is `n * chunk_size`, so keep `n` bounded. See [Concurrent chunked transfer](docs/concurrent-chunk-transfer.md). |
 | `build()` | Yes | Reads file metadata for file-backed uploads and returns `PounceTask`; may return `std::io::Error`. |
 
 Beginner tips:
@@ -333,9 +334,27 @@ When you do not attach a provider plugin, uploads use the built-in default proto
 | `with_breakpoint_download(download)` | Optional | Sets a per-task custom `BreakpointDownload`, such as Aliyun/Azure direct or presigned range download. |
 | `with_breakpoint_download_http(config)` | Optional | Overrides per-task range download HTTP behavior. |
 | `with_max_chunk_retries(retries)` | Optional | Sets additional retries after the first failed range chunk attempt. `0` disables chunk retry. Default is `3`. |
+| `with_max_parts_in_flight(n)` | Optional | Maximum range chunks of this file fetched **concurrently** (intra-file parallel download). Default `1` (strict serial, unchanged behavior). A value `> 1` is honored only when the download protocol proves range safety (`StandardRangeDownload` does) **and** the total size is known up front (`with_total_size` or a HEAD that returns `Content-Length`); otherwise the download stays serial. `0` is normalized to `1`. Peak download memory is `n * chunk_size`, so keep `n` bounded. |
+| `with_total_size(size)` | Optional | Supplies a known total size so the executor SKIPS the HEAD probe and builds the range grid directly. `0` (default) means "discover via HEAD". Required in practice to get intra-file concurrency for a URL whose server does not support HEAD (for example a presigned GET URL). |
 | `build()` | Yes | Returns `PounceTask`. Validation happens during enqueue/runtime. |
 
 Download HTTP methods are intentionally not configurable. Resumable HTTP download depends on standard `HEAD` and `GET` range behavior. If a gateway or provider needs a non-standard method, implement `BreakpointDownload` and inject it with `with_breakpoint_download(...)`.
+
+#### Range headers and query-embedded auth (presigned / SAS)
+
+Adding a `Range` header to a `GET` does **not** invalidate query-embedded authentication. RFC 7233 range requests carry the range in a request header, and presigned/SAS signatures (`sig`, `X-Amz-Signature`, …) cover the URL and query parameters, not arbitrary request headers — so the same signed range URL can be fetched in as many `Range` slices as you like, including concurrently. The range `Accept` header is overridable per task with `with_breakpoint_download_http(BreakpointDownloadHttpConfig { range_accept })`; if a strict Azure gateway also requires an explicit `x-ms-version`, add it (and any other provider header) through the task's base headers with `with_headers(...)`, which are applied to both the `HEAD` and the range `GET` — never by editing the signed URL.
+
+#### Concurrent-download resume semantics (`<file>.rcdl`)
+
+A concurrent download (`with_max_parts_in_flight(n)` with `n > 1`) always writes a `<file>.rcdl` ("resumable download log") sidecar next to the target. It records which fixed-size parts of the pre-sized file are durably on disk, so an interrupted transfer re-fetches only the missing parts. The sidecar **survives cancel/failure on purpose** so the next run can resume; it is deleted **only** on successful completion. A one-shot caller that will never resume can delete it manually.
+
+The sidecar is bound to `(URL identity, total, chunk, max_parts)` and to the target's on-disk length. If any of those differs on the next run — a different URL, a resized object, a different chunking, or a target that was deleted/truncated (so its length no longer equals `total`) — the stale sidecar is ignored and a **fresh full download** runs. It is never mis-applied to a target it does not match, so a leftover `.rcdl` can only ever cause a safe re-download, never silent corruption.
+
+For a step-by-step, beginner-friendly walkthrough of concurrent chunked upload **and** download — the two concurrency knobs, the parallel-safe protocol matrix, per-provider recipes, memory sizing, and `.rcdl` resume — see [Concurrent chunked transfer (single-file parallel parts)](docs/concurrent-chunk-transfer.md).
+
+#### Custom-protocol migration
+
+Existing custom `BreakpointDownload` implementations are unaffected: `supports_parallel_parts` defaults to `false`, so a custom protocol stays strictly serial until it explicitly overrides that to `true` (and only when each `range_url`/`merge_range_get_headers` result is independent of any other chunk's completion). Concurrency additionally requires the total size to be known — supply it with `with_total_size(...)` or via a HEAD that returns `Content-Length` — otherwise the transfer falls back to the serial path even for a range-safe protocol.
 
 ## Error handling and retries
 
@@ -367,6 +386,52 @@ Two builder knobs control how many times a failed step is retried before the tas
 Within those budgets the SDK only retries **transient transport failures** (connection reset, timeout, incomplete message), and it waits between attempts using **exponential backoff with jitter**, so a flaky network or a briefly overloaded server does not trigger a retry storm. Non-transient errors (an HTTP `403`, a malformed response, an invalid range) fail fast without consuming the retry budget, because retrying them would not help.
 
 To continue a task that ultimately failed (or that you paused), rebuild it and call `try_enqueue` again, or `resume(...)` a paused one; both continue from the last checkpoint. See [Resuming uploads and downloads after a restart](docs/resume-after-restart.md).
+
+## SDK debug logs: levels and what to persist
+
+`set_debug_log_listener(Some(listener))` installs one process-global callback that receives every `Log` the SDK emits. Each entry carries a `LogLevel` that tells you how to treat it. The levels are ordered by severity and are designed so you can split a high-volume diagnostic stream from a small, durable troubleshooting stream:
+
+| Level | What it is | Frequency | Persist? |
+|-------|------------|-----------|----------|
+| `Trace` | per-chunk / per-poll / per-retry hot-loop detail | very high | **No** — drop or sample only; never store |
+| `Debug` | low-volume internal diagnostics | a few per task | optional / short-term ring buffer only |
+| `Info` | normal operational notes | low | optional |
+| `Key` | task & executor **lifecycle checkpoints** (created, enqueued, started, prepared, resumed, completed, paused, cancelled, closed, listener changes) | a few per task | **Yes** — keep and forward when reporting a bug |
+| `Warn` | recoverable anomaly, caller misuse, backpressure, failed cleanup | per anomaly | **Yes** |
+| `Error` | a chunk/part upload or download **failed**, a task failed, an HTTP error, a signing failure, or a caught panic — with full structured context | per failure | **Yes** |
+
+**Rule of thumb:** persist everything at `>= LogLevel::Key` (`Key | Warn | Error`) and never persist the high-frequency `Trace` stream. The library exposes this policy so you do not have to hard-code it:
+
+```rust
+use std::sync::Arc;
+use rusty_cat::api::{Log, LogLevel, MeowClient, MeowConfig};
+
+let client = MeowClient::new(MeowConfig::default());
+client.set_debug_log_listener(Some(Arc::new(|log: Log| {
+    // Never store the high-frequency Trace tier — it fires per chunk/poll/retry.
+    if log.level() == LogLevel::Trace {
+        return;
+    }
+    if log.level().persist_recommended() {
+        // Key | Warn | Error → keep these and ship them to your log server.
+        ship_to_log_server(&log);
+    } else {
+        // Debug | Info → optional; a short-term in-memory ring buffer at most.
+        local_ring_buffer(&log);
+    }
+}))).unwrap();
+// where `ship_to_log_server` / `local_ring_buffer` are your own sinks.
+```
+
+When you hit a problem, **collect the persisted `Key + Warn + Error` entries and send them to the library author** — the `Key` checkpoints reconstruct what the task was doing and the `Error` entries pinpoint the failure.
+
+### Structured fields for triage
+
+Besides `log.level()`, `log.tag()` and `log.message()`, `Error` and `Key` entries may carry structured context you can index or filter on: `task_id()`, `object_key()`, `part_index()`, `offset()`, `byte_len()`, `http_status()`, `attempt()`, `max_retries()`, `error_code()`, and `url()`. `Log`'s `Display` also appends every present field as ` key=value`, so `format!("{log}")` is a self-describing line.
+
+### Secret safety
+
+The SDK never puts a raw SAS/presigned URL, signature, credential, response body, or request header into a log: URLs go through `sanitize_url()` (signature/credential query params are redacted) and error chains/response bodies go through `redact_secrets()` before they reach a `Log`. Both helpers are public (`rusty_cat::api::{sanitize_url, redact_secrets}`) so you can apply the same redaction to anything **you** add in a progress callback or debug listener — do not re-log a raw task URL or header map yourself.
 
 ## OSS upload/download developer guides
 

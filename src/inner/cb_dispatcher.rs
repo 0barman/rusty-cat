@@ -133,13 +133,13 @@ impl CbSubmit {
             match self.tx.try_send(CbJob::Progress { cb, dto }) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
-                    crate::meow_flow_log!(
+                    crate::meow_trace_log!(
                         "cb_dispatcher",
                         "transmission frame dropped: callback queue full"
                     );
                 }
                 Err(TrySendError::Disconnected(_)) => {
-                    crate::meow_flow_log!(
+                    crate::meow_trace_log!(
                         "cb_dispatcher",
                         "transmission frame dropped: dispatcher already shut down"
                     );
@@ -148,7 +148,7 @@ impl CbSubmit {
             return;
         }
         if let Err(e) = self.tx.send(CbJob::Progress { cb, dto }) {
-            crate::meow_flow_log!(
+            crate::meow_warn_log!(
                 "cb_dispatcher",
                 "terminal progress frame undelivered: dispatcher gone ({e})"
             );
@@ -162,7 +162,7 @@ impl CbSubmit {
             task_id,
             payload,
         }) {
-            crate::meow_flow_log!(
+            crate::meow_warn_log!(
                 "cb_dispatcher",
                 "complete callback undelivered: dispatcher gone ({e})"
             );
@@ -182,11 +182,18 @@ pub(crate) struct CbDispatcherJoin {
 impl CbDispatcherJoin {
     /// 阻塞等待分发线程退出。重复调用是安全的（第二次直接返回）。
     ///
-    /// 同样为了避免在 close 流程的"夹缝时刻"通过全局 debug 日志监听器影响
-    /// 并发的 listener 单元测试，这里不在 join 成功/失败路径主动 emit log。
+    /// 为了避免在 close 流程的"夹缝时刻"通过全局 debug 日志监听器影响并发的
+    /// listener 单元测试，join 成功路径保持静默（不主动 emit log）；仅当
+    /// `join()` 返回 `Err`（分发线程发生 panic）时才 emit 一条 Warn —— 这种
+    /// 情况罕见且可以接受。
     pub(crate) fn join(&mut self) {
         if let Some(h) = self.handle.take() {
-            let _ = h.join();
+            if h.join().is_err() {
+                crate::meow_warn_log!(
+                    "cb_dispatcher",
+                    "dispatcher thread panicked (join returned Err)"
+                );
+            }
         }
     }
 }
@@ -221,7 +228,7 @@ pub(crate) fn start() -> Result<(CbSubmit, CbDispatcherJoin), MeowError> {
                     CbJob::Progress { cb, dto } => {
                         let ret = catch_unwind(AssertUnwindSafe(|| cb(dto)));
                         if ret.is_err() {
-                            crate::meow_flow_log!(
+                            crate::meow_warn_log!(
                                 "cb_dispatcher",
                                 "progress callback panicked; isolated in dispatcher thread"
                             );
@@ -234,16 +241,25 @@ pub(crate) fn start() -> Result<(CbSubmit, CbDispatcherJoin), MeowError> {
                     } => {
                         let ret = catch_unwind(AssertUnwindSafe(|| cb(task_id, payload)));
                         if ret.is_err() {
-                            crate::meow_flow_log!(
-                                "cb_dispatcher",
-                                "complete callback panicked; isolated in dispatcher thread"
-                            );
+                            crate::log::emit_lazy(|| {
+                                crate::log::Log::warn(
+                                    "cb_dispatcher",
+                                    "complete callback panicked; isolated in dispatcher thread",
+                                )
+                                .with_task_id(task_id.to_string())
+                            });
                         }
                     }
                 }
             }
         })
         .map_err(|e| {
+            crate::log::emit_lazy(|| {
+                crate::log::Log::error(
+                    "cb_dispatcher",
+                    format!("spawn rusty-cat callback dispatcher thread failed: {e}"),
+                )
+            });
             MeowError::from_source(
                 InnerErrorCode::RuntimeCreationFailedError,
                 "spawn rusty-cat callback dispatcher thread failed",

@@ -23,8 +23,9 @@ pub use crate::http_breakpoint::{
 };
 pub use crate::ids::{GlobalProgressListenerId, TaskId};
 pub use crate::log::{
-    debug_log_listener_active, emit, emit_lazy, set_debug_log_listener, try_set_debug_log_listener,
-    DebugLogListener, DebugLogListenerError, Log, LogLevel,
+    debug_log_listener_active, emit, emit_lazy, redact_secrets, sanitize_url,
+    set_debug_log_listener, try_set_debug_log_listener, DebugLogListener, DebugLogListenerError,
+    Log, LogLevel,
 };
 pub use crate::meow_client::{GlobalProgressListener, MeowClient, TaskOutcome};
 pub use crate::meow_config::{MeowConfig, MeowConfigBuilder};

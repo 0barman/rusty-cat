@@ -12,6 +12,8 @@
 
 use std::collections::BTreeSet;
 
+use crate::{InnerErrorCode, MeowError};
+
 /// Bounded windowed dispatcher + contiguous-prefix tracker for one file's
 /// parallel parts. Pure logic, no I/O.
 pub(crate) struct PartWindow {
@@ -61,21 +63,30 @@ impl PartWindow {
     }
 
     /// Records a successfully-completed part by its start offset, then advances
-    /// the contiguous watermark over any now-contiguous completed parts. Returns
-    /// the new watermark iff it advanced (so the caller emits exactly one
-    /// Progress); `None` means the part landed above a still-open hole.
-    pub(crate) fn on_done(&mut self, offset: u64) -> Option<u64> {
-        debug_assert!(self.in_flight > 0, "on_done without a matching dispatch");
-        self.in_flight = self.in_flight.saturating_sub(1);
+    /// the contiguous watermark over any now-contiguous completed parts.
+    ///
+    /// Returns `Ok(Some(watermark))` iff the watermark advanced (so the caller
+    /// emits exactly one Progress); `Ok(None)` means the part landed above a
+    /// still-open hole. Returns `Err` if called without a matching dispatch
+    /// (`in_flight == 0`) — an internal accounting violation surfaced as an
+    /// error instead of a panic, so the executor can fail the task gracefully.
+    pub(crate) fn on_done(&mut self, offset: u64) -> Result<Option<u64>, MeowError> {
+        if self.in_flight == 0 {
+            return Err(MeowError::from_code_str(
+                InnerErrorCode::InvalidTaskState,
+                "internal: on_done called without a matching dispatch",
+            ));
+        }
+        self.in_flight -= 1;
         self.completed.insert(offset);
         let before = self.watermark;
         while self.watermark < self.total && self.completed.remove(&self.watermark) {
             self.watermark = (self.watermark + self.chunk).min(self.total);
         }
         if self.watermark != before {
-            Some(self.watermark)
+            Ok(Some(self.watermark))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -123,7 +134,7 @@ mod tests {
         // Window full at 2 in flight.
         assert_eq!(w.take_dispatch(), None);
         // Completing one frees a slot; next offset continues the sequence.
-        assert_eq!(w.on_done(0), Some(10));
+        assert_eq!(w.on_done(0).unwrap(), Some(10));
         assert_eq!(w.take_dispatch(), Some(20));
     }
 
@@ -135,9 +146,9 @@ mod tests {
         w.take_dispatch();
         w.take_dispatch();
         w.take_dispatch();
-        assert_eq!(w.on_done(0), Some(10));
-        assert_eq!(w.on_done(10), Some(20));
-        assert_eq!(w.on_done(20), Some(30));
+        assert_eq!(w.on_done(0).unwrap(), Some(10));
+        assert_eq!(w.on_done(10).unwrap(), Some(20));
+        assert_eq!(w.on_done(20).unwrap(), Some(30));
         assert!(w.is_complete());
     }
 
@@ -148,14 +159,14 @@ mod tests {
         w.take_dispatch(); // 10
         w.take_dispatch(); // 20
         // Highest part lands first: watermark must NOT move (hole at 0..20).
-        assert_eq!(w.on_done(20), None);
+        assert_eq!(w.on_done(20).unwrap(), None);
         assert_eq!(w.watermark(), 0);
         assert!(!w.is_complete());
         // Middle part lands: still a hole at 0..10.
-        assert_eq!(w.on_done(10), None);
+        assert_eq!(w.on_done(10).unwrap(), None);
         assert_eq!(w.watermark(), 0);
         // First part fills the gap: watermark jumps over ALL contiguous parts.
-        assert_eq!(w.on_done(0), Some(30));
+        assert_eq!(w.on_done(0).unwrap(), Some(30));
         assert_eq!(w.watermark(), 30);
         assert!(w.is_complete());
     }
@@ -167,10 +178,10 @@ mod tests {
         w.take_dispatch();
         w.take_dispatch();
         w.take_dispatch();
-        w.on_done(0);
-        w.on_done(10);
+        w.on_done(0).unwrap();
+        w.on_done(10).unwrap();
         // Completing the short last part must reach exactly total, not 30.
-        assert_eq!(w.on_done(20), Some(25));
+        assert_eq!(w.on_done(20).unwrap(), Some(25));
         assert_eq!(w.watermark(), 25);
         assert!(w.is_complete());
     }
@@ -183,10 +194,10 @@ mod tests {
         w.take_dispatch(); // 0
         w.take_dispatch(); // 10
         // First completes, watermark=10, but a part is still in flight.
-        w.on_done(0);
+        w.on_done(0).unwrap();
         assert!(!w.is_complete());
         // Second completes, watermark=20 and in_flight back to 0.
-        w.on_done(10);
+        w.on_done(10).unwrap();
         assert!(w.is_complete());
     }
 
@@ -212,8 +223,8 @@ mod tests {
         assert_eq!(w.take_dispatch(), Some(10));
         assert_eq!(w.take_dispatch(), Some(20));
         assert_eq!(w.take_dispatch(), None);
-        assert_eq!(w.on_done(10), Some(20));
-        assert_eq!(w.on_done(20), Some(30));
+        assert_eq!(w.on_done(10).unwrap(), Some(20));
+        assert_eq!(w.on_done(20).unwrap(), Some(30));
         assert!(w.is_complete());
     }
 

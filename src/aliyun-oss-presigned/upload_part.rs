@@ -26,13 +26,18 @@ pub fn upload_part_with_expiry(
 fn provider_part_id(part_number: u64) -> String {
     match PART_NUMBER_PROVIDER_ID_RADIX {
         10 => part_number.to_string(),
-        radix => format_radix(part_number, radix),
+        radix if (2..=36).contains(&radix) => format_radix(part_number, radix),
+        // A radix outside 2..=36 has no valid digit alphabet and would otherwise
+        // index `DIGITS` out of bounds (a panic in both debug and release). Fall
+        // back to base-10 so a misconfigured constant degrades instead of crashing.
+        _ => part_number.to_string(),
     }
 }
 
+/// Formats `value` in `radix`. The caller guarantees `2 <= radix <= 36`, which
+/// keeps the `DIGITS` index in bounds.
 fn format_radix(mut value: u64, radix: u32) -> String {
     const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-    debug_assert!((2..=36).contains(&radix));
     if value == 0 {
         return "0".to_string();
     }

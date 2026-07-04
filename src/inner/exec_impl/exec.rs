@@ -45,27 +45,39 @@ pub(crate) async fn try_start_next(
             state.queued_set_mut().remove(&key);
 
             if state.paused_set().contains(&key) {
-                crate::meow_flow_log!("scheduler", "skip key paused (requeue): key={:?}", key);
+                crate::meow_flow_log!(
+                    "scheduler",
+                    "skip key paused (requeue): key={}",
+                    crate::inner::safe_key(&key)
+                );
                 state.queued_mut().push_back(key.clone());
                 state.queued_set_mut().insert(key.clone());
                 continue;
             }
             if state.active().contains_key(&key) {
-                crate::meow_flow_log!("scheduler", "skip key already active: key={:?}", key);
+                crate::meow_flow_log!(
+                    "scheduler",
+                    "skip key already active: key={}",
+                    crate::inner::safe_key(&key)
+                );
                 state.queued_mut().push_back(key.clone());
                 state.queued_set_mut().insert(key.clone());
                 continue;
             }
             let Some(group) = state.groups().get(&key) else {
-                crate::meow_flow_log!("scheduler", "skip key missing group state: key={:?}", key);
+                crate::meow_warn_log!(
+                    "scheduler",
+                    "skip key missing group state: key={}",
+                    crate::inner::safe_key(&key)
+                );
                 continue;
             };
             let direction = key.0;
             if !can_start_direction(state, direction) {
-                crate::meow_flow_log!(
+                crate::meow_trace_log!(
                     "scheduler",
-                    "direction concurrency full, requeue key={:?} dir={:?}",
-                    key,
+                    "direction concurrency full, requeue key={} dir={:?}",
+                    crate::inner::safe_key(&key),
                     direction
                 );
                 state.queued_mut().push_back(key.clone());
@@ -97,10 +109,10 @@ pub(crate) async fn try_start_next(
             let worker_tx_clone = worker_tx.clone();
             let executor = executor.clone();
             let start_offset = state.offsets().get(&key).copied().unwrap_or(0);
-            crate::meow_flow_log!(
+            crate::meow_key_log!(
                 "scheduler",
-                "start key={:?} from offset={} chunk_size={}",
-                key,
+                "start key={} from offset={} chunk_size={}",
+                crate::inner::safe_key(&key),
                 start_offset,
                 inner.chunk_size()
             );
@@ -115,6 +127,18 @@ pub(crate) async fn try_start_next(
                         InnerErrorCode::Unknown,
                         format!("run_group task panicked: {}", join_err),
                     );
+                    let err_code = err.code();
+                    crate::log::emit_lazy(|| {
+                        crate::log::Log::error(
+                            "run_group",
+                            format!(
+                                "run_group task panicked: key={} err={}",
+                                crate::inner::safe_key(&panic_key),
+                                crate::log::redact_secrets(&err.to_string())
+                            ),
+                        )
+                        .with_error_code(err_code)
+                    });
                     let _ = panic_tx
                         .send(WorkerEvent::Failed {
                             key: panic_key,
@@ -162,10 +186,10 @@ async fn run_group(
     executor: Arc<dyn TransferTrait>,
     start_offset: u64,
 ) {
-    crate::meow_flow_log!(
+    crate::meow_key_log!(
         "run_group",
-        "run_group begin: key={:?} task_id={:?} start_offset={}",
-        key,
+        "run_group begin: key={} task_id={:?} start_offset={}",
+        crate::inner::safe_key(&key),
         inner.task_id(),
         start_offset
     );
@@ -200,26 +224,38 @@ async fn run_group(
                     && crate::inner::exec_impl::retry::is_connection_layer_retryable(&e);
                 let reached_limit = prep_attempt >= max_prep_retries;
                 if !retryable || reached_limit {
-                    crate::meow_flow_log!(
-                        "run_group",
-                        "prepare failed: key={:?} task_id={:?} err={}",
-                        key,
-                        inner.task_id(),
-                        e
-                    );
+                    crate::log::emit_lazy(|| {
+                        let mut log = crate::log::Log::error(
+                            "run_group",
+                            format!(
+                                "prepare failed: key={} err={}",
+                                crate::inner::safe_key(&key),
+                                crate::log::redact_secrets(&e.to_string())
+                            ),
+                        )
+                        .with_task_id(inner.task_id().to_string())
+                        .with_offset(start_offset)
+                        .with_attempt(prep_attempt)
+                        .with_max_retries(max_prep_retries)
+                        .with_error_code(e.code());
+                        if let Some(status) = e.http_status() {
+                            log = log.with_http_status(status);
+                        }
+                        log
+                    });
                     let _ = worker_tx.send(WorkerEvent::Failed { key, error: e }).await;
                     return;
                 }
                 let delay_ms =
                     crate::inner::exec_impl::retry::calc_backoff_with_jitter_ms(prep_attempt);
-                crate::meow_flow_log!(
+                crate::meow_warn_log!(
                     "run_group",
-                    "prepare retry scheduled: key={:?} task_id={:?} attempt={} delay_ms={} err={}",
-                    key,
+                    "prepare retry scheduled: key={} task_id={:?} attempt={} delay_ms={} err={}",
+                    crate::inner::safe_key(&key),
                     inner.task_id(),
                     prep_attempt + 1,
                     delay_ms,
-                    e
+                    crate::log::redact_secrets(&e.to_string())
                 );
                 tokio::select! {
                     _ = cancel.cancelled() => {
@@ -250,7 +286,9 @@ async fn run_group(
     // 单文件内多分片并发（opt-in，optimization ④）：仅当调用方放大了
     // `max_parts_in_flight` 且所选协议证明乱序安全时，走窗口化并发路径；否则
     // （默认 `==1` / 不支持的协议）落到下面逐字未变的串行 loop，行为字节一致。
-    if inner.max_parts_in_flight() > 1 && executor.supports_parallel_parts(&task) {
+    // A windowed download needs a known total to build the part grid and pre-size
+    // the file; when the size is unknown (0), fall back to the serial loop.
+    if inner.max_parts_in_flight() > 1 && known_total > 0 && executor.supports_parallel_parts(&task) {
         run_group_parallel(
             key,
             &inner,
@@ -266,10 +304,10 @@ async fn run_group(
     }
     loop {
         if cancel.is_cancelled() {
-            crate::meow_flow_log!(
+            crate::meow_key_log!(
                 "run_group",
-                "cancellation observed: key={:?} task_id={:?} offset={}",
-                key,
+                "cancellation observed: key={} task_id={:?} offset={}",
+                crate::inner::safe_key(&key),
                 inner.task_id(),
                 offset
             );
@@ -294,10 +332,10 @@ async fn run_group(
         {
             crate::inner::exec_impl::retry::ChunkRetryResult::Done(v) => v,
             crate::inner::exec_impl::retry::ChunkRetryResult::Cancelled => {
-                crate::meow_flow_log!(
+                crate::meow_key_log!(
                     "run_group",
-                    "chunk retry interrupted by cancellation: key={:?} task_id={:?} offset={}",
-                    key,
+                    "chunk retry interrupted by cancellation: key={} task_id={:?} offset={}",
+                    crate::inner::safe_key(&key),
                     inner.task_id(),
                     offset
                 );
@@ -305,14 +343,25 @@ async fn run_group(
                 return;
             }
             crate::inner::exec_impl::retry::ChunkRetryResult::Failed(e) => {
-                crate::meow_flow_log!(
-                    "run_group",
-                    "chunk retry exhausted or non-retryable: key={:?} task_id={:?} offset={} err={}",
-                    key,
-                    inner.task_id(),
-                    offset,
-                    e
-                );
+                crate::log::emit_lazy(|| {
+                    let mut log = crate::log::Log::error(
+                        "run_group",
+                        format!(
+                            "chunk retry exhausted or non-retryable: key={} offset={} err={}",
+                            crate::inner::safe_key(&key),
+                            offset,
+                            crate::log::redact_secrets(&e.to_string())
+                        ),
+                    )
+                    .with_task_id(inner.task_id().to_string())
+                    .with_offset(offset)
+                    .with_byte_len(inner.chunk_size())
+                    .with_error_code(e.code());
+                    if let Some(status) = e.http_status() {
+                        log = log.with_http_status(status);
+                    }
+                    log
+                });
                 let _ = worker_tx.send(WorkerEvent::Failed { key, error: e }).await;
                 return;
             }
@@ -329,10 +378,10 @@ async fn run_group(
             })
             .await;
         if outcome.done {
-            crate::meow_flow_log!(
+            crate::meow_key_log!(
                 "run_group",
-                "run_group completed: key={:?} task_id={:?} final_offset={} total={}",
-                key,
+                "run_group completed: key={} task_id={:?} final_offset={} total={}",
+                crate::inner::safe_key(&key),
                 inner.task_id(),
                 offset,
                 known_total
@@ -412,26 +461,70 @@ async fn run_group_parallel(
     use crate::inner::exec_impl::part_window::PartWindow;
     use crate::inner::exec_impl::retry::ChunkRetryResult;
 
-    crate::meow_flow_log!(
+    crate::meow_key_log!(
         "run_group_parallel",
-        "begin: key={:?} task_id={:?} start_offset={} total={} max_parts={}",
-        key,
+        "begin: key={} task_id={:?} start_offset={} total={} max_parts={}",
+        crate::inner::safe_key(&key),
         inner.task_id(),
         start_offset,
         known_total,
         inner.max_parts_in_flight()
     );
 
-    // Resume already at total: match the serial `offset >= total` early return,
-    // which emits Completed WITHOUT a finalize call.
+    // Resume already at total: every part is already durably written.
+    //
+    // For a DOWNLOAD, `start_offset` is the sidecar's contiguous watermark, so
+    // `watermark == total` means the whole file is on disk but the `.rcdl`
+    // sidecar may still exist. Finalize here so `complete()` can validate the
+    // final length and delete the sidecar; otherwise a `.rcdl` that survived a
+    // crash-before-cleanup leaks forever and a later serial re-download trips
+    // the cross-mode guard. `download_prepare` has already populated
+    // `download_progress()`, so `complete()` has what it needs to validate.
+    //
+    // For an UPLOAD (and any non-download) keep the existing behavior exactly:
+    // emit Completed WITHOUT re-finalizing, preserving the "already-complete
+    // upload resume emits Completed without re-running complete" semantics.
     if start_offset >= known_total {
-        let _ = worker_tx
-            .send(WorkerEvent::Completed {
-                key,
-                total_size: known_total,
-                completion_payload: None,
-            })
-            .await;
+        if task.direction() == Direction::Download {
+            match executor.complete(task).await {
+                Ok(payload) => {
+                    let _ = worker_tx
+                        .send(WorkerEvent::Completed {
+                            key,
+                            total_size: known_total,
+                            completion_payload: payload,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    crate::log::emit_lazy(|| {
+                        let mut log = crate::log::Log::error(
+                            "run_group_parallel",
+                            format!(
+                                "download finalize at total failed: key={} err={}",
+                                crate::inner::safe_key(&key),
+                                crate::log::redact_secrets(&e.to_string())
+                            ),
+                        )
+                        .with_task_id(inner.task_id().to_string())
+                        .with_error_code(e.code());
+                        if let Some(status) = e.http_status() {
+                            log = log.with_http_status(status);
+                        }
+                        log
+                    });
+                    let _ = worker_tx.send(WorkerEvent::Failed { key, error: e }).await;
+                }
+            }
+        } else {
+            let _ = worker_tx
+                .send(WorkerEvent::Completed {
+                    key,
+                    total_size: known_total,
+                    completion_payload: None,
+                })
+                .await;
+        }
         return;
     }
 
@@ -464,27 +557,57 @@ async fn run_group_parallel(
                     InnerErrorCode::Unknown,
                     format!("upload part task panicked: {join_err}"),
                 );
-                crate::meow_flow_log!(
-                    "run_group_parallel",
-                    "part task panicked: key={:?} task_id={:?} err={}",
-                    key,
-                    inner.task_id(),
-                    err
-                );
+                crate::log::emit_lazy(|| {
+                    crate::log::Log::error(
+                        "run_group_parallel",
+                        format!(
+                            "part task panicked: key={} err={}",
+                            crate::inner::safe_key(&key),
+                            crate::log::redact_secrets(&err.to_string())
+                        ),
+                    )
+                    .with_task_id(inner.task_id().to_string())
+                    .with_error_code(err.code())
+                });
                 let _ = worker_tx.send(WorkerEvent::Failed { key, error: err }).await;
                 return;
             }
             Ok((off, ChunkRetryResult::Done(_))) => {
-                if let Some(watermark) = window.on_done(off) {
+                match window.on_done(off) {
                     // Emit ONE coalesced Progress only when the contiguous
                     // prefix advances — never a raw per-part offset.
-                    let _ = worker_tx
-                        .send(WorkerEvent::Progress {
-                            key: key.clone(),
-                            next_offset: watermark,
-                            total_size: known_total,
-                        })
-                        .await;
+                    Ok(Some(watermark)) => {
+                        let _ = worker_tx
+                            .send(WorkerEvent::Progress {
+                                key: key.clone(),
+                                next_offset: watermark,
+                                total_size: known_total,
+                            })
+                            .await;
+                    }
+                    Ok(None) => {}
+                    // Internal accounting violation: record it as a failure and
+                    // stop dispatching; keep draining in-flight siblings so a
+                    // single terminal event is still emitted after the barrier.
+                    Err(e) => {
+                        crate::log::emit_lazy(|| {
+                            crate::log::Log::error(
+                                "run_group_parallel",
+                                format!(
+                                    "part window on_done invalid task state: key={} part_offset={} err={}",
+                                    crate::inner::safe_key(&key),
+                                    off,
+                                    crate::log::redact_secrets(&e.to_string())
+                                ),
+                            )
+                            .with_task_id(inner.task_id().to_string())
+                            .with_offset(off)
+                            .with_error_code(e.code())
+                        });
+                        if failed.is_none() {
+                            failed = Some(e);
+                        }
+                    }
                 }
                 // Top up the window only while still healthy.
                 if !cancelled && failed.is_none() {
@@ -517,34 +640,74 @@ async fn run_group_parallel(
     // prioritizing a genuine failure over a cancel (the retry layer already maps
     // user-cancel in-flight errors to Cancelled, so `failed` means a real error).
     if let Some(e) = failed {
-        crate::meow_flow_log!(
-            "run_group_parallel",
-            "failed after drain: key={:?} task_id={:?} err={}",
-            key,
-            inner.task_id(),
-            e
-        );
+        crate::log::emit_lazy(|| {
+            let mut log = crate::log::Log::error(
+                "run_group_parallel",
+                format!(
+                    "failed after drain: key={} err={}",
+                    crate::inner::safe_key(&key),
+                    crate::log::redact_secrets(&e.to_string())
+                ),
+            )
+            .with_task_id(inner.task_id().to_string())
+            .with_error_code(e.code());
+            if let Some(status) = e.http_status() {
+                log = log.with_http_status(status);
+            }
+            log
+        });
         let _ = worker_tx.send(WorkerEvent::Failed { key, error: e }).await;
     } else if cancelled || cancel.is_cancelled() {
         // FLAW-1: re-check cancel right before finalizing so `complete` can never
         // race the `abort_upload` that `cancel_group` issues; treat a late cancel
         // as Canceled even if every part already finished.
-        crate::meow_flow_log!(
+        crate::meow_key_log!(
             "run_group_parallel",
-            "canceled after drain: key={:?} task_id={:?} watermark={}",
-            key,
+            "canceled after drain: key={} task_id={:?} watermark={}",
+            crate::inner::safe_key(&key),
             inner.task_id(),
             window.watermark()
         );
         let _ = worker_tx.send(WorkerEvent::Canceled { key }).await;
     } else {
-        debug_assert!(window.is_complete(), "complete fired before contiguous prefix reached total");
+        if !window.is_complete() {
+            // Internal invariant: the success path must finalize only a fully
+            // contiguous prefix. If somehow not complete, fail the file instead
+            // of completing a possibly-incomplete remote object (a debug_assert
+            // here would be stripped in release and silently complete bad data).
+            let err = MeowError::from_code(
+                InnerErrorCode::Unknown,
+                format!(
+                    "internal: complete fired before contiguous prefix reached total (watermark={}, total={})",
+                    window.watermark(),
+                    known_total
+                ),
+            );
+            crate::log::emit_lazy(|| {
+                let mut log = crate::log::Log::error(
+                    "run_group_parallel",
+                    format!(
+                        "invariant violation before complete: key={} err={}",
+                        crate::inner::safe_key(&key),
+                        crate::log::redact_secrets(&err.to_string())
+                    ),
+                )
+                .with_task_id(inner.task_id().to_string())
+                .with_error_code(err.code());
+                if let Some(status) = err.http_status() {
+                    log = log.with_http_status(status);
+                }
+                log
+            });
+            let _ = worker_tx.send(WorkerEvent::Failed { key, error: err }).await;
+            return;
+        }
         match executor.complete(task).await {
             Ok(completion_payload) => {
-                crate::meow_flow_log!(
+                crate::meow_key_log!(
                     "run_group_parallel",
-                    "completed: key={:?} task_id={:?} total={}",
-                    key,
+                    "completed: key={} task_id={:?} total={}",
+                    crate::inner::safe_key(&key),
                     inner.task_id(),
                     known_total
                 );
@@ -557,13 +720,22 @@ async fn run_group_parallel(
                     .await;
             }
             Err(e) => {
-                crate::meow_flow_log!(
-                    "run_group_parallel",
-                    "complete call failed: key={:?} task_id={:?} err={}",
-                    key,
-                    inner.task_id(),
-                    e
-                );
+                crate::log::emit_lazy(|| {
+                    let mut log = crate::log::Log::error(
+                        "run_group_parallel",
+                        format!(
+                            "complete call failed: key={} err={}",
+                            crate::inner::safe_key(&key),
+                            crate::log::redact_secrets(&e.to_string())
+                        ),
+                    )
+                    .with_task_id(inner.task_id().to_string())
+                    .with_error_code(e.code());
+                    if let Some(status) = e.http_status() {
+                        log = log.with_http_status(status);
+                    }
+                    log
+                });
                 let _ = worker_tx.send(WorkerEvent::Failed { key, error: e }).await;
             }
         }
