@@ -3,6 +3,7 @@ use reqwest::header::{CONTENT_LENGTH, ETAG};
 use reqwest::{Client, Method};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::fs::OpenOptions;
 use tokio::time::sleep;
 
 use crate::chunk_outcome::ChunkOutcome;
@@ -17,7 +18,8 @@ use crate::transfer_executor_trait::TransferTrait;
 use crate::transfer_task::TransferTask;
 
 use super::default_http_transfer_chunks::{
-    download_one_chunk, map_reqwest, upload_one_chunk, upload_one_chunk_part,
+    download_one_chunk, download_one_chunk_part_positioned, map_reqwest, upload_one_chunk,
+    upload_one_chunk_part,
 };
 
 /// Creates default breakpoint protocol instances.
@@ -137,10 +139,10 @@ impl DefaultHttpTransfer {
         let client = match build_internal_client(http_timeout, tcp_keepalive) {
             Ok(c) => c,
             Err(e) => {
-                crate::meow_flow_log!(
+                crate::meow_warn_log!(
                     "http_client",
                     "with_http_timeouts build failed, fallback to Client::new(): {}",
-                    e
+                    crate::log::redact_secrets(&e.to_string())
                 );
                 Client::new()
             }
@@ -293,7 +295,7 @@ async fn upload_prepare(
         match upload_prepare_once(client, task, upload.clone(), local_offset).await {
             Ok(outcome) => {
                 if attempt > 0 {
-                    crate::meow_flow_log!(
+                    crate::meow_key_log!(
                         "upload_prepare",
                         "prepare retry recovered: file={} attempts_used={}",
                         task.file_name(),
@@ -306,25 +308,37 @@ async fn upload_prepare(
                 let retryable = crate::inner::exec_impl::retry::is_transport_retryable(&err);
                 let reached_limit = attempt >= max_retries;
                 if !retryable || reached_limit {
-                    crate::meow_flow_log!(
-                        "upload_prepare",
-                        "prepare give up: file={} attempt={} max_retries={} retryable={} err={}",
-                        task.file_name(),
-                        attempt,
-                        max_retries,
-                        retryable,
-                        err
-                    );
+                    crate::log::emit_lazy(|| {
+                        let mut log = crate::log::Log::error(
+                            "upload_prepare",
+                            format!(
+                                "prepare give up: file={} attempt={} max_retries={} retryable={} err={}",
+                                task.file_name(),
+                                attempt,
+                                max_retries,
+                                retryable,
+                                crate::log::redact_secrets(&err.to_string())
+                            ),
+                        )
+                        .with_key(task.file_name())
+                        .with_offset(local_offset)
+                        .with_attempt(attempt)
+                        .with_max_retries(max_retries);
+                        if let Some(s) = err.http_status() {
+                            log = log.with_http_status(s);
+                        }
+                        log
+                    });
                     return Err(err);
                 }
                 let delay_ms = crate::inner::exec_impl::retry::calc_backoff_with_jitter_ms(attempt);
-                crate::meow_flow_log!(
+                crate::meow_warn_log!(
                     "upload_prepare",
                     "prepare retry scheduled: file={} next_attempt={} delay_ms={} err={}",
                     task.file_name(),
                     attempt + 1,
                     delay_ms,
-                    err
+                    crate::log::redact_secrets(&err.to_string())
                 );
                 sleep(Duration::from_millis(delay_ms)).await;
                 attempt += 1;
@@ -346,9 +360,15 @@ async fn upload_prepare_once(
             local_offset,
         })
         .await?;
+    crate::meow_key_log!(
+        "upload_prepare",
+        "prepare protocol completed: file={} local_offset={}",
+        task.file_name(),
+        local_offset
+    );
     if info.completed_file_id.is_some() {
         let total = task.total_size();
-        crate::meow_flow_log!(
+        crate::meow_key_log!(
             "upload_prepare",
             "server indicates upload already complete: file={} total={}",
             task.file_name(),
@@ -374,6 +394,169 @@ async fn upload_prepare_once(
     })
 }
 
+/// Whether this download task should take the concurrent path (same condition
+/// as the executor gate, evaluable from a task snapshot).
+fn download_is_parallel(
+    task: &TransferTask,
+    download: &Arc<dyn BreakpointDownload + Send + Sync>,
+) -> bool {
+    task.direction() == Direction::Download
+        && task.max_parts_in_flight() > 1
+        && download.supports_parallel_parts()
+}
+
+/// Stable identity for a download target, binding a `.rcdl` sidecar to this URL
+/// so a same-path/different-URL re-download does not reuse stale bits. A cheap
+/// FNV-1a of the range URL is sufficient (no crypto needed).
+fn download_identity(url: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in url.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x00000100000001B3);
+    }
+    format!("{h:016x}")
+}
+
+/// Shared tail of [`download_prepare`]: given a resolved remote `total`
+/// (`0` == unknown) and the local resume `start`, either drives the concurrent
+/// pre-size + `.rcdl` sidecar path, or the serial length-based path. Splitting
+/// this out lets every size source (hint / `with_total_size` / HEAD) run the
+/// exact same branch without duplicating it or re-indenting the HEAD block.
+async fn download_prepare_finish(
+    task: &TransferTask,
+    download: &Arc<dyn BreakpointDownload + Send + Sync>,
+    start: u64,
+    total: u64,
+) -> Result<PrepareOutcome, MeowError> {
+    let path = task.file_path();
+    if download_is_parallel(task, download) {
+        if total == 0 {
+            // Unknown size cannot be windowed; let the caller fall back to serial.
+            return Ok(PrepareOutcome {
+                next_offset: 0,
+                total_size: 0,
+            });
+        }
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                    MeowError::from_io(
+                        format!("create download dir failed: {}", parent.display()),
+                        e,
+                    )
+                })?;
+            }
+        }
+        // Load (or create) the sidecar BEFORE presizing the target file. The
+        // sidecar's own safety guard only invalidates a stale `.rcdl` when the
+        // target's on-disk length differs from `total`; if we presized first,
+        // the length would already equal `total` and the guard could never
+        // fire, letting a stale bitmap survive a deleted/truncated target.
+        let identity = download_identity(&download.range_url(task));
+        let progress = crate::dflt::download_progress::DownloadProgress::load_or_create(
+            path,
+            total,
+            task.chunk_size(),
+            task.max_parts_in_flight(),
+            &identity,
+        )
+        .map_err(|e| MeowError::from_io("load .rcdl sidecar failed".to_string(), e))?;
+        let watermark = progress.contiguous_watermark();
+
+        // Pre-size once so every part can positioned-write into its slot. Never
+        // truncate: on resume the file already holds partial bytes that the
+        // sidecar bitmap accounts for; `set_len(total)` only fixes the length.
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .await
+            .map_err(|e| {
+                MeowError::from_io(format!("open for presize failed: {}", path.display()), e)
+            })?;
+        file.set_len(total)
+            .await
+            .map_err(|e| MeowError::from_io("presize set_len failed".to_string(), e))?;
+        file.sync_all()
+            .await
+            .map_err(|e| MeowError::from_io("presize sync failed".to_string(), e))?;
+        drop(file);
+
+        if let Ok(mut slot) = task.download_progress().try_lock() {
+            *slot = Some(progress);
+        } else {
+            // The slot is task-owned and only touched here before dispatch; a
+            // contended lock is an internal invariant violation.
+            return Err(MeowError::from_code_str(
+                InnerErrorCode::InvalidTaskState,
+                "download progress slot unexpectedly locked during prepare",
+            ));
+        }
+        crate::meow_key_log!(
+            "download_prepare",
+            "prepared concurrent download: resume_watermark={} remote_total={}",
+            watermark,
+            total
+        );
+        return Ok(PrepareOutcome {
+            next_offset: watermark,
+            total_size: total,
+        });
+    }
+
+    // Serial path: guard against silently "completing" a pre-sized file left by
+    // a prior parallel run (its length == total would otherwise look finished).
+    if crate::dflt::download_progress::DownloadProgress::sidecar_exists(path) {
+        return Err(MeowError::from_code_str(
+            InnerErrorCode::InvalidTaskState,
+            "found an in-progress parallel download sidecar (.rcdl); resume with \
+             max_parts_in_flight > 1, or delete the sidecar and the partial file",
+        ));
+    }
+
+    // Existing serial length-based outcome (resume from the local length).
+    if start > total {
+        crate::log::emit_lazy(|| {
+            crate::log::Log::error(
+                "download_prepare",
+                format!(
+                    "invalid local length larger than remote: local={} remote={}",
+                    start, total
+                ),
+            )
+            .with_key(task.file_name())
+            .with_offset(start)
+        });
+        return Err(MeowError::from_code_str(
+            InnerErrorCode::InvalidRange,
+            "local file larger than remote total size",
+        ));
+    }
+    if start >= total {
+        crate::meow_key_log!(
+            "download_prepare",
+            "already complete by local length: local={} remote={}",
+            start,
+            total
+        );
+        return Ok(PrepareOutcome {
+            next_offset: total,
+            total_size: total,
+        });
+    }
+    crate::meow_key_log!(
+        "download_prepare",
+        "prepared resume offset: start={} remote_total={}",
+        start,
+        total
+    );
+    Ok(PrepareOutcome {
+        next_offset: start,
+        total_size: total,
+    })
+}
+
 /// Runs download prepare stage and computes resume offset/total size.
 async fn download_prepare(
     client: &reqwest::Client,
@@ -394,6 +577,13 @@ async fn download_prepare(
         // a fresh download rather than a mid-transfer removal.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0u64,
         Err(e) => {
+            crate::log::emit_lazy(|| {
+                crate::log::Log::error(
+                    "download_prepare",
+                    format!("stat failed: path={} err={}", path.display(), e),
+                )
+                .with_key(task.file_name())
+            });
             return Err(MeowError::from_io(
                 format!("download_prepare stat failed: {}", path.display()),
                 e,
@@ -403,49 +593,78 @@ async fn download_prepare(
 
     // Use local persisted length as resume start to avoid sparse gaps.
     let start = local_len;
-    if let Some(total) = download.total_size_hint(task) {
-        if start > total {
-            crate::meow_flow_log!(
-                "download_prepare",
-                "invalid local length larger than hinted remote: local={} remote={}",
-                start,
-                total
-            );
-            return Err(MeowError::from_code_str(
-                InnerErrorCode::InvalidRange,
-                "local file larger than hinted remote total size",
-            ));
-        }
-        crate::meow_flow_log!(
+
+    // Resolve the remote total size. Order (first non-zero source wins):
+    //   1) protocol `total_size_hint` (e.g. presigned downloads),
+    //   2) builder-supplied `task.total_size()` (`with_total_size`),
+    //   3) a HEAD request (only when both hints are absent/zero).
+    // Whichever source resolves `total`, the same parallel/serial branch runs.
+    if let Some(hinted) = download.total_size_hint(task) {
+        crate::meow_key_log!(
             "download_prepare",
-            "prepared from total_size_hint: start={} remote_total={}",
+            "resolved total from total_size_hint: start={} remote_total={}",
             start,
-            total
+            hinted
         );
-        return Ok(PrepareOutcome {
-            next_offset: start.min(total),
-            total_size: total,
-        });
+        return download_prepare_finish(task, &download, start, hinted).await;
+    }
+    if task.total_size() > 0 {
+        // Builder supplied a known size via with_total_size(): skip HEAD.
+        let hinted = task.total_size();
+        crate::meow_key_log!(
+            "download_prepare",
+            "resolved total from with_total_size: start={} remote_total={}",
+            start,
+            hinted
+        );
+        return download_prepare_finish(task, &download, start, hinted).await;
     }
 
     let head_url = download.head_url(task);
     let mut head_headers = task.headers().clone();
-    download.merge_head_headers(DownloadHeadCtx {
-        task,
-        base: &mut head_headers,
-    })?;
+    download
+        .merge_head_headers(DownloadHeadCtx {
+            task,
+            base: &mut head_headers,
+        })
+        .map_err(|e| {
+            crate::log::emit_lazy(|| {
+                crate::log::Log::warn(
+                    "head",
+                    format!("merge_head_headers failed: err={}", crate::log::redact_secrets(&e.to_string())),
+                )
+                .with_key(task.file_name())
+                .with_url(head_url.as_str())
+            });
+            e
+        })?;
     let head_resp = client
         .request(Method::HEAD, &head_url)
         .headers(head_headers)
         .send()
         .await
-        .map_err(map_reqwest)?;
+        .map_err(|e| {
+            crate::log::emit_lazy(|| {
+                crate::log::Log::error(
+                    "head",
+                    format!("HEAD send failed: err={}", crate::log::redact_secrets(&e.to_string())),
+                )
+                .with_key(task.file_name())
+                .with_url(head_url.as_str())
+            });
+            map_reqwest(e)
+        })?;
     if !head_resp.status().is_success() {
-        crate::meow_flow_log!(
-            "download_prepare",
-            "head failed: status={}",
-            head_resp.status()
-        );
+        let head_status = head_resp.status();
+        crate::log::emit_lazy(|| {
+            crate::log::Log::error(
+                "head",
+                format!("head failed: status={}", head_status),
+            )
+            .with_key(task.file_name())
+            .with_http_status(head_status.as_u16())
+            .with_url(head_url.as_str())
+        });
         return Err(MeowError::from_code(
             InnerErrorCode::ResponseStatusError,
             format!("download_prepare HEAD failed: {}", head_resp.status()),
@@ -465,45 +684,25 @@ async fn download_prepare(
     crate::meow_flow_log!(
         "download_prepare",
         "head metadata: url={} content_length={} etag={}",
-        head_url,
+        crate::log::sanitize_url(&head_url),
         head_content_length,
         head_etag
     );
-    let total = download.total_size_from_head(head_resp.headers())?;
-    if start > total {
-        crate::meow_flow_log!(
-            "download_prepare",
-            "invalid local length larger than remote: local={} remote={}",
-            start,
-            total
-        );
-        return Err(MeowError::from_code_str(
-            InnerErrorCode::InvalidRange,
-            "local file larger than remote content-length",
-        ));
-    }
-    if start >= total {
-        crate::meow_flow_log!(
-            "download_prepare",
-            "already complete by local length: local={} remote={}",
-            start,
-            total
-        );
-        return Ok(PrepareOutcome {
-            next_offset: total,
-            total_size: total,
-        });
-    }
-    crate::meow_flow_log!(
-        "download_prepare",
-        "prepared resume offset: start={} remote_total={}",
-        start,
-        total
-    );
-    Ok(PrepareOutcome {
-        next_offset: start,
-        total_size: total,
-    })
+    let total = download
+        .total_size_from_head(head_resp.headers())
+        .map_err(|e| {
+            crate::log::emit_lazy(|| {
+                crate::log::Log::error(
+                    "head",
+                    format!("total_size_from_head parse failed: err={}", crate::log::redact_secrets(&e.to_string())),
+                )
+                .with_key(task.file_name())
+                .with_url(head_url.as_str())
+            });
+            e
+        })?;
+    // HEAD resolved the size; run the shared parallel/serial branch.
+    download_prepare_finish(task, &download, start, total).await
 }
 
 #[async_trait]
@@ -561,10 +760,13 @@ impl TransferTrait for DefaultHttpTransfer {
         self.upload_arc(task).abort_upload(&client, task).await
     }
 
-    /// Parallel parts are only offered for uploads whose resolved protocol
-    /// proves out-of-order safety; downloads always stay serial.
+    /// Parallel parts are offered for uploads whose resolved protocol proves
+    /// out-of-order safety, and for downloads whose range protocol declares it.
     fn supports_parallel_parts(&self, task: &TransferTask) -> bool {
-        task.direction() == Direction::Upload && self.upload_arc(task).supports_parallel_parts()
+        match task.direction() {
+            Direction::Upload => self.upload_arc(task).supports_parallel_parts(),
+            Direction::Download => self.download_arc(task).supports_parallel_parts(),
+        }
     }
 
     /// Uploads one chunk without finalizing (parallel path). Completion is run
@@ -581,9 +783,24 @@ impl TransferTrait for DefaultHttpTransfer {
             Direction::Upload => {
                 upload_one_chunk_part(&client, task, self.upload_arc(task), offset, chunk_size).await
             }
-            // Download has no finalize step; behaves exactly like transfer_chunk.
             Direction::Download => {
-                download_one_chunk(
+                // Resume short-circuit: a part already recorded done in the
+                // sidecar needs no network I/O. Keep the lock scope short and
+                // never hold it across the network call below.
+                {
+                    let guard = task.download_progress().lock().await;
+                    if let Some(p) = guard.as_ref() {
+                        if p.is_done(offset) {
+                            return Ok(ChunkOutcome {
+                                next_offset: (offset + chunk_size).min(remote_total_size),
+                                total_size: remote_total_size,
+                                done: (offset + chunk_size) >= remote_total_size,
+                                completion_payload: None,
+                            });
+                        }
+                    }
+                }
+                let outcome = download_one_chunk_part_positioned(
                     &client,
                     task,
                     self.download_arc(task),
@@ -591,18 +808,70 @@ impl TransferTrait for DefaultHttpTransfer {
                     chunk_size,
                     remote_total_size,
                 )
-                .await
+                .await?;
+                // Bytes are durably written (sync_data) — now record the bit.
+                {
+                    let mut guard = task.download_progress().lock().await;
+                    if let Some(p) = guard.as_mut() {
+                        p.mark_done_and_persist(offset).map_err(|e| {
+                            MeowError::from_io("persist .rcdl progress failed".to_string(), e)
+                        })?;
+                    }
+                }
+                Ok(outcome)
             }
         }
     }
 
-    /// Finalizes an upload after all parts have been uploaded; delegates to the
-    /// protocol's `complete_upload`.
+    /// Finalizes a transfer after all parts have been transferred.
+    ///
+    /// Upload delegates to the protocol's `complete_upload`. Download validates
+    /// the concurrent path's result (pre-sized length matches `total` and every
+    /// part is recorded done) and then drops the `.rcdl` sidecar; serial
+    /// downloads finalize inline and never set up progress, so they no-op here.
     async fn complete(&self, task: &TransferTask) -> Result<Option<String>, MeowError> {
-        if task.direction() != Direction::Upload {
-            return Ok(None);
+        match task.direction() {
+            Direction::Upload => {
+                let client = self.client_for(task);
+                self.upload_arc(task).complete_upload(&client, task).await
+            }
+            Direction::Download => {
+                // Only the concurrent path sets up progress; serial downloads
+                // never reach complete() with progress (they finalize inline).
+                let progress = {
+                    let mut guard = task.download_progress().lock().await;
+                    guard.take()
+                };
+                if let Some(p) = progress {
+                    let expected = p.total();
+                    let actual = tokio::fs::metadata(task.file_path())
+                        .await
+                        .map(|m| m.len())
+                        .map_err(|e| {
+                            MeowError::from_io("stat completed download failed".to_string(), e)
+                        })?;
+                    if actual != expected {
+                        return Err(MeowError::from_code(
+                            InnerErrorCode::InvalidRange,
+                            format!(
+                                "download length mismatch on complete: expected {expected}, got {actual}"
+                            ),
+                        ));
+                    }
+                    if !p.all_done() {
+                        return Err(MeowError::from_code_str(
+                            InnerErrorCode::InvalidRange,
+                            "download complete called before all parts recorded done",
+                        ));
+                    }
+                    // Success: drop the sidecar. Best effort; a leftover .rcdl is
+                    // re-validated (and ignored) on any future download.
+                    if let Err(e) = p.delete() {
+                        crate::meow_warn_log!("download_complete", "sidecar delete failed: {}", e);
+                    }
+                }
+                Ok(None)
+            }
         }
-        let client = self.client_for(task);
-        self.upload_arc(task).complete_upload(&client, task).await
     }
 }

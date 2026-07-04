@@ -49,7 +49,7 @@ impl InnerTask {
         default_download: Arc<dyn BreakpointDownload + Send + Sync>,
     ) -> Result<Self, MeowError> {
         let task_id = TaskId::new();
-        crate::meow_flow_log!("inner_task", "from_pounce start: task_id={:?}", task_id);
+        crate::meow_key_log!("inner_task", "from_pounce start: task_id={:?}", task_id);
 
         let PounceTask {
             direction,
@@ -81,6 +81,13 @@ impl InnerTask {
         let file_sign = match direction {
             Direction::Upload => {
                 let source = upload_source.as_ref().ok_or_else(|| {
+                    crate::log::emit_lazy(|| {
+                        crate::log::Log::warn(
+                            "inner_task",
+                            "upload task missing upload source",
+                        )
+                        .with_task_id(task_id.to_string())
+                    });
                     MeowError::from_code_str(
                         InnerErrorCode::ParameterEmpty,
                         "upload task missing upload source",
@@ -88,7 +95,7 @@ impl InnerTask {
                 })?;
                 match source {
                     UploadSource::File(path) => {
-                        crate::meow_flow_log!(
+                        crate::meow_key_log!(
                             "inner_task",
                             "build upload task from file: task_id={:?} path={}",
                             task_id,
@@ -96,26 +103,34 @@ impl InnerTask {
                         );
                         let file = File::open(path).await.map_err(|e| {
                             if e.kind() == std::io::ErrorKind::NotFound {
-                                crate::meow_flow_log!(
-                                    "inner_task",
-                                    "upload source missing: task_id={:?} path={} err={}",
-                                    task_id,
-                                    path.display(),
-                                    e
-                                );
+                                crate::log::emit_lazy(|| {
+                                    crate::log::Log::error(
+                                        "inner_task",
+                                        format!(
+                                            "upload source missing: path={} err={}",
+                                            path.display(),
+                                            crate::log::redact_secrets(&e.to_string())
+                                        ),
+                                    )
+                                    .with_task_id(task_id.to_string())
+                                });
                                 MeowError::from_source(
                                     InnerErrorCode::FileNotFound,
                                     format!("upload source file not found: {}", path.display()),
                                     e,
                                 )
                             } else {
-                                crate::meow_flow_log!(
-                                    "inner_task",
-                                    "upload source open failed: task_id={:?} path={} err={}",
-                                    task_id,
-                                    path.display(),
-                                    e
-                                );
+                                crate::log::emit_lazy(|| {
+                                    crate::log::Log::error(
+                                        "inner_task",
+                                        format!(
+                                            "upload source open failed: path={} err={}",
+                                            path.display(),
+                                            crate::log::redact_secrets(&e.to_string())
+                                        ),
+                                    )
+                                    .with_task_id(task_id.to_string())
+                                });
                                 MeowError::from_source(
                                     InnerErrorCode::IoError,
                                     format!("open upload source failed: {}", path.display()),
@@ -123,10 +138,23 @@ impl InnerTask {
                                 )
                             }
                         })?;
-                        calculate_sign(&file).await?
+                        calculate_sign(&file).await.map_err(|e| {
+                            crate::log::emit_lazy(|| {
+                                crate::log::Log::error(
+                                    "inner_task",
+                                    format!(
+                                        "calculate_sign failed: path={} err={}",
+                                        path.display(),
+                                        crate::log::redact_secrets(&e.to_string())
+                                    ),
+                                )
+                                .with_task_id(task_id.to_string())
+                            });
+                            e
+                        })?
                     }
                     UploadSource::Bytes(bytes) => {
-                        crate::meow_flow_log!(
+                        crate::meow_key_log!(
                             "inner_task",
                             "build upload task from bytes: task_id={:?} len={}",
                             task_id,
@@ -137,20 +165,29 @@ impl InnerTask {
                 }
             }
             Direction::Download => {
-                crate::meow_flow_log!(
+                crate::meow_key_log!(
                     "inner_task",
                     "build download task: task_id={:?} path={}",
                     task_id,
                     file_path.display()
                 );
-                client_file_sign.unwrap_or_default()
+                client_file_sign.unwrap_or_else(|| {
+                    crate::log::emit_lazy(|| {
+                        crate::log::Log::warn(
+                            "inner_task",
+                            "download task missing client_file_sign; defaulting to empty",
+                        )
+                        .with_task_id(task_id.to_string())
+                    });
+                    String::default()
+                })
             }
         };
 
         let breakpoint_upload = breakpoint_upload.unwrap_or(default_upload);
         let breakpoint_download = breakpoint_download.unwrap_or(default_download);
         let breakpoint_download_http = breakpoint_download_http.unwrap_or(default_download_http);
-        crate::meow_flow_log!(
+        crate::meow_key_log!(
             "inner_task",
             "from_pounce resolved: task_id={:?} dir={:?} file={} chunk={} total={} max_chunk_retries={} max_upload_prepare_retries={}",
             task_id,
@@ -161,6 +198,15 @@ impl InnerTask {
             max_chunk_retries,
             max_upload_prepare_retries
         );
+
+        crate::log::emit_lazy(|| {
+            crate::log::Log::key(
+                "inner_task",
+                format!("task created dir={:?}", direction),
+            )
+            .with_task_id(task_id.to_string())
+            .with_byte_len(total_size)
+        });
 
         Ok(Self {
             task_id,

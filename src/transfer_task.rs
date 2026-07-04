@@ -49,6 +49,13 @@ pub struct TransferTask {
     upload_file_slot: Arc<Mutex<Option<File>>>,
     /// Task-level download file handle slot to avoid reopening per chunk.
     download_file_slot: Arc<Mutex<Option<File>>>,
+    /// Max parts of this file transferred concurrently (intra-file parallel).
+    /// `1` means the strict-serial legacy path.
+    max_parts_in_flight: usize,
+    /// Shared progress bitmap for the concurrent download path (None until the
+    /// parallel `download_prepare` initializes it). Guarded so concurrent parts
+    /// can flip their bit without racing.
+    download_progress: Arc<Mutex<Option<crate::dflt::download_progress::DownloadProgress>>>,
     /// Max retries after first failed upload prepare (`BreakpointUpload::prepare`).
     max_upload_prepare_retries: u32,
 }
@@ -97,6 +104,8 @@ impl TransferTask {
             http_client: inner.http_client_ref().cloned(),
             upload_file_slot: Arc::new(Mutex::new(None)),
             download_file_slot: Arc::new(Mutex::new(None)),
+            max_parts_in_flight: inner.max_parts_in_flight(),
+            download_progress: Arc::new(Mutex::new(None)),
             max_upload_prepare_retries: inner.max_upload_prepare_retries(),
         }
     }
@@ -287,5 +296,17 @@ impl TransferTask {
     /// Returns download file handle slot used by executor.
     pub(crate) fn download_file_slot(&self) -> &Arc<Mutex<Option<File>>> {
         &self.download_file_slot
+    }
+
+    /// Returns the configured max concurrent parts for this task.
+    pub(crate) fn max_parts_in_flight(&self) -> usize {
+        self.max_parts_in_flight
+    }
+
+    /// Returns the shared concurrent-download progress slot.
+    pub(crate) fn download_progress(
+        &self,
+    ) -> &Arc<Mutex<Option<crate::dflt::download_progress::DownloadProgress>>> {
+        &self.download_progress
     }
 }

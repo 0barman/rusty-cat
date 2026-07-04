@@ -230,7 +230,7 @@ impl MeowClient {
             self.config.http_timeout(),
             self.config.tcp_keepalive(),
         )?;
-        crate::meow_flow_log!(
+        crate::meow_key_log!(
             "executor",
             "initializing DefaultHttpTransfer (timeout={:?}, tcp_keepalive={:?})",
             self.config.http_timeout(),
@@ -242,7 +242,7 @@ impl MeowClient {
             self.global_progress_listener.clone(),
         )?;
         self.executor.set(exec).map_err(|_| {
-            crate::meow_flow_log!(
+            crate::meow_error_log!(
                 "executor",
                 "executor init race failed while holding init lock"
             );
@@ -252,7 +252,7 @@ impl MeowClient {
             )
         })?;
         self.executor.get().ok_or_else(|| {
-            crate::meow_flow_log!(
+            crate::meow_error_log!(
                 "executor",
                 "executor init race failed after set; returning RuntimeCreationFailedError"
             );
@@ -318,7 +318,7 @@ impl MeowClient {
         F: Fn(FileTransferRecord) + Send + Sync + 'static,
     {
         let id = GlobalProgressListenerId::new();
-        crate::meow_flow_log!("listener", "register global listener: id={:?}", id);
+        crate::meow_key_log!("listener", "register global listener: id={:?}", id);
         let mut guard = self.global_progress_listener.write().map_err(|e| {
             MeowError::from_code(
                 InnerErrorCode::LockPoisoned,
@@ -360,7 +360,7 @@ impl MeowClient {
         })?;
         if let Some(pos) = g.iter().position(|(k, _)| *k == id) {
             g.remove(pos);
-            crate::meow_flow_log!(
+            crate::meow_key_log!(
                 "listener",
                 "unregister global listener success: id={:?}",
                 id
@@ -388,7 +388,7 @@ impl MeowClient {
     /// # Ok::<(), rusty_cat::api::MeowError>(())
     /// ```
     pub fn clear_global_listener(&self) -> Result<(), MeowError> {
-        crate::meow_flow_log!("listener", "clear all global listeners");
+        crate::meow_key_log!("listener", "clear all global listeners");
         self.global_progress_listener
             .write()
             .map_err(|e| {
@@ -547,11 +547,20 @@ impl MeowClient {
     {
         self.ensure_open()?;
         if task.is_empty() {
-            crate::meow_flow_log!("try_enqueue", "reject empty task");
+            crate::meow_warn_log!("try_enqueue", "reject empty task");
             return Err(MeowError::from_code1(InnerErrorCode::ParameterEmpty));
         }
 
-        crate::meow_flow_log!("try_enqueue", "task={:?}", task);
+        crate::meow_flow_log!(
+            "try_enqueue",
+            "task dir={:?} name={:?} size={} chunk={} method={:?} url={}",
+            task.direction,
+            task.file_name,
+            task.total_size,
+            task.chunk_size,
+            task.method,
+            crate::log::sanitize_url(&task.url)
+        );
 
         let progress: ProgressCb = Arc::new(progress_cb);
         let complete: Option<CompleteCb> = Some(Arc::new(complete_cb) as CompleteCb);
@@ -568,7 +577,7 @@ impl MeowClient {
         .await?;
 
         let task_id = self.get_exec()?.try_enqueue(inner, callbacks)?;
-        crate::meow_flow_log!("try_enqueue", "try_enqueue success: task_id={:?}", task_id);
+        crate::meow_key_log!("try_enqueue", "try_enqueue success: task_id={:?}", task_id);
         Ok(task_id)
     }
 
@@ -663,11 +672,20 @@ impl MeowClient {
     {
         self.ensure_open()?;
         if task.is_empty() {
-            crate::meow_flow_log!("try_enqueue_paused", "reject empty task");
+            crate::meow_warn_log!("try_enqueue_paused", "reject empty task");
             return Err(MeowError::from_code1(InnerErrorCode::ParameterEmpty));
         }
 
-        crate::meow_flow_log!("try_enqueue_paused", "task={:?}", task);
+        crate::meow_flow_log!(
+            "try_enqueue_paused",
+            "task dir={:?} name={:?} size={} chunk={} method={:?} url={}",
+            task.direction,
+            task.file_name,
+            task.total_size,
+            task.chunk_size,
+            task.method,
+            crate::log::sanitize_url(&task.url)
+        );
 
         let progress: ProgressCb = Arc::new(progress_cb);
         let complete: Option<CompleteCb> = Some(Arc::new(complete_cb) as CompleteCb);
@@ -684,7 +702,7 @@ impl MeowClient {
         .await?;
 
         let task_id = self.get_exec()?.try_enqueue_paused(inner, callbacks)?;
-        crate::meow_flow_log!(
+        crate::meow_key_log!(
             "try_enqueue_paused",
             "try_enqueue_paused success: task_id={:?}",
             task_id
@@ -813,10 +831,6 @@ impl MeowClient {
         }
     }
 
-    // pub async fn get_task_status(&self, task_id: TaskId)-> Result<FileTransferRecord, MeowError> {
-    //     todo!(arman) -
-    // }
-
     /// Pauses a running or pending task by ID.
     ///
     /// This API sends a control command to the internal scheduler worker
@@ -843,7 +857,7 @@ impl MeowClient {
     /// ```
     pub async fn pause(&self, task_id: TaskId) -> Result<(), MeowError> {
         self.ensure_open()?;
-        crate::meow_flow_log!("client_api", "pause called: task_id={:?}", task_id);
+        crate::meow_key_log!("client_api", "pause called: task_id={:?}", task_id);
         self.get_exec()?.pause(task_id).await
     }
 
@@ -870,7 +884,7 @@ impl MeowClient {
     /// ```
     pub async fn resume(&self, task_id: TaskId) -> Result<(), MeowError> {
         self.ensure_open()?;
-        crate::meow_flow_log!("client_api", "resume called: task_id={:?}", task_id);
+        crate::meow_key_log!("client_api", "resume called: task_id={:?}", task_id);
         self.get_exec()?.resume(task_id).await
     }
 
@@ -900,7 +914,7 @@ impl MeowClient {
     /// ```
     pub async fn cancel(&self, task_id: TaskId) -> Result<(), MeowError> {
         self.ensure_open()?;
-        crate::meow_flow_log!("client_api", "cancel called: task_id={:?}", task_id);
+        crate::meow_key_log!("client_api", "cancel called: task_id={:?}", task_id);
         self.get_exec()?.cancel(task_id).await
     }
 
@@ -992,7 +1006,7 @@ impl MeowClient {
             ));
         }
         if let Some(exec) = self.executor.get() {
-            crate::meow_flow_log!("client_api", "close forwarding to executor");
+            crate::meow_key_log!("client_api", "close forwarding to executor");
             if let Err(e) = exec.close().await {
                 // Roll back closed flag so caller can retry close.
                 self.closed.store(false, Ordering::SeqCst);
@@ -1000,7 +1014,7 @@ impl MeowClient {
             }
             Ok(())
         } else {
-            crate::meow_flow_log!("client_api", "close with no executor initialized");
+            crate::meow_key_log!("client_api", "close with no executor initialized");
             Ok(())
         }
     }

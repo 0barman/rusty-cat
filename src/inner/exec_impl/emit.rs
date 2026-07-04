@@ -13,7 +13,7 @@ use crate::transfer_status::TransferStatus;
 /// [`crate::inner::cb_dispatcher`] 模块文档。
 pub(crate) fn invoke_progress_cb(state: &SchedulerState, cb: &ProgressCb, dto: FileTransferRecord) {
     let Some(submit) = state.cb_submit() else {
-        crate::meow_flow_log!(
+        crate::meow_trace_log!(
             "callback",
             "progress callback skipped: dispatcher already taken (closing)"
         );
@@ -33,7 +33,7 @@ pub(crate) fn invoke_complete_cb(
     payload: Option<String>,
 ) {
     let Some(submit) = state.cb_submit() else {
-        crate::meow_flow_log!(
+        crate::meow_warn_log!(
             "callback",
             "complete callback skipped: dispatcher already taken (closing)"
         );
@@ -51,14 +51,14 @@ pub(crate) fn emit_global_progress(state: &SchedulerState, dto: FileTransferReco
     let listeners: Vec<ProgressCb> = match state.global_progress_listener().read() {
         Ok(g) => g.iter().map(|(_, cb)| cb.clone()).collect(),
         Err(_) => {
-            crate::meow_flow_log!(
+            crate::meow_warn_log!(
                 "emit_global_progress",
                 "global listener lock poisoned; skip progress broadcast"
             );
             return;
         }
     };
-    crate::meow_flow_log!(
+    crate::meow_trace_log!(
         "emit_global_progress",
         "broadcast start: listener_count={} task_id={:?}",
         listeners.len(),
@@ -76,7 +76,7 @@ pub(crate) fn emit_status(
     transferred: u64,
     total: u64,
 ) {
-    crate::meow_flow_log!(
+    crate::meow_trace_log!(
         "emit_status",
         "status emit start: task_id={:?} status={:?} transferred={} total={}",
         entry.inner().task_id(),

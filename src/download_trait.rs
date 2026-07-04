@@ -69,6 +69,19 @@ pub trait BreakpointDownload: Send + Sync {
         None
     }
 
+    /// Whether this download protocol is safe to fetch out of order, so the
+    /// executor may run up to `max_parts_in_flight` range GETs of one file
+    /// concurrently and write them at absolute offsets.
+    ///
+    /// Default `false` keeps every protocol strictly serial. Plain HTTP Range
+    /// (RFC 7233) is order-agnostic, so [`crate::api::StandardRangeDownload`]
+    /// overrides this to `true`. A custom protocol should return `true` only if
+    /// each `range_url`/`merge_range_get_headers` result is independent of any
+    /// other chunk's completion.
+    fn supports_parallel_parts(&self) -> bool {
+        false
+    }
+
     /// Returns full URL for HEAD request.
     ///
     /// Default implementation returns [`TransferTask::url`].

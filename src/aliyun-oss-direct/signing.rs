@@ -57,15 +57,15 @@ pub(crate) fn derive_signing_key(
     access_key_secret: &str,
     date: &str,
     region: &str,
-) -> SecretKeyBytes {
+) -> Result<SecretKeyBytes, MeowError> {
     let signing_key = hmac_sha256(
         format!("aliyun_v4{access_key_secret}").as_bytes(),
         date.as_bytes(),
-    );
-    let signing_key = hmac_sha256(&signing_key, region.as_bytes());
-    let signing_key = hmac_sha256(&signing_key, b"oss");
-    let signing_key = hmac_sha256(&signing_key, b"aliyun_v4_request");
-    SecretKeyBytes(signing_key)
+    )?;
+    let signing_key = hmac_sha256(&signing_key, region.as_bytes())?;
+    let signing_key = hmac_sha256(&signing_key, b"oss")?;
+    let signing_key = hmac_sha256(&signing_key, b"aliyun_v4_request")?;
+    Ok(SecretKeyBytes(signing_key))
 }
 
 /// Builds OSS v4 signed headers from a pre-derived signing key.
@@ -113,7 +113,7 @@ pub(crate) fn signed_headers_with_key(
         "OSS4-HMAC-SHA256\n{iso8601}\n{scope}\n{}",
         hex_encode(Sha256::digest(canonical_request.as_bytes()).as_slice())
     );
-    let signature = hex_encode(&hmac_sha256(signing_key.as_slice(), string_to_sign.as_bytes()));
+    let signature = hex_encode(&hmac_sha256(signing_key.as_slice(), string_to_sign.as_bytes())?);
     let mut headers = HeaderMap::new();
     headers.insert("x-oss-date", header_value(&iso8601)?);
     headers.insert("x-oss-content-sha256", header_value(OSS_UNSIGNED_PAYLOAD)?);
@@ -153,7 +153,7 @@ pub(crate) fn signed_headers(
 ) -> Result<HeaderMap, MeowError> {
     let now = time::OffsetDateTime::now_utc();
     let date = oss_date(now);
-    let signing_key = derive_signing_key(access_key_secret, &date, region);
+    let signing_key = derive_signing_key(access_key_secret, &date, region)?;
     signed_headers_with_key(
         method,
         canonical_uri,
@@ -167,10 +167,18 @@ pub(crate) fn signed_headers(
     )
 }
 
-fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<Vec<u8>, MeowError> {
+    // `Hmac<Sha256>` accepts a key of any length, so `new_from_slice` never
+    // returns `InvalidLength` in practice; the error is surfaced as a `MeowError`
+    // rather than panicking so this stays a non-panicking library API.
+    let mut mac = HmacSha256::new_from_slice(key).map_err(|e| {
+        MeowError::from_code(
+            InnerErrorCode::Unknown,
+            format!("HMAC-SHA256 key initialization failed: {e}"),
+        )
+    })?;
     mac.update(data);
-    mac.finalize().into_bytes().to_vec()
+    Ok(mac.finalize().into_bytes().to_vec())
 }
 
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
@@ -222,9 +230,9 @@ mod tests {
     fn derive_signing_key_is_date_sensitive() {
         // Same (secret, date, region) → identical key (cache hit is safe);
         // a different UTC date → different key (cache must invalidate at midnight).
-        let a = derive_signing_key("secret", "20260627", "cn-hangzhou");
-        let b = derive_signing_key("secret", "20260627", "cn-hangzhou");
-        let c = derive_signing_key("secret", "20260628", "cn-hangzhou");
+        let a = derive_signing_key("secret", "20260627", "cn-hangzhou").expect("derive key");
+        let b = derive_signing_key("secret", "20260627", "cn-hangzhou").expect("derive key");
+        let c = derive_signing_key("secret", "20260628", "cn-hangzhou").expect("derive key");
         assert_eq!(a.as_slice(), b.as_slice());
         assert_ne!(a.as_slice(), c.as_slice());
     }
@@ -234,7 +242,7 @@ mod tests {
         let now = time::OffsetDateTime::from_unix_timestamp(1_782_500_000)
             .expect("valid timestamp");
         let date = super::oss_date(now);
-        let key = derive_signing_key("secret", &date, "cn-hangzhou");
+        let key = derive_signing_key("secret", &date, "cn-hangzhou").expect("derive key");
         let make = || {
             signed_headers_with_key(
                 "PUT",
@@ -265,7 +273,7 @@ mod tests {
 
     #[test]
     fn secret_key_bytes_debug_is_redacted() {
-        let key = derive_signing_key("secret", "20260627", "cn-hangzhou");
+        let key = derive_signing_key("secret", "20260627", "cn-hangzhou").expect("derive key");
         assert_eq!(format!("{key:?}"), "SecretKeyBytes(<redacted>)");
     }
 }

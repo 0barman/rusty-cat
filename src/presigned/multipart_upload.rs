@@ -113,11 +113,41 @@ impl PresignedMultipartUpload {
             return Ok(part);
         };
 
-        let refreshed = refresher.refresh_upload_part(&part).await?;
+        let refreshed = refresher.refresh_upload_part(&part).await.map_err(|e| {
+            crate::log::emit_lazy(|| {
+                crate::log::Log::error(
+                    "upload_part",
+                    format!(
+                        "presigned upload-part re-sign failed: {}",
+                        crate::log::redact_secrets(&e.to_string())
+                    ),
+                )
+                .with_part(part.part_number)
+                .with_range(part.offset, part.size)
+                .with_url(part.url.as_str())
+            });
+            e
+        })?;
         if refreshed.part_number != part.part_number
             || refreshed.offset != part.offset
             || refreshed.size != part.size
         {
+            crate::log::emit_lazy(|| {
+                crate::log::Log::error(
+                    "upload_part",
+                    format!(
+                        "refreshed presigned part diverges: old=({}, {}, {}) new=({}, {}, {})",
+                        part.part_number,
+                        part.offset,
+                        part.size,
+                        refreshed.part_number,
+                        refreshed.offset,
+                        refreshed.size
+                    ),
+                )
+                .with_part(part.part_number)
+                .with_range(part.offset, part.size)
+            });
             return Err(MeowError::from_code(
                 InnerErrorCode::InvalidTaskState,
                 format!(
@@ -168,11 +198,42 @@ impl PresignedMultipartUpload {
             builder = builder.body(body);
         }
         let resp = builder.send().await.map_err(|e| {
+            crate::log::emit_lazy(|| {
+                crate::log::Log::error(
+                    "callback",
+                    format!(
+                        "{label} send transport failure: {}",
+                        crate::log::redact_secrets(&e.to_string())
+                    ),
+                )
+                .with_url(req.url.as_str())
+            });
             MeowError::from_source(InnerErrorCode::HttpError, format!("{label} failed"), e)
         })?;
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = match resp.text().await {
+            Ok(body) => body,
+            Err(e) => {
+                crate::meow_warn_log!(
+                    "callback",
+                    "{label} response body read errored: {}",
+                    crate::log::redact_secrets(&e.to_string())
+                );
+                String::new()
+            }
+        };
         if !status.is_success() {
+            crate::log::emit_lazy(|| {
+                crate::log::Log::error(
+                    "callback",
+                    format!(
+                        "{label} non-2xx status={status}, body: {}",
+                        crate::log::redact_secrets(&body)
+                    ),
+                )
+                .with_http_status(status.as_u16())
+                .with_url(req.url.as_str())
+            });
             return Err(MeowError::from_code(
                 InnerErrorCode::ResponseStatusError,
                 format!("{label} failed: {status}, body: {body}"),
@@ -209,6 +270,12 @@ impl PresignedMultipartUpload {
             parts: uploaded_parts,
         })
         .map_err(|e| {
+            crate::log::emit_lazy(|| {
+                crate::log::Log::error(
+                    "complete",
+                    format!("completion body serde_json::to_vec failed: {e}"),
+                )
+            });
             MeowError::from_code(
                 InnerErrorCode::ResponseParseError,
                 format!("serialize presigned completion body failed: {e}"),
@@ -278,6 +345,19 @@ impl BreakpointUpload for PresignedMultipartUpload {
             .send()
             .await
             .map_err(|e| {
+                crate::log::emit_lazy(|| {
+                    crate::log::Log::error(
+                        "upload_part",
+                        format!(
+                            "presigned upload part send transport failure: {}",
+                            crate::log::redact_secrets(&e.to_string())
+                        ),
+                    )
+                    .with_task_id(ctx.task.file_sign())
+                    .with_part(part.part_number)
+                    .with_range(part.offset, part.size)
+                    .with_url(part.url.as_str())
+                });
                 MeowError::from_source(InnerErrorCode::HttpError, "presigned upload part failed", e)
             })?;
         let status = resp.status();
@@ -287,7 +367,31 @@ impl BreakpointUpload for PresignedMultipartUpload {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = match resp.text().await {
+                Ok(body) => body,
+                Err(e) => {
+                    crate::meow_warn_log!(
+                        "upload_part",
+                        "presigned upload part response body read errored: {}",
+                        crate::log::redact_secrets(&e.to_string())
+                    );
+                    String::new()
+                }
+            };
+            crate::log::emit_lazy(|| {
+                crate::log::Log::error(
+                    "upload_part",
+                    format!(
+                        "presigned upload part non-2xx status={status}, body: {}",
+                        crate::log::redact_secrets(&body)
+                    ),
+                )
+                .with_task_id(ctx.task.file_sign())
+                .with_part(part.part_number)
+                .with_range(part.offset, part.size)
+                .with_http_status(status.as_u16())
+                .with_url(part.url.as_str())
+            });
             return Err(MeowError::from_code(
                 InnerErrorCode::ResponseStatusError,
                 format!("presigned upload part failed: {status}, body: {body}"),
@@ -310,6 +414,15 @@ impl BreakpointUpload for PresignedMultipartUpload {
                 etag,
             });
         }
+        crate::log::emit_lazy(|| {
+            crate::log::Log::trace(
+                "upload_part",
+                format!("presigned part committed to uploaded_parts part={}", part.part_number),
+            )
+            .with_task_id(ctx.task.file_sign())
+            .with_part(part.part_number)
+            .with_range(part.offset, part.size)
+        });
 
         Ok(UploadResumeInfo {
             completed_file_id: None,
@@ -333,13 +446,39 @@ impl BreakpointUpload for PresignedMultipartUpload {
         let body = if let Some(body) = &req.body {
             Some(body.clone())
         } else if let Some(builder) = &self.plan.complete_body_builder {
-            Some(builder.build_body(&self.plan, &uploaded_parts)?)
+            Some(builder.build_body(&self.plan, &uploaded_parts).map_err(|e| {
+                crate::log::emit_lazy(|| {
+                    crate::log::Log::error(
+                        "complete",
+                        format!(
+                            "complete build_body failed: {}",
+                            crate::log::redact_secrets(&e.to_string())
+                        ),
+                    )
+                    .with_url(req.url.as_str())
+                });
+                e
+            })?)
         } else if req.uploaded_parts_json_body {
             Some(self.completion_json_body(&uploaded_parts)?)
         } else {
             None
         };
-        Self::send_callback(client, req, body, "presigned complete callback").await
+        let result = Self::send_callback(client, req, body, "presigned complete callback").await;
+        if result.is_ok() {
+            crate::log::emit_lazy(|| {
+                crate::log::Log::key(
+                    "complete",
+                    format!(
+                        "multipart completion committed parts={} upload_id={:?}",
+                        uploaded_parts.len(),
+                        self.plan.upload_id
+                    ),
+                )
+                .with_url(req.url.as_str())
+            });
+        }
+        result
     }
 
     async fn abort_upload(

@@ -22,7 +22,7 @@ pub(crate) fn map_reqwest(e: reqwest::Error) -> MeowError {
 
 async fn rollback_download_file(file: &mut File, offset: u64, path: &std::path::Path) {
     if let Err(e) = file.set_len(offset).await {
-        crate::meow_flow_log!(
+        crate::meow_warn_log!(
             "download_chunk",
             "rollback set_len failed: path={} offset={} err={}",
             path.display(),
@@ -31,7 +31,7 @@ async fn rollback_download_file(file: &mut File, offset: u64, path: &std::path::
         );
     }
     if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)).await {
-        crate::meow_flow_log!(
+        crate::meow_warn_log!(
             "download_chunk",
             "rollback seek failed: path={} offset={} err={}",
             path.display(),
@@ -234,7 +234,25 @@ pub(crate) async fn upload_one_chunk_part(
             chunk: chunk_bytes,
             offset,
         })
-        .await?;
+        .await
+        .map_err(|e| {
+            crate::log::emit_lazy(|| {
+                let mut log = crate::log::Log::error(
+                    "upload_part",
+                    format!("part chunk upload failed (orphaned-parts risk): {}", e),
+                )
+                .with_key(task.file_name())
+                .with_offset(offset)
+                .with_byte_len(uploaded_chunk_len)
+                .with_url(task.url());
+                if let Some(status) = e.http_status() {
+                    log = log.with_http_status(status);
+                }
+                log = log.with_error_code(e.code());
+                log
+            });
+            e
+        })?;
     let next = info.next_byte.unwrap_or(offset + uploaded_chunk_len).min(total);
     Ok(ChunkOutcome {
         next_offset: next,
@@ -275,7 +293,25 @@ pub(crate) async fn upload_one_chunk(
             chunk: chunk_bytes,
             offset,
         })
-        .await?;
+        .await
+        .map_err(|e| {
+            crate::log::emit_lazy(|| {
+                let mut log = crate::log::Log::error(
+                    "upload_chunk",
+                    format!("serial chunk upload failed: {}", e),
+                )
+                .with_key(task.file_name())
+                .with_offset(offset)
+                .with_byte_len(uploaded_chunk_len)
+                .with_url(task.url());
+                if let Some(status) = e.http_status() {
+                    log = log.with_http_status(status);
+                }
+                log = log.with_error_code(e.code());
+                log
+            });
+            e
+        })?;
     if info.completed_file_id.is_some() {
         return Ok(ChunkOutcome {
             next_offset: total,
@@ -290,7 +326,33 @@ pub(crate) async fn upload_one_chunk(
         .min(total);
     let mut completion_payload = None;
     if next >= total {
-        completion_payload = upload.complete_upload(client, task).await?;
+        completion_payload = upload
+            .complete_upload(client, task)
+            .await
+            .map_err(|e| {
+                crate::log::emit_lazy(|| {
+                    let mut log = crate::log::Log::error(
+                        "complete",
+                        format!("complete_upload finalize failed: {}", e),
+                    )
+                    .with_key(task.file_name())
+                    .with_offset(offset)
+                    .with_byte_len(total)
+                    .with_url(task.url());
+                    if let Some(status) = e.http_status() {
+                        log = log.with_http_status(status);
+                    }
+                    log = log.with_error_code(e.code());
+                    log
+                });
+                e
+            })?;
+        crate::log::emit_lazy(|| {
+            crate::log::Log::key("complete", "complete_upload finalized")
+                .with_key(task.file_name())
+                .with_byte_len(total)
+                .with_url(task.url())
+        });
     }
     Ok(ChunkOutcome {
         next_offset: next,
@@ -316,7 +378,7 @@ fn parse_content_range(value: &str) -> Result<(u64, u64, Option<u64>), MeowError
     let unit = parts.next().unwrap_or_default().trim();
     let range_and_total = parts.next().unwrap_or_default().trim();
     if unit != "bytes" || range_and_total.is_empty() {
-        crate::meow_flow_log!(
+        crate::meow_error_log!(
             "content_range",
             "invalid content-range unit/format: value={}",
             value
@@ -352,7 +414,7 @@ fn parse_content_range(value: &str) -> Result<(u64, u64, Option<u64>), MeowError
         )
     })?;
     if end < start {
-        crate::meow_flow_log!(
+        crate::meow_error_log!(
             "content_range",
             "invalid content-range order: start={} end={} value={}",
             start,
@@ -412,22 +474,49 @@ pub(crate) async fn download_one_chunk(
     })?;
 
     let range_url = download.range_url(task);
+    // Sanitized snapshot for logging only: the raw `range_url` is a presigned/SAS
+    // URL and is moved into `client.get(..)` below, so capture a redacted copy now.
+    let sanitized_range_url = crate::log::sanitize_url(&range_url);
     let mut resp = client
         .get(range_url)
         .headers(headers)
         .send()
         .await
-        .map_err(map_reqwest)?;
+        .map_err(|e| {
+            let meow_err = map_reqwest(e);
+            crate::log::emit_lazy(|| {
+                crate::log::Log::error(
+                    "range_get",
+                    format!(
+                        "download GET send failed: {}",
+                        crate::log::redact_secrets(&meow_err.to_string())
+                    ),
+                )
+                .with_key(task.file_name())
+                .with_offset(offset)
+                .with_url(sanitized_range_url.as_str())
+            });
+            meow_err
+        })?;
     let status = resp.status();
     if status != reqwest::StatusCode::PARTIAL_CONTENT {
         let body = read_error_body_preview(&mut resp, MAX_ERROR_BODY_PREVIEW_BYTES).await;
-        crate::meow_flow_log!(
-            "download_chunk",
-            "invalid status for range GET: status={} offset={} spec={}",
-            status,
-            offset,
-            spec
-        );
+        crate::log::emit_lazy(|| {
+            crate::log::Log::error(
+                "range_get",
+                format!(
+                    "invalid status for range GET: status={} offset={} spec={} body={}",
+                    status,
+                    offset,
+                    spec,
+                    crate::log::redact_secrets(&body)
+                ),
+            )
+            .with_key(task.file_name())
+            .with_offset(offset)
+            .with_http_status(status.as_u16())
+            .with_url(sanitized_range_url.as_str())
+        });
         return Err(MeowError::from_code(
             InnerErrorCode::InvalidRange,
             format!("download GET requires 206 Partial Content, got {status}: {body}"),
@@ -439,12 +528,15 @@ pub(crate) async fn download_one_chunk(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .ok_or_else(|| {
-            crate::meow_flow_log!(
-                "download_chunk",
-                "missing content-range header: offset={} spec={}",
-                offset,
-                spec
-            );
+            crate::log::emit_lazy(|| {
+                crate::log::Log::error(
+                    "range_get",
+                    format!("missing content-range header: offset={} spec={}", offset, spec),
+                )
+                .with_key(task.file_name())
+                .with_offset(offset)
+                .with_url(sanitized_range_url.as_str())
+            });
             MeowError::from_code_str(
                 InnerErrorCode::InvalidRange,
                 "download response missing content-range for ranged GET",
@@ -452,13 +544,18 @@ pub(crate) async fn download_one_chunk(
         })?;
     let (range_start, range_end, range_total) = parse_content_range(&content_range)?;
     if range_start != offset {
-        crate::meow_flow_log!(
-            "download_chunk",
-            "content-range start mismatch: expected={} got={} header={}",
-            offset,
-            range_start,
-            content_range
-        );
+        crate::log::emit_lazy(|| {
+            crate::log::Log::error(
+                "range_get",
+                format!(
+                    "content-range start mismatch: expected={} got={} header={}",
+                    offset, range_start, content_range
+                ),
+            )
+            .with_key(task.file_name())
+            .with_offset(offset)
+            .with_url(sanitized_range_url.as_str())
+        });
         return Err(MeowError::from_code(
             InnerErrorCode::InvalidRange,
             format!("download content-range start mismatch: expected {offset}, got {range_start}"),
@@ -466,12 +563,18 @@ pub(crate) async fn download_one_chunk(
     }
     if let Some(rt) = range_total {
         if rt != total {
-            crate::meow_flow_log!(
-                "download_chunk",
-                "content-range total mismatch: head_total={} range_total={}",
-                total,
-                rt
-            );
+            crate::log::emit_lazy(|| {
+                crate::log::Log::error(
+                    "range_get",
+                    format!(
+                        "content-range total mismatch: head_total={} range_total={}",
+                        total, rt
+                    ),
+                )
+                .with_key(task.file_name())
+                .with_offset(offset)
+                .with_url(sanitized_range_url.as_str())
+            });
             return Err(MeowError::from_code(
                 InnerErrorCode::InvalidRange,
                 format!("download total size changed: HEAD={total}, Content-Range={rt}"),
@@ -528,12 +631,17 @@ pub(crate) async fn download_one_chunk(
             })?
             .len();
         if local_len != offset {
-            crate::meow_flow_log!(
-                "download_chunk",
-                "local length mismatch before resume write: expected={} got={}",
-                offset,
-                local_len
-            );
+            crate::log::emit_lazy(|| {
+                crate::log::Log::error(
+                    "range_get",
+                    format!(
+                        "local length mismatch before resume write: expected={} got={}",
+                        offset, local_len
+                    ),
+                )
+                .with_key(task.file_name())
+                .with_offset(offset)
+            });
             return Err(MeowError::from_code(
                 InnerErrorCode::InvalidRange,
                 format!("local file size mismatch: expected {offset}, got {local_len}"),
@@ -566,6 +674,18 @@ pub(crate) async fn download_one_chunk(
                 if written_len > 0 {
                     rollback_download_file(f, offset, path).await;
                 }
+                crate::log::emit_lazy(|| {
+                    crate::log::Log::error(
+                        "range_get",
+                        format!(
+                            "streaming body read failed: {}",
+                            crate::log::redact_secrets(&e.to_string())
+                        ),
+                    )
+                    .with_key(task.file_name())
+                    .with_offset(offset)
+                    .with_url(sanitized_range_url.as_str())
+                });
                 return Err(map_reqwest(e));
             }
         };
@@ -578,7 +698,7 @@ pub(crate) async fn download_one_chunk(
         let next_written = written_len + chunk.len() as u64;
         if next_written > expected_len {
             rollback_download_file(f, offset, path).await;
-            crate::meow_flow_log!(
+            crate::meow_error_log!(
                 "download_chunk",
                 "body length exceeded expected range: expected={} next_written={} header={}",
                 expected_len,
@@ -594,6 +714,14 @@ pub(crate) async fn download_one_chunk(
         }
         if let Err(e) = f.write_all(&chunk).await {
             rollback_download_file(f, offset, path).await;
+            crate::log::emit_lazy(|| {
+                crate::log::Log::error(
+                    "download_chunk",
+                    format!("write download file failed: path={}", path.display()),
+                )
+                .with_key(task.file_name())
+                .with_offset(offset)
+            });
             // `from_io` classifies out-of-space (`ENOSPC` / `ERROR_DISK_FULL`)
             // into `DiskFull` and a vanished file into `LocalFileRemoved`.
             return Err(MeowError::from_io(
@@ -604,7 +732,7 @@ pub(crate) async fn download_one_chunk(
         written_len = next_written;
     }
     if written_len == 0 {
-        crate::meow_flow_log!(
+        crate::meow_error_log!(
             "download_chunk",
             "empty body for ranged chunk: offset={} spec={}",
             offset,
@@ -617,7 +745,7 @@ pub(crate) async fn download_one_chunk(
     }
     if written_len != expected_len {
         rollback_download_file(f, offset, path).await;
-        crate::meow_flow_log!(
+        crate::meow_error_log!(
             "download_chunk",
             "body length mismatch: expected={} actual={} header={}",
             expected_len,
@@ -642,7 +770,7 @@ pub(crate) async fn download_one_chunk(
     // such a deletion does not fail `write_all` (the handle keeps an orphaned
     // inode alive), so without this check the failure would be silent.
     ensure_download_file_present(path, next).await?;
-    crate::meow_flow_log!(
+    crate::meow_trace_log!(
         "download_chunk",
         "chunk write success: file={} offset={} next={} total={}",
         task.file_name(),
@@ -658,9 +786,174 @@ pub(crate) async fn download_one_chunk(
     })
 }
 
+/// Downloads exactly one range chunk into `task.file_path()` at its absolute
+/// offset using a dedicated file handle. Concurrency-safe: no shared cursor, no
+/// truncating rollback. The file MUST already be pre-sized to at least
+/// `offset + expected_len` (the parallel `download_prepare` pre-sizes to total).
+pub(crate) async fn download_one_chunk_part_positioned(
+    client: &reqwest::Client,
+    task: &TransferTask,
+    download: Arc<dyn BreakpointDownload + Send + Sync>,
+    offset: u64,
+    chunk_size: u64,
+    remote_total_size: u64,
+) -> Result<ChunkOutcome, MeowError> {
+    let total = remote_total_size;
+    if offset >= total {
+        return Ok(ChunkOutcome {
+            next_offset: offset,
+            total_size: total,
+            done: true,
+            completion_payload: None,
+        });
+    }
+    let spec = range_spec(offset, chunk_size, total);
+    let mut headers = task.headers().clone();
+    download.merge_range_get_headers(DownloadRangeGetCtx {
+        task,
+        range_value: &spec,
+        base: &mut headers,
+    })?;
+    let range_url = download.range_url(task);
+    let mut resp = client
+        .get(range_url)
+        .headers(headers)
+        .send()
+        .await
+        .map_err(map_reqwest)?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::OK {
+        // Server ignored Range and is streaming the whole body. Positioned
+        // parallel writes require 206; surface a clear, terminal error so the
+        // caller (app) can retry serially. Do NOT try to slice a 200 body here.
+        let _ = read_error_body_preview(&mut resp, MAX_ERROR_BODY_PREVIEW_BYTES).await;
+        return Err(MeowError::from_code(
+            InnerErrorCode::InvalidRange,
+            "server returned 200 OK to a Range request (Range not honored); \
+             concurrent download requires 206 Partial Content"
+                .to_string(),
+        ));
+    }
+    if status != reqwest::StatusCode::PARTIAL_CONTENT {
+        let body = read_error_body_preview(&mut resp, MAX_ERROR_BODY_PREVIEW_BYTES).await;
+        return Err(MeowError::from_code(
+            InnerErrorCode::InvalidRange,
+            format!("range GET requires 206, got {status}: {body}"),
+        ));
+    }
+    let content_range = resp
+        .headers()
+        .get(CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .ok_or_else(|| {
+            MeowError::from_code_str(
+                InnerErrorCode::InvalidRange,
+                "range response missing content-range",
+            )
+        })?;
+    let (range_start, range_end, range_total) = parse_content_range(&content_range)?;
+    if range_start != offset {
+        return Err(MeowError::from_code(
+            InnerErrorCode::InvalidRange,
+            format!("content-range start mismatch: expected {offset}, got {range_start}"),
+        ));
+    }
+    if let Some(rt) = range_total {
+        if rt != total {
+            return Err(MeowError::from_code(
+                InnerErrorCode::InvalidRange,
+                format!(
+                    "content-range total mismatch (remote file may have been resized \
+                     mid-download): expected total={total}, server reports {rt}; \
+                     verify the URL is stable and retry"
+                ),
+            ));
+        }
+    }
+    let expected_len = range_end - range_start + 1;
+
+    // Own handle: independent OS cursor; disjoint ranges never conflict.
+    let path = task.file_path();
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create(false)
+        .open(path)
+        .await
+        .map_err(|e| {
+            MeowError::from_io(format!("open download file failed: {}", path.display()), e)
+        })?;
+    // Defensive precondition: the file MUST already be pre-sized to at least
+    // `offset + expected_len` (download_prepare `set_len(total)`). Seeking past
+    // EOF and writing would otherwise silently create a sparse hole on POSIX.
+    let flen = f
+        .metadata()
+        .await
+        .map(|m| m.len())
+        .map_err(|e| MeowError::from_io(format!("stat download file failed: {}", path.display()), e))?;
+    if flen < offset + expected_len {
+        return Err(MeowError::from_code(
+            InnerErrorCode::InvalidRange,
+            format!(
+                "download file not pre-sized for positioned write: len={flen}, need>={}",
+                offset + expected_len
+            ),
+        ));
+    }
+    f.seek(std::io::SeekFrom::Start(offset)).await.map_err(|e| {
+        MeowError::from_io(format!("seek download file failed: offset={offset}"), e)
+    })?;
+    let mut written_len = 0_u64;
+    loop {
+        let chunk = match resp.chunk().await {
+            Ok(v) => v,
+            Err(e) => return Err(map_reqwest(e)), // no rollback: retry overwrites
+        };
+        let Some(chunk) = chunk else { break };
+        if chunk.is_empty() {
+            continue;
+        }
+        let next_written = written_len + chunk.len() as u64;
+        if next_written > expected_len {
+            return Err(MeowError::from_code(
+                InnerErrorCode::InvalidRange,
+                format!("range body too long: expected {expected_len}, got >= {next_written}"),
+            ));
+        }
+        f.write_all(&chunk)
+            .await
+            .map_err(|e| MeowError::from_io(format!("write download file failed at {offset}"), e))?;
+        written_len = next_written;
+    }
+    if written_len != expected_len {
+        return Err(MeowError::from_code(
+            InnerErrorCode::InvalidRange,
+            format!("range body short: expected {expected_len}, got {written_len}"),
+        ));
+    }
+    // Durable before the sidecar bit is set by the caller.
+    f.sync_data()
+        .await
+        .map_err(|e| MeowError::from_io("sync download part failed".to_string(), e))?;
+    Ok(ChunkOutcome {
+        next_offset: (offset + expected_len).min(total),
+        total_size: total,
+        done: (offset + expected_len) >= total,
+        completion_payload: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_content_range;
+    use super::range_spec;
+
+    #[test]
+    fn range_spec_clamps_last_part() {
+        // total=25, chunk=10 => last part at 20 spans bytes 20-24 (5 bytes)
+        assert_eq!(range_spec(20, 10, 25), "bytes=20-24");
+        assert_eq!(range_spec(0, 10, 25), "bytes=0-9");
+    }
 
     #[test]
     fn parse_content_range_ok() -> Result<(), crate::error::MeowError> {

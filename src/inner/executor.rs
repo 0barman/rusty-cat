@@ -75,7 +75,7 @@ fn worker_loop(
         cb_join.join();
     }
 
-    crate::meow_flow_log!("worker_loop", "starting scheduler worker thread");
+    crate::meow_key_log!("worker_loop", "starting scheduler worker thread");
     let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel::<Result<(), MeowError>>(1);
     let handle = std::thread::spawn(move || {
         let runtime_ret = tokio::runtime::Builder::new_multi_thread()
@@ -83,7 +83,7 @@ fn worker_loop(
             .build();
         match runtime_ret {
             Ok(runtime) => {
-                crate::meow_flow_log!("worker_loop", "runtime created successfully");
+                crate::meow_key_log!("worker_loop", "runtime created successfully");
                 let _ = startup_tx.send(Ok(()));
                 runtime.block_on(async move {
                     loop {
@@ -97,11 +97,11 @@ fn worker_loop(
                                 match cmd {
                                     TransferCmd::Enqueue { inner, callbacks } => {
                                         let key = inner.dedupe_key();
-                                        crate::meow_flow_log!(
+                                        crate::meow_key_log!(
                                             "cmd_enqueue",
-                                            "received enqueue: task_id={:?} key={:?} chunk_size={}",
+                                            "received enqueue: task_id={:?} key={} chunk_size={}",
                                             inner.task_id(),
-                                            key,
+                                            crate::inner::safe_key(&key),
                                             inner.chunk_size()
                                         );
                                         if let Some(existing) = state.groups().get(&key) {
@@ -125,10 +125,10 @@ fn worker_loop(
                                                 &state,
                                                 dup_dto,
                                             );
-                                            crate::meow_flow_log!(
+                                            crate::meow_warn_log!(
                                                 "cmd_enqueue",
-                                                "duplicate key rejected: key={:?}",
-                                                key
+                                                "duplicate key rejected: key={}",
+                                                crate::inner::safe_key(&key)
                                             );
                                             continue;
                                         }
@@ -167,10 +167,10 @@ fn worker_loop(
                                         if !state.active().contains_key(&key) && !state.queued_set().contains(&key) {
                                             state.queued_mut().push_back(key.clone());
                                             state.queued_set_mut().insert(key.clone());
-                                            crate::meow_flow_log!(
+                                            crate::meow_key_log!(
                                                 "cmd_enqueue",
-                                                "queued new key: key={:?} queued_len={}",
-                                                key,
+                                                "queued new key: key={} queued_len={}",
+                                                crate::inner::safe_key(&key),
                                                 state.queued().len()
                                             );
                                         }
@@ -183,11 +183,11 @@ fn worker_loop(
                                     }
                                     TransferCmd::EnqueuePaused { inner, callbacks } => {
                                         let key = inner.dedupe_key();
-                                        crate::meow_flow_log!(
+                                        crate::meow_key_log!(
                                             "cmd_enqueue_paused",
-                                            "received enqueue_paused: task_id={:?} key={:?} chunk_size={}",
+                                            "received enqueue_paused: task_id={:?} key={} chunk_size={}",
                                             inner.task_id(),
-                                            key,
+                                            crate::inner::safe_key(&key),
                                             inner.chunk_size()
                                         );
                                         // Same duplicate detection as Enqueue so repeated imports stay idempotent.
@@ -212,10 +212,10 @@ fn worker_loop(
                                                 &state,
                                                 dup_dto,
                                             );
-                                            crate::meow_flow_log!(
+                                            crate::meow_warn_log!(
                                                 "cmd_enqueue_paused",
-                                                "duplicate key rejected: key={:?}",
-                                                key
+                                                "duplicate key rejected: key={}",
+                                                crate::inner::safe_key(&key)
                                             );
                                             continue;
                                         }
@@ -248,14 +248,14 @@ fn worker_loop(
                                                 group.entry().inner().total_size(),
                                             );
                                         }
-                                        crate::meow_flow_log!(
+                                        crate::meow_key_log!(
                                             "cmd_enqueue_paused",
-                                            "task registered as paused: key={:?}",
-                                            key
+                                            "task registered as paused: key={}",
+                                            crate::inner::safe_key(&key)
                                         );
                                     }
                                     TransferCmd::Pause { task_id, respond_to } => {
-                                        crate::meow_flow_log!(
+                                        crate::meow_key_log!(
                                             "cmd_pause",
                                             "pause requested: task_id={:?}",
                                             task_id
@@ -264,14 +264,14 @@ fn worker_loop(
                                         {
                                             pause_group(&mut state, &key).await;
                                             let _ = respond_to.send(Ok(()));
-                                            crate::meow_flow_log!(
+                                            crate::meow_key_log!(
                                                 "cmd_pause",
-                                                "pause accepted: task_id={:?} key={:?}",
+                                                "pause accepted: task_id={:?} key={}",
                                                 task_id,
-                                                key
+                                                crate::inner::safe_key(&key)
                                             );
                                         } else {
-                                            crate::meow_flow_log!(
+                                            crate::meow_warn_log!(
                                                 "cmd_pause",
                                                 "pause failed task not found: task_id={:?}",
                                                 task_id
@@ -286,7 +286,7 @@ fn worker_loop(
                                         .await;
                                     }
                                     TransferCmd::Resume { task_id, respond_to } => {
-                                        crate::meow_flow_log!(
+                                        crate::meow_key_log!(
                                             "cmd_resume",
                                             "resume requested: task_id={:?}",
                                             task_id
@@ -295,24 +295,24 @@ fn worker_loop(
                                         {
                                             let resume_ret = resume_group(&mut state, &key).await;
                                             if let Err(e) = &resume_ret {
-                                                crate::meow_flow_log!(
+                                                crate::meow_warn_log!(
                                                     "cmd_resume",
-                                                    "resume rejected: task_id={:?} key={:?} err={}",
+                                                    "resume rejected: task_id={:?} key={} err={}",
                                                     task_id,
-                                                    key,
+                                                    crate::inner::safe_key(&key),
                                                     e
                                                 );
                                             } else {
-                                                crate::meow_flow_log!(
+                                                crate::meow_key_log!(
                                                     "cmd_resume",
-                                                    "resume accepted: task_id={:?} key={:?}",
+                                                    "resume accepted: task_id={:?} key={}",
                                                     task_id,
-                                                    key
+                                                    crate::inner::safe_key(&key)
                                                 );
                                             }
                                             let _ = respond_to.send(resume_ret);
                                         } else {
-                                            crate::meow_flow_log!(
+                                            crate::meow_warn_log!(
                                                 "cmd_resume",
                                                 "resume failed task not found: task_id={:?}",
                                                 task_id
@@ -327,7 +327,7 @@ fn worker_loop(
                                         .await;
                                     }
                                     TransferCmd::Cancel { task_id, respond_to } => {
-                                        crate::meow_flow_log!(
+                                        crate::meow_key_log!(
                                             "cmd_cancel",
                                             "cancel requested: task_id={:?}",
                                             task_id
@@ -336,14 +336,14 @@ fn worker_loop(
                                         {
                                             cancel_group(&mut state, &key, &executor).await;
                                             let _ = respond_to.send(Ok(()));
-                                            crate::meow_flow_log!(
+                                            crate::meow_key_log!(
                                                 "cmd_cancel",
-                                                "cancel accepted: task_id={:?} key={:?}",
+                                                "cancel accepted: task_id={:?} key={}",
                                                 task_id,
-                                                key
+                                                crate::inner::safe_key(&key)
                                             );
                                         } else {
-                                            crate::meow_flow_log!(
+                                            crate::meow_warn_log!(
                                                 "cmd_cancel",
                                                 "cancel failed task not found: task_id={:?}",
                                                 task_id
@@ -372,7 +372,7 @@ fn worker_loop(
                                         });
                                     }
                                     TransferCmd::Close { respond_to } => {
-                                        crate::meow_flow_log!(
+                                        crate::meow_key_log!(
                                             "cmd_close",
                                             "close requested: active={} groups={} queued={} paused={}",
                                             state.active().len(),
@@ -406,7 +406,7 @@ fn worker_loop(
                                         // 之后阻塞 join 分发线程，确保所有终态回调（包括上面刚 emit
                                         // 的 Paused）在 close().await 返回前已经被回放完毕。
                                         shutdown_callback_dispatcher(&mut state, &mut cb_join);
-                                        crate::meow_flow_log!("cmd_close", "close finished, worker loop exiting");
+                                        crate::meow_key_log!("cmd_close", "close finished, worker loop exiting");
                                         let _ = respond_to.send(Ok(()));
                                         break;
                                     }
@@ -414,7 +414,7 @@ fn worker_loop(
                             }
                             maybe_event = worker_rx.recv() => {
                                 let Some(event) = maybe_event else { continue; };
-                                crate::meow_flow_log!("worker_loop", "worker event received");
+                                crate::meow_trace_log!("worker_loop", "worker event received");
                                 crate::inner::exec_impl::handle_worker_event::handle_worker_event(
                                     event,
                                     &mut state,
@@ -432,7 +432,7 @@ fn worker_loop(
                 });
             }
             Err(e) => {
-                crate::meow_flow_log!("worker_loop", "runtime creation failed: {}", e);
+                crate::meow_error_log!("worker_loop", "runtime creation failed: {}", e);
                 let _ = startup_tx.send(Err(MeowError::from_code(
                     InnerErrorCode::RuntimeCreationFailedError,
                     format!("runtime build failed: {}", e),
@@ -451,8 +451,8 @@ fn worker_loop(
 async fn pause_group(state: &mut SchedulerState, key: &UniqueId) {
     crate::meow_flow_log!(
         "pause_group",
-        "pause begin: key={:?} active={} queued={} paused={}",
-        key,
+        "pause begin: key={} active={} queued={} paused={}",
+        crate::inner::safe_key(key),
         state.active().contains_key(key),
         state.queued_set().contains(key),
         state.paused_set().contains(key)
@@ -484,8 +484,8 @@ async fn pause_group(state: &mut SchedulerState, key: &UniqueId) {
         );
         crate::meow_flow_log!(
             "pause_group",
-            "pause status emitted: key={:?} offset={}",
-            key,
+            "pause status emitted: key={} offset={}",
+            crate::inner::safe_key(key),
             current
         );
     }
@@ -494,15 +494,19 @@ async fn pause_group(state: &mut SchedulerState, key: &UniqueId) {
 async fn resume_group(state: &mut SchedulerState, key: &UniqueId) -> Result<(), MeowError> {
     crate::meow_flow_log!(
         "resume_group",
-        "resume begin: key={:?} active={} queued={} paused={}",
-        key,
+        "resume begin: key={} active={} queued={} paused={}",
+        crate::inner::safe_key(key),
         state.active().contains_key(key),
         state.queued_set().contains(key),
         state.paused_set().contains(key)
     );
     // 非 paused 任务不允许 resume，防止错误状态转换。
     if !state.paused_set().contains(key) {
-        crate::meow_flow_log!("resume_group", "resume rejected not paused: key={:?}", key);
+        crate::meow_warn_log!(
+            "resume_group",
+            "resume rejected not paused: key={}",
+            crate::inner::safe_key(key)
+        );
         return Err(MeowError::from_code(
             InnerErrorCode::InvalidTaskState,
             "resume target is not paused".to_string(),
@@ -510,10 +514,10 @@ async fn resume_group(state: &mut SchedulerState, key: &UniqueId) -> Result<(), 
     }
     // 仍在 active 说明 pause 正在收敛中，先拒绝本次 resume，避免和取消事件竞态。
     if state.active().contains_key(key) {
-        crate::meow_flow_log!(
+        crate::meow_warn_log!(
             "resume_group",
-            "resume rejected still stopping: key={:?}",
-            key
+            "resume rejected still stopping: key={}",
+            crate::inner::safe_key(key)
         );
         return Err(MeowError::from_code(
             InnerErrorCode::InvalidTaskState,
@@ -524,10 +528,10 @@ async fn resume_group(state: &mut SchedulerState, key: &UniqueId) -> Result<(), 
     state.paused_set_mut().remove(key);
     // 若组已不存在则属于内部状态异常，直接报错而不是静默忽略。
     let Some(group) = state.groups().get(key) else {
-        crate::meow_flow_log!(
+        crate::meow_warn_log!(
             "resume_group",
-            "resume rejected missing group: key={:?}",
-            key
+            "resume rejected missing group: key={}",
+            crate::inner::safe_key(key)
         );
         return Err(MeowError::from_code(
             InnerErrorCode::InvalidTaskState,
@@ -549,12 +553,16 @@ async fn resume_group(state: &mut SchedulerState, key: &UniqueId) -> Result<(), 
         state.queued_set_mut().insert(key.clone());
         crate::meow_flow_log!(
             "resume_group",
-            "resume requeued key={:?} queued_len={}",
-            key,
+            "resume requeued key={} queued_len={}",
+            crate::inner::safe_key(key),
             state.queued().len()
         );
     }
-    crate::meow_flow_log!("resume_group", "resume success: key={:?}", key);
+    crate::meow_flow_log!(
+        "resume_group",
+        "resume success: key={}",
+        crate::inner::safe_key(key)
+    );
     Ok(())
 }
 
@@ -565,8 +573,8 @@ async fn cancel_group(
 ) {
     crate::meow_flow_log!(
         "cancel_group",
-        "cancel begin: key={:?} active={} queued={} paused={}",
-        key,
+        "cancel begin: key={} active={} queued={} paused={}",
+        crate::inner::safe_key(key),
         state.active().contains_key(key),
         state.queued_set().contains(key),
         state.paused_set().contains(key)
@@ -591,8 +599,8 @@ async fn cancel_group(
             // for out-of-band cleanup. We continue local teardown regardless.
             crate::meow_warn_log!(
                 "cancel_group",
-                "protocol abort failed but continue cleanup: key={:?} err={}",
-                key,
+                "protocol abort failed but continue cleanup: key={} err={}",
+                crate::inner::safe_key(key),
                 err
             );
         }
@@ -611,8 +619,8 @@ async fn cancel_group(
         );
         crate::meow_flow_log!(
             "cancel_group",
-            "cancel status emitted: key={:?} offset={}",
-            key,
+            "cancel status emitted: key={} offset={}",
+            crate::inner::safe_key(key),
             current
         );
     }
@@ -662,7 +670,7 @@ impl Executor {
         executor: Arc<dyn TransferTrait>,
         global_progress_listener: Arc<RwLock<Vec<(GlobalProgressListenerId, ProgressCb)>>>,
     ) -> Result<Self, MeowError> {
-        crate::meow_flow_log!(
+        crate::meow_key_log!(
             "executor",
             "executor new: max_upload={} max_download={}",
             config.max_upload_concurrency(),
@@ -689,7 +697,7 @@ impl Executor {
             executor,
             cb_join,
         )?;
-        crate::meow_flow_log!("executor", "executor worker started");
+        crate::meow_key_log!("executor", "executor worker started");
         Ok(Self {
             cmd_tx,
             worker_join: Mutex::new(Some(worker_join)),
@@ -745,7 +753,7 @@ impl Drop for Executor {
                 );
             }
             Err(e) => {
-                crate::meow_flow_log!(
+                crate::meow_warn_log!(
                     "executor_drop",
                     "best-effort Close try_send skipped: {}; relying on \
                      cmd_tx drop to unblock worker loop",
@@ -777,12 +785,21 @@ impl Executor {
         tokio::task::spawn_blocking(move || handle.join())
             .await
             .map_err(|e| {
+                crate::meow_error_log!(
+                    "executor_close",
+                    "join_worker_thread join task failed: err={}",
+                    e
+                );
                 MeowError::from_code(
                     InnerErrorCode::Unknown,
                     format!("worker thread join task failed: {}", e),
                 )
             })?
             .map_err(|_| {
+                crate::meow_error_log!(
+                    "executor_close",
+                    "worker thread panicked during shutdown"
+                );
                 MeowError::from_code_str(
                     InnerErrorCode::Unknown,
                     "worker thread panicked during shutdown",
@@ -809,14 +826,14 @@ impl Executor {
         let id = inner.task_id();
         crate::meow_flow_log!(
             "executor_api",
-            "try_enqueue send: task_id={:?} key={:?}",
+            "try_enqueue send: task_id={:?} key={}",
             id,
-            inner.dedupe_key()
+            crate::inner::safe_key(&inner.dedupe_key())
         );
         self.cmd_tx
             .try_send(TransferCmd::Enqueue { inner, callbacks })
             .map_err(|e| {
-                crate::meow_flow_log!(
+                crate::meow_warn_log!(
                     "executor_api",
                     "try_enqueue send failed: task_id={:?} err={}",
                     id,
@@ -845,14 +862,14 @@ impl Executor {
         let id = inner.task_id();
         crate::meow_flow_log!(
             "executor_api",
-            "try_enqueue_paused send: task_id={:?} key={:?}",
+            "try_enqueue_paused send: task_id={:?} key={}",
             id,
-            inner.dedupe_key()
+            crate::inner::safe_key(&inner.dedupe_key())
         );
         self.cmd_tx
             .try_send(TransferCmd::EnqueuePaused { inner, callbacks })
             .map_err(|e| {
-                crate::meow_flow_log!(
+                crate::meow_warn_log!(
                     "executor_api",
                     "try_enqueue_paused send failed: task_id={:?} err={}",
                     id,
@@ -882,7 +899,7 @@ impl Executor {
             })
             .await
             .map_err(|e| {
-                crate::meow_flow_log!(
+                crate::meow_warn_log!(
                     "executor_api",
                     "pause send failed: task_id={:?} err={}",
                     task_id,
@@ -895,7 +912,7 @@ impl Executor {
             })?;
         crate::meow_flow_log!("executor_api", "pause send ok: task_id={:?}", task_id);
         rx.await.map_err(|e| {
-            crate::meow_flow_log!(
+            crate::meow_warn_log!(
                 "executor_api",
                 "pause response await failed: task_id={:?} err={}",
                 task_id,
@@ -919,7 +936,7 @@ impl Executor {
             })
             .await
             .map_err(|e| {
-                crate::meow_flow_log!(
+                crate::meow_warn_log!(
                     "executor_api",
                     "resume send failed: task_id={:?} err={}",
                     task_id,
@@ -932,7 +949,7 @@ impl Executor {
             })?;
         crate::meow_flow_log!("executor_api", "resume send ok: task_id={:?}", task_id);
         rx.await.map_err(|e| {
-            crate::meow_flow_log!(
+            crate::meow_warn_log!(
                 "executor_api",
                 "resume response await failed: task_id={:?} err={}",
                 task_id,
@@ -956,7 +973,7 @@ impl Executor {
             })
             .await
             .map_err(|e| {
-                crate::meow_flow_log!(
+                crate::meow_warn_log!(
                     "executor_api",
                     "cancel send failed: task_id={:?} err={}",
                     task_id,
@@ -969,7 +986,7 @@ impl Executor {
             })?;
         crate::meow_flow_log!("executor_api", "cancel send ok: task_id={:?}", task_id);
         rx.await.map_err(|e| {
-            crate::meow_flow_log!(
+            crate::meow_warn_log!(
                 "executor_api",
                 "cancel response await failed: task_id={:?} err={}",
                 task_id,
@@ -983,20 +1000,20 @@ impl Executor {
     }
 
     pub(crate) async fn snapshot(&self) -> Result<TransferSnapshot, MeowError> {
-        crate::meow_flow_log!("executor_api", "snapshot send");
+        crate::meow_trace_log!("executor_api", "snapshot send");
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(TransferCmd::Snapshot { respond_to: tx })
             .await
             .map_err(|e| {
-                crate::meow_flow_log!("executor_api", "snapshot send failed: err={}", e);
+                crate::meow_warn_log!("executor_api", "snapshot send failed: err={}", e);
                 MeowError::from_code(
                     InnerErrorCode::CommandSendFailed,
                     format!("snapshot cmd_tx send failed: {}", e),
                 )
             })?;
         rx.await.map_err(|e| {
-            crate::meow_flow_log!("executor_api", "snapshot response await failed: err={}", e);
+            crate::meow_warn_log!("executor_api", "snapshot response await failed: err={}", e);
             MeowError::from_code(
                 InnerErrorCode::CommandResponseFailed,
                 format!("snapshot rx.await failed: {}", e),
@@ -1005,19 +1022,20 @@ impl Executor {
     }
 
     pub(crate) async fn close(&self) -> Result<(), MeowError> {
-        crate::meow_flow_log!("executor_api", "close send");
+        crate::meow_key_log!("executor_api", "close send");
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(TransferCmd::Close { respond_to: tx })
             .await
             .map_err(|e| {
-                crate::meow_flow_log!("executor_api", "close send failed: err={}", e);
+                crate::meow_warn_log!("executor_api", "close send failed: err={}", e);
                 MeowError::from_code(
                     InnerErrorCode::CommandSendFailed,
                     format!("close_failed: {}", e),
                 )
             })?;
         let result = rx.await.map_err(|e| {
+            crate::meow_warn_log!("executor_api", "close response await failed: err={}", e);
             MeowError::from_code(
                 InnerErrorCode::CommandResponseFailed,
                 format!("close response failed: {}", e),

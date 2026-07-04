@@ -76,7 +76,7 @@ impl AliOssDirectUpload {
         additional_headers: Option<&str>,
     ) -> Result<reqwest::header::HeaderMap, MeowError> {
         let (now, date) = current_date();
-        let signing_key = self.signing_key_for(&date);
+        let signing_key = self.signing_key_for(&date)?;
         signed_headers_with_key(
             method,
             canonical_uri,
@@ -97,19 +97,19 @@ impl AliOssDirectUpload {
     /// clock jump that changes the date string — recomputes it (passive
     /// invalidation, no timer). The cached material is secret-derived, hence the
     /// non-`Debug` [`SecretKeyBytes`] wrapper.
-    fn signing_key_for(&self, date: &str) -> SecretKeyBytes {
+    fn signing_key_for(&self, date: &str) -> Result<SecretKeyBytes, MeowError> {
         let mut guard = self
             .signing_key_cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some((cached_date, key)) = guard.as_ref() {
             if cached_date == date {
-                return key.clone();
+                return Ok(key.clone());
             }
         }
-        let key = derive_signing_key(self.access_key_secret.as_str(), date, self.region.as_str());
+        let key = derive_signing_key(self.access_key_secret.as_str(), date, self.region.as_str())?;
         *guard = Some((date.to_string(), key.clone()));
-        key
+        Ok(key)
     }
 
     async fn initiate_multipart_upload(
@@ -129,6 +129,17 @@ impl AliOssDirectUpload {
             .send()
             .await
             .map_err(|e| {
+                crate::log::emit_lazy(|| {
+                    crate::log::Log::error(
+                        "initiate",
+                        format!(
+                            "oss initiate multipart send failed: {}",
+                            crate::log::redact_secrets(&e.to_string())
+                        ),
+                    )
+                    .with_task_id(task.file_sign())
+                    .with_url(task.url())
+                });
                 MeowError::from_source(
                     InnerErrorCode::HttpError,
                     "oss initiate multipart failed",
@@ -138,6 +149,18 @@ impl AliOssDirectUpload {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
+            crate::log::emit_lazy(|| {
+                crate::log::Log::error(
+                    "initiate",
+                    format!(
+                        "oss initiate multipart non-2xx: {status}, body: {}",
+                        crate::log::redact_secrets(&body)
+                    ),
+                )
+                .with_task_id(task.file_sign())
+                .with_http_status(status.as_u16())
+                .with_url(task.url())
+            });
             return Err(MeowError::from_code(
                 InnerErrorCode::ResponseStatusError,
                 format!("oss initiate multipart failed: {status}, body: {body}"),
@@ -145,6 +168,17 @@ impl AliOssDirectUpload {
             .with_http_status(status.as_u16()));
         }
         extract_xml_tag(&body, "UploadId").ok_or_else(|| {
+            crate::log::emit_lazy(|| {
+                crate::log::Log::error(
+                    "initiate",
+                    format!(
+                        "oss initiate multipart 2xx but UploadId unparseable, body: {}",
+                        crate::log::redact_secrets(&body)
+                    ),
+                )
+                .with_task_id(task.file_sign())
+                .with_url(task.url())
+            });
             MeowError::from_code(
                 InnerErrorCode::ResponseParseError,
                 format!("oss initiate multipart missing UploadId: {body}"),
@@ -185,6 +219,18 @@ impl AliOssDirectUpload {
             .send()
             .await
             .map_err(|e| {
+                crate::log::emit_lazy(|| {
+                    crate::log::Log::warn(
+                        "list_uploads",
+                        format!(
+                            "oss list multipart uploads send failed: {}",
+                            crate::log::redact_secrets(&e.to_string())
+                        ),
+                    )
+                    .with_task_id(task.file_sign())
+                    .with_key(object_key.as_str())
+                    .with_url(task.url())
+                });
                 MeowError::from_source(
                     InnerErrorCode::HttpError,
                     "oss list multipart uploads failed",
@@ -194,6 +240,19 @@ impl AliOssDirectUpload {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
+            crate::log::emit_lazy(|| {
+                crate::log::Log::warn(
+                    "list_uploads",
+                    format!(
+                        "oss list multipart uploads non-2xx: {status}, body: {}",
+                        crate::log::redact_secrets(&body)
+                    ),
+                )
+                .with_task_id(task.file_sign())
+                .with_key(object_key.as_str())
+                .with_http_status(status.as_u16())
+                .with_url(task.url())
+            });
             return Err(MeowError::from_code(
                 InnerErrorCode::ResponseStatusError,
                 format!("oss list multipart uploads failed: {status}, body: {body}"),
@@ -202,6 +261,17 @@ impl AliOssDirectUpload {
         }
         let ids = extract_upload_ids_for_key(&body, &object_key);
         if ids.len() > 1 {
+            crate::log::emit_lazy(|| {
+                crate::log::Log::error(
+                    "list_uploads",
+                    format!(
+                        "found multiple multipart sessions for object '{object_key}'; cannot safely adopt"
+                    ),
+                )
+                .with_task_id(task.file_sign())
+                .with_key(object_key.as_str())
+                .with_url(task.url())
+            });
             return Err(MeowError::from_code(
                 InnerErrorCode::InvalidTaskState,
                 format!("found multiple multipart sessions for object '{object_key}'"),
@@ -232,11 +302,34 @@ impl AliOssDirectUpload {
             .send()
             .await
             .map_err(|e| {
+                crate::log::emit_lazy(|| {
+                    crate::log::Log::warn(
+                        "list_parts",
+                        format!(
+                            "oss list parts send failed: {}",
+                            crate::log::redact_secrets(&e.to_string())
+                        ),
+                    )
+                    .with_task_id(task.file_sign())
+                    .with_url(task.url())
+                });
                 MeowError::from_source(InnerErrorCode::HttpError, "oss list parts failed", e)
             })?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
+            crate::log::emit_lazy(|| {
+                crate::log::Log::warn(
+                    "list_parts",
+                    format!(
+                        "oss list parts non-2xx: {status}, body: {}",
+                        crate::log::redact_secrets(&body)
+                    ),
+                )
+                .with_task_id(task.file_sign())
+                .with_http_status(status.as_u16())
+                .with_url(task.url())
+            });
             return Err(MeowError::from_code(
                 InnerErrorCode::ResponseStatusError,
                 format!("oss list parts failed: {status}, body: {body}"),
@@ -322,6 +415,17 @@ impl AliOssDirectUpload {
             .send()
             .await
             .map_err(|e| {
+                crate::log::emit_lazy(|| {
+                    crate::log::Log::warn(
+                        "abort",
+                        format!(
+                            "oss abort multipart send failed (uploadId={upload_id}); session id retained: {}",
+                            crate::log::redact_secrets(&e.to_string())
+                        ),
+                    )
+                    .with_task_id(task.file_sign())
+                    .with_url(task.url())
+                });
                 MeowError::from_source(
                     InnerErrorCode::HttpError,
                     format!("oss abort multipart upload failed (uploadId={upload_id})"),
@@ -331,6 +435,18 @@ impl AliOssDirectUpload {
         let status = resp.status();
         if !(status.is_success() || status == reqwest::StatusCode::NOT_FOUND) {
             let body = resp.text().await.unwrap_or_default();
+            crate::log::emit_lazy(|| {
+                crate::log::Log::warn(
+                    "abort",
+                    format!(
+                        "oss abort multipart non-2xx-non-404: {status}, uploadId={upload_id}, body: {}; session id retained",
+                        crate::log::redact_secrets(&body)
+                    ),
+                )
+                .with_task_id(task.file_sign())
+                .with_http_status(status.as_u16())
+                .with_url(task.url())
+            });
             return Err(MeowError::from_code(
                 InnerErrorCode::ResponseStatusError,
                 format!(
@@ -377,6 +493,15 @@ impl BreakpointUpload for AliOssDirectUpload {
                 let mut state = self.session.lock().await;
                 state.target_url = Some(ctx.task.url().to_string());
                 state.upload_id = Some(upload_id.clone());
+                crate::log::emit_lazy(|| {
+                    crate::log::Log::key(
+                        "initiate",
+                        format!("oss multipart adopted existing session (uploadId={upload_id})"),
+                    )
+                    .with_task_id(ctx.task.file_sign())
+                    .with_offset(ctx.local_offset)
+                    .with_url(ctx.task.url())
+                });
                 return Ok(UploadResumeInfo {
                     completed_file_id: None,
                     next_byte: Some(ctx.local_offset),
@@ -392,6 +517,14 @@ impl BreakpointUpload for AliOssDirectUpload {
         let mut state = self.session.lock().await;
         state.target_url = Some(ctx.task.url().to_string());
         state.upload_id = Some(upload_id.clone());
+        crate::log::emit_lazy(|| {
+            crate::log::Log::key(
+                "initiate",
+                format!("oss multipart initiated (uploadId={upload_id})"),
+            )
+            .with_task_id(ctx.task.file_sign())
+            .with_url(ctx.task.url())
+        });
         Ok(UploadResumeInfo {
             completed_file_id: None,
             next_byte: Some(0),
@@ -410,6 +543,19 @@ impl BreakpointUpload for AliOssDirectUpload {
         })?;
         let part_number = (ctx.offset / ctx.task.chunk_size()) + 1;
         if part_number > MAX_OSS_PART_NUMBER {
+            crate::log::emit_lazy(|| {
+                crate::log::Log::error(
+                    "upload_part",
+                    format!(
+                        "computed partNumber {part_number} exceeds MAX_OSS_PART_NUMBER {MAX_OSS_PART_NUMBER}"
+                    ),
+                )
+                .with_task_id(ctx.task.file_sign())
+                .with_part(part_number - 1)
+                .with_offset(ctx.offset)
+                .with_byte_len(ctx.chunk.len() as u64)
+                .with_url(ctx.task.url())
+            });
             return Err(MeowError::from_code(
                 InnerErrorCode::InvalidRange,
                 format!("partNumber out of range: {part_number}"),
@@ -432,12 +578,41 @@ impl BreakpointUpload for AliOssDirectUpload {
             .send()
             .await
             .map_err(|e| {
+                crate::log::emit_lazy(|| {
+                    crate::log::Log::error(
+                        "upload_part",
+                        format!(
+                            "oss upload part send failed (uploadId={upload_id}): {}",
+                            crate::log::redact_secrets(&e.to_string())
+                        ),
+                    )
+                    .with_task_id(ctx.task.file_sign())
+                    .with_part(part_number - 1)
+                    .with_offset(ctx.offset)
+                    .with_byte_len(ctx.chunk.len() as u64)
+                    .with_url(ctx.task.url())
+                });
                 MeowError::from_source(InnerErrorCode::HttpError, "oss upload part failed", e)
             })?;
         let status = resp.status();
         let etag_present = resp.headers().get(ETAG).is_some();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            crate::log::emit_lazy(|| {
+                crate::log::Log::error(
+                    "upload_part",
+                    format!(
+                        "oss upload part non-2xx: {status}, uploadId={upload_id}, body: {}",
+                        crate::log::redact_secrets(&body)
+                    ),
+                )
+                .with_task_id(ctx.task.file_sign())
+                .with_part(part_number - 1)
+                .with_offset(ctx.offset)
+                .with_byte_len(ctx.chunk.len() as u64)
+                .with_http_status(status.as_u16())
+                .with_url(ctx.task.url())
+            });
             return Err(MeowError::from_code(
                 InnerErrorCode::ResponseStatusError,
                 format!("oss upload part failed: {status}, body: {body}"),
@@ -445,6 +620,20 @@ impl BreakpointUpload for AliOssDirectUpload {
             .with_http_status(status.as_u16()));
         }
         if !etag_present {
+            crate::log::emit_lazy(|| {
+                crate::log::Log::error(
+                    "upload_part",
+                    format!(
+                        "oss upload part 2xx but missing ETag header; part not durably acked (uploadId={upload_id})"
+                    ),
+                )
+                .with_task_id(ctx.task.file_sign())
+                .with_part(part_number - 1)
+                .with_offset(ctx.offset)
+                .with_byte_len(ctx.chunk.len() as u64)
+                .with_http_status(status.as_u16())
+                .with_url(ctx.task.url())
+            });
             return Err(MeowError::from_code_str(
                 InnerErrorCode::ResponseParseError,
                 "oss upload part success but missing ETag header",
@@ -468,6 +657,9 @@ impl BreakpointUpload for AliOssDirectUpload {
         let Some(upload_id) = upload_id else {
             return Ok(None);
         };
+        // Cloned before `upload_id` is moved into the query builder so the
+        // (non-credential) session id can be attached to the complete logs below.
+        let upload_id_for_log = upload_id.clone();
         let (url, raw_query) = Self::build_query_url(task, &[("uploadId", upload_id)])?;
         let mut headers = self.build_signed_headers(
             "POST",
@@ -487,6 +679,17 @@ impl BreakpointUpload for AliOssDirectUpload {
             .send()
             .await
             .map_err(|e| {
+                crate::log::emit_lazy(|| {
+                    crate::log::Log::error(
+                        "complete",
+                        format!(
+                            "oss complete multipart send failed (uploadId={upload_id_for_log}): {}",
+                            crate::log::redact_secrets(&e.to_string())
+                        ),
+                    )
+                    .with_task_id(task.file_sign())
+                    .with_url(task.url())
+                });
                 MeowError::from_source(
                     InnerErrorCode::HttpError,
                     "oss complete multipart upload failed",
@@ -496,6 +699,18 @@ impl BreakpointUpload for AliOssDirectUpload {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
+            crate::log::emit_lazy(|| {
+                crate::log::Log::error(
+                    "complete",
+                    format!(
+                        "oss complete multipart non-2xx: {status}, uploadId={upload_id_for_log}, body: {}",
+                        crate::log::redact_secrets(&body)
+                    ),
+                )
+                .with_task_id(task.file_sign())
+                .with_http_status(status.as_u16())
+                .with_url(task.url())
+            });
             return Err(MeowError::from_code(
                 InnerErrorCode::ResponseStatusError,
                 format!("oss complete multipart upload failed: {status}, body: {body}"),
@@ -503,6 +718,14 @@ impl BreakpointUpload for AliOssDirectUpload {
             .with_http_status(status.as_u16()));
         }
         self.session.lock().await.upload_id = None;
+        crate::log::emit_lazy(|| {
+            crate::log::Log::key(
+                "complete",
+                format!("oss multipart completed (uploadId={upload_id_for_log})"),
+            )
+            .with_task_id(task.file_sign())
+            .with_url(task.url())
+        });
         Ok(None)
     }
 

@@ -90,10 +90,10 @@ pub(crate) async fn transfer_chunk_with_retry(
     loop {
         // 在每次请求前检查取消，避免 pause/cancel 后仍继续发请求。
         if cancel.is_cancelled() {
-            crate::meow_flow_log!(
+            crate::meow_trace_log!(
                 "chunk_retry",
-                "cancel before transfer: key={:?} offset={} attempt={}",
-                key,
+                "cancel before transfer: key={} offset={} attempt={}",
+                crate::inner::safe_key(key),
                 offset,
                 attempt
             );
@@ -115,10 +115,10 @@ pub(crate) async fn transfer_chunk_with_retry(
             Ok(outcome) => {
                 // 若经过重试后成功，额外记录一次“重试恢复成功”日志。
                 if attempt > 0 {
-                    crate::meow_flow_log!(
+                    crate::meow_warn_log!(
                         "chunk_retry",
-                        "retry recovered: key={:?} offset={} attempts_used={} next_offset={}",
-                        key,
+                        "retry recovered: key={} offset={} attempts_used={} next_offset={}",
+                        crate::inner::safe_key(key),
                         offset,
                         attempt,
                         outcome.next_offset
@@ -130,13 +130,13 @@ pub(crate) async fn transfer_chunk_with_retry(
                 // pause/cancel 可能在 in-flight 请求返回后才落到令牌上；此时错误常为 HttpError
                 //（底层 Canceled/reset），应优先走取消分支而不是按网络错误重试或失败。
                 if cancel.is_cancelled() {
-                    crate::meow_flow_log!(
+                    crate::meow_trace_log!(
                         "chunk_retry",
-                        "cancel after chunk error: key={:?} offset={} attempt={} err={}",
-                        key,
+                        "cancel after chunk error: key={} offset={} attempt={} err={}",
+                        crate::inner::safe_key(key),
                         offset,
                         attempt,
-                        err
+                        crate::log::redact_secrets(&err.to_string())
                     );
                     return ChunkRetryResult::Cancelled;
                 }
@@ -144,38 +144,50 @@ pub(crate) async fn transfer_chunk_with_retry(
                 let retryable = is_transport_retryable(&err);
                 let reached_limit = attempt >= max_chunk_retries;
                 if !retryable || reached_limit {
-                    crate::meow_flow_log!(
-                        "chunk_retry",
-                        "give up: key={:?} offset={} attempt={} max_retries={} retryable={} err={}",
-                        key,
-                        offset,
-                        attempt,
-                        max_chunk_retries,
-                        retryable,
-                        err
-                    );
+                    crate::log::emit_lazy(|| {
+                        let mut log = crate::log::Log::error(
+                            "chunk_retry",
+                            format!(
+                                "give up: key={} offset={} attempt={} max_retries={} retryable={} err={}",
+                                crate::inner::safe_key(key),
+                                offset,
+                                attempt,
+                                max_chunk_retries,
+                                retryable,
+                                crate::log::redact_secrets(&err.to_string())
+                            ),
+                        )
+                        .with_offset(offset)
+                        .with_attempt(attempt)
+                        .with_max_retries(max_chunk_retries)
+                        .with_error_code(err.code());
+                        if let Some(status) = err.http_status() {
+                            log = log.with_http_status(status);
+                        }
+                        log
+                    });
                     return ChunkRetryResult::Failed(err);
                 }
 
                 // 计算下一次退避时长（指数退避 + 抖动）。
                 let delay_ms = calc_backoff_with_jitter_ms(attempt);
-                crate::meow_flow_log!(
+                crate::meow_trace_log!(
                     "chunk_retry",
-                    "retry scheduled: key={:?} offset={} attempt={} next_delay_ms={} err={}",
-                    key,
+                    "retry scheduled: key={} offset={} attempt={} next_delay_ms={} err={}",
+                    crate::inner::safe_key(key),
                     offset,
                     attempt + 1,
                     delay_ms,
-                    err
+                    crate::log::redact_secrets(&err.to_string())
                 );
 
                 // 在退避等待期间支持取消，保证控制语义响应及时。
                 tokio::select! {
                     _ = cancel.cancelled() => {
-                        crate::meow_flow_log!(
+                        crate::meow_trace_log!(
                             "chunk_retry",
-                            "cancel during backoff wait: key={:?} offset={} attempt={}",
-                            key,
+                            "cancel during backoff wait: key={} offset={} attempt={}",
+                            crate::inner::safe_key(key),
                             offset,
                             attempt
                         );
@@ -241,7 +253,13 @@ pub(crate) fn calc_backoff_with_jitter_ms(attempt: u32) -> u64 {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.subsec_nanos() as u64)
-        .unwrap_or(0);
+        .unwrap_or_else(|_| {
+            crate::meow_warn_log!(
+                "chunk_retry",
+                "system clock before unix epoch: backoff jitter source defaulted to 0"
+            );
+            0
+        });
     // ratio_percent 取值区间 [80, 120]（即 ±20%）。
     let jitter_span = CHUNK_RETRY_JITTER_PERCENT * 2;
     let ratio_percent = 100 - CHUNK_RETRY_JITTER_PERCENT + (nanos % (jitter_span + 1));

@@ -70,6 +70,13 @@ impl PresignedRangeDownload {
 
         let Some(refresher) = &self.url_refresher else {
             if Self::is_plan_expired(&plan)? {
+                crate::log::emit_lazy(|| {
+                    crate::log::Log::error(
+                        "range_get",
+                        "presigned range URL expired and no refresher is configured",
+                    )
+                    .with_url(plan.range_url.as_str())
+                });
                 return Err(MeowError::from_code_str(
                     InnerErrorCode::InvalidTaskState,
                     "presigned range URL expired and no refresher is configured",
@@ -78,9 +85,28 @@ impl PresignedRangeDownload {
             return Ok(plan);
         };
 
-        let mut refreshed = refresher.refresh_range_download(&plan)?;
+        let mut refreshed = refresher.refresh_range_download(&plan).map_err(|e| {
+            crate::log::emit_lazy(|| {
+                crate::log::Log::error(
+                    "range_get",
+                    format!(
+                        "presigned range URL refresh/re-sign failed: {}",
+                        crate::log::redact_secrets(&e.to_string())
+                    ),
+                )
+                .with_url(plan.range_url.as_str())
+            });
+            e
+        })?;
         if let (Some(old), Some(new)) = (plan.total_size, refreshed.total_size) {
             if old != new {
+                crate::log::emit_lazy(|| {
+                    crate::log::Log::error(
+                        "range_get",
+                        format!("refreshed range total_size mismatch: old={old} new={new}"),
+                    )
+                    .with_url(plan.range_url.as_str())
+                });
                 return Err(MeowError::from_code(
                     InnerErrorCode::InvalidTaskState,
                     format!("refreshed range total_size mismatch: old={old} new={new}"),
@@ -132,10 +158,12 @@ impl BreakpointDownload for PresignedRangeDownload {
         ctx.base.insert(
             RANGE,
             HeaderValue::from_str(ctx.range_value).map_err(|e| {
-                MeowError::from_code(
-                    InnerErrorCode::ParameterEmpty,
-                    format!("invalid range header value '{}': {e}", ctx.range_value),
-                )
+                let detail = format!("invalid range header value '{}': {e}", ctx.range_value);
+                crate::log::emit_lazy({
+                    let detail = detail.clone();
+                    move || crate::log::Log::warn("range_get", detail)
+                });
+                MeowError::from_code(InnerErrorCode::ParameterEmpty, detail)
             })?,
         );
         if !ctx.base.contains_key(ACCEPT) {

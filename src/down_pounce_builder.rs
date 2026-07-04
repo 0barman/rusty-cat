@@ -42,6 +42,11 @@ pub struct DownloadPounceBuilder {
     ///
     /// Effective range: `>= 0`; `0` means "do not retry".
     max_chunk_retries: u32,
+    /// Max chunks of this file downloaded concurrently (intra-file parallel).
+    /// Effective range: `>= 1`; `0` normalizes to `1` (strict serial).
+    max_parts_in_flight: usize,
+    /// Known total size in bytes; `0` means "discover via HEAD".
+    total_size: u64,
 }
 
 impl DownloadPounceBuilder {
@@ -92,6 +97,8 @@ impl DownloadPounceBuilder {
             breakpoint_download: None,
             breakpoint_download_http: None,
             max_chunk_retries: PounceTask::DEFAULT_MAX_CHUNK_RETRIES,
+            max_parts_in_flight: PounceTask::DEFAULT_MAX_PARTS_IN_FLIGHT,
+            total_size: 0,
         }
     }
 
@@ -225,6 +232,52 @@ impl DownloadPounceBuilder {
         self
     }
 
+    /// Maximum chunks of this file downloaded **concurrently** (intra-file
+    /// parallel parts). Default `1` (strict serial, byte-identical to legacy
+    /// behavior). A value `> 1` is honored only when the download protocol
+    /// returns `true` from
+    /// [`crate::download_trait::BreakpointDownload::supports_parallel_parts`]
+    /// (the bundled [`crate::api::StandardRangeDownload`] does) AND the total
+    /// size is known up front; otherwise the download stays serial. `0`
+    /// normalizes to `1`.
+    ///
+    /// Peak download memory for this file is `max_parts_in_flight * chunk_size`,
+    /// so keep it bounded. Concurrent downloads write parts out of order into a
+    /// pre-sized file and track progress in a `<file>.rcdl` sidecar for resume.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rusty_cat::api::DownloadPounceBuilder;
+    /// let _t = DownloadPounceBuilder::new("a.bin", "./a.bin", 1 << 20, "https://x")
+    ///     .with_max_parts_in_flight(4)
+    ///     .build();
+    /// ```
+    pub fn with_max_parts_in_flight(mut self, max_parts_in_flight: usize) -> Self {
+        self.max_parts_in_flight = PounceTask::normalized_max_parts_in_flight(max_parts_in_flight);
+        self
+    }
+
+    /// Supplies a known total size, so the executor SKIPS the HEAD probe and
+    /// builds the range grid directly. Use when the size is already known (e.g.
+    /// from an application metadata/check endpoint or a prior `Content-Range`
+    /// probe). `0` (default) means "discover via HEAD". Required in practice to
+    /// get intra-file concurrency for a URL whose server does not support HEAD.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use rusty_cat::api::DownloadPounceBuilder;
+    /// let _t = DownloadPounceBuilder::new("a.bin", "./a.bin", 1 << 20, "https://cdn/x")
+    ///     .with_total_size(119_584_768)
+    ///     .with_max_parts_in_flight(4)
+    ///     .build();
+    /// ```
+    pub fn with_total_size(mut self, total_size: u64) -> Self {
+        self.total_size = total_size;
+        self
+    }
+
     /// Builds the final download [`PounceTask`].
     ///
     /// This operation is infallible; validation occurs during enqueue/runtime.
@@ -249,7 +302,7 @@ impl DownloadPounceBuilder {
             file_name: self.file_name,
             file_path: self.file_path,
             upload_source: None,
-            total_size: 0,
+            total_size: self.total_size,
             chunk_size: self.chunk_size,
             url: self.url,
             // Download uses HEAD (prepare) + GET (chunks) hard-coded by the
@@ -263,8 +316,38 @@ impl DownloadPounceBuilder {
             breakpoint_download_http: self.breakpoint_download_http,
             max_chunk_retries: self.max_chunk_retries,
             max_upload_prepare_retries: PounceTask::DEFAULT_MAX_UPLOAD_PREPARE_RETRIES,
-            // Download never fans out into parallel parts; keep the serial default.
-            max_parts_in_flight: PounceTask::DEFAULT_MAX_PARTS_IN_FLIGHT,
+            max_parts_in_flight: self.max_parts_in_flight,
         }
+    }
+}
+
+#[cfg(test)]
+mod parts_tests {
+    use super::*;
+
+    #[test]
+    fn download_max_parts_defaults_to_one() {
+        let task = DownloadPounceBuilder::new("a", "./a", 1024, "https://x").build();
+        assert_eq!(task.max_parts_in_flight, 1);
+    }
+
+    #[test]
+    fn download_with_max_parts_round_trips_and_normalizes_zero() {
+        let t = DownloadPounceBuilder::new("a", "./a", 1024, "https://x")
+            .with_max_parts_in_flight(4)
+            .build();
+        assert_eq!(t.max_parts_in_flight, 4);
+        let z = DownloadPounceBuilder::new("a", "./a", 1024, "https://x")
+            .with_max_parts_in_flight(0)
+            .build();
+        assert_eq!(z.max_parts_in_flight, 1);
+    }
+
+    #[test]
+    fn download_with_total_size_sets_task_total() {
+        let t = DownloadPounceBuilder::new("a", "./a", 1024, "https://x")
+            .with_total_size(4096)
+            .build();
+        assert_eq!(t.total_size, 4096);
     }
 }

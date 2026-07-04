@@ -10,10 +10,10 @@ pub(crate) async fn handle_worker_event(event: WorkerEvent, state: &mut Schedule
             next_offset,
             total_size,
         } => {
-            crate::meow_flow_log!(
+            crate::meow_trace_log!(
                 "worker_event",
-                "progress: key={:?} next_offset={} total_size={}",
-                key,
+                "progress: key={} next_offset={} total_size={}",
+                crate::inner::safe_key(&key),
                 next_offset,
                 total_size
             );
@@ -35,6 +35,18 @@ pub(crate) async fn handle_worker_event(event: WorkerEvent, state: &mut Schedule
                         total_size,
                     );
                 }
+            } else {
+                crate::log::emit_lazy(|| {
+                    crate::log::Log::warn(
+                        "worker_event",
+                        format!(
+                            "stray Progress for dead group; ignored next_offset={} total_size={}",
+                            next_offset, total_size
+                        ),
+                    )
+                    .with_key(key.1.as_str())
+                    .with_offset(next_offset)
+                });
             }
         }
         WorkerEvent::Completed {
@@ -42,10 +54,10 @@ pub(crate) async fn handle_worker_event(event: WorkerEvent, state: &mut Schedule
             total_size,
             completion_payload,
         } => {
-            crate::meow_flow_log!(
+            crate::meow_key_log!(
                 "worker_event",
-                "completed: key={:?} total_size={}",
-                key,
+                "completed: key={} total_size={}",
+                crate::inner::safe_key(&key),
                 total_size
             );
             state.active_mut().remove(&key);
@@ -72,11 +84,18 @@ pub(crate) async fn handle_worker_event(event: WorkerEvent, state: &mut Schedule
                         completion_payload,
                     );
                 }
+            } else {
+                crate::log::emit_lazy(|| {
+                    crate::log::Log::warn(
+                        "worker_event",
+                        format!("Completed for unknown group; nothing to finalize total_size={}", total_size),
+                    )
+                    .with_key(key.1.as_str())
+                });
             }
             state.offsets_mut().remove(&key);
         }
         WorkerEvent::Failed { key, error } => {
-            crate::meow_flow_log!("worker_event", "failed: key={:?} error={}", key, error);
             state.active_mut().remove(&key);
             // 失败终态会结束任务生命周期，因此同步清理 paused 标记。
             state.paused_set_mut().remove(&key);
@@ -85,6 +104,22 @@ pub(crate) async fn handle_worker_event(event: WorkerEvent, state: &mut Schedule
                     .task_id_to_dedupe_mut()
                     .remove(&group.leader_inner().task_id());
                 let current = state.offsets().get(&key).copied().unwrap_or(0);
+                // Core chunk/part-failure log: terminal task failure with the
+                // contiguous offset reached and the underlying error detail.
+                // Emitted before `error` is moved into `TransferStatus::Failed`.
+                crate::log::emit_lazy(|| {
+                    let mut log = crate::log::Log::error(
+                        "worker_event",
+                        format!("task failed: {}", crate::log::redact_secrets(&error.to_string())),
+                    )
+                    .with_key(key.1.as_str())
+                    .with_offset(current)
+                    .with_error_code(error.code());
+                    if let Some(status) = error.http_status() {
+                        log = log.with_http_status(status);
+                    }
+                    log
+                });
                 crate::inner::exec_impl::emit::emit_status(
                     state,
                     group.entry(),
@@ -92,18 +127,27 @@ pub(crate) async fn handle_worker_event(event: WorkerEvent, state: &mut Schedule
                     current,
                     group.entry().inner().total_size(),
                 );
+            } else {
+                crate::log::emit_lazy(|| {
+                    crate::log::Log::warn(
+                        "worker_event",
+                        format!("Failed for unknown group; nothing to finalize error={}", crate::log::redact_secrets(&error.to_string())),
+                    )
+                    .with_key(key.1.as_str())
+                    .with_error_code(error.code())
+                });
             }
             state.offsets_mut().remove(&key);
         }
         WorkerEvent::Canceled { key } => {
-            crate::meow_flow_log!("worker_event", "canceled: key={:?}", key);
+            crate::meow_key_log!("worker_event", "canceled: key={}", crate::inner::safe_key(&key));
             state.active_mut().remove(&key);
             // 若 key 在 paused_set 中，表示该取消来自 pause 流程，仅收敛执行态，不销毁 group。
             if state.paused_set().contains(&key) {
-                crate::meow_flow_log!(
+                crate::meow_key_log!(
                     "worker_event",
-                    "canceled from pause flow; keep group for resume: key={:?}",
-                    key
+                    "canceled from pause flow; keep group for resume: key={}",
+                    crate::inner::safe_key(&key)
                 );
                 return;
             }
@@ -119,6 +163,14 @@ pub(crate) async fn handle_worker_event(event: WorkerEvent, state: &mut Schedule
                     current,
                     group.entry().inner().total_size(),
                 );
+            } else {
+                crate::log::emit_lazy(|| {
+                    crate::log::Log::warn(
+                        "worker_event",
+                        "Canceled for unknown group; nothing to finalize".to_string(),
+                    )
+                    .with_key(key.1.as_str())
+                });
             }
             state.offsets_mut().remove(&key);
         }
