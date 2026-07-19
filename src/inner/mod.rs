@@ -23,4 +23,6 @@ pub(crate) mod inner_task;
 pub(crate) mod scheduler_state;
 pub(crate) mod sign;
 pub(crate) mod task_callbacks;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(crate) mod worker_event;

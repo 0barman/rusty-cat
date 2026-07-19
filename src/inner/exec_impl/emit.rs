@@ -1,8 +1,10 @@
 use crate::file_transfer_record::FileTransferRecord;
 use crate::ids::TaskId;
 use crate::inner::group_state::RecordEntry;
+use crate::inner::inner_task::InnerTask;
 use crate::inner::scheduler_state::SchedulerState;
 use crate::inner::task_callbacks::{CompleteCb, ProgressCb};
+use crate::inner::UniqueId;
 use crate::transfer_status::TransferStatus;
 
 /// 投递一次进度回调到分发线程。
@@ -69,6 +71,24 @@ pub(crate) fn emit_global_progress(state: &SchedulerState, dto: FileTransferReco
     }
 }
 
+/// 汰选一个组当前最可信的文件总大小。
+///
+/// 运行期探测到的 total（来自 worker `Progress` 事件，经 prepare/分片响应得到，
+/// 见 [`SchedulerState::known_totals`]）是权威真值，优先采用；仅当尚无运行期
+/// 记录时，回退到构建期预设值（`with_total_size`，下载默认 0）。两者都缺失时
+/// 返回 0，由 [`emit_status`] 按"总大小未知"处理（progress 记 0.0）。
+///
+/// **不用 `max(runtime, preset)`**：调用方可能把预设值设得比真实对象更大
+/// （例如预设 10000 但远端 hint 为 4096）。若与运行期取 max，会把对外上报的
+/// total 永久抬高到错误的预设值，使进度永远到不了 100%。因此运行期值一旦出现
+/// 就无条件采信它，预设值只作为"运行期尚未知"时的兜底。
+pub(crate) fn effective_total(state: &SchedulerState, key: &UniqueId, inner: &InnerTask) -> u64 {
+    match state.known_totals().get(key).copied() {
+        Some(v) if v > 0 => v,
+        _ => inner.total_size(),
+    }
+}
+
 pub(crate) fn emit_status(
     state: &SchedulerState,
     entry: &RecordEntry,
@@ -102,4 +122,61 @@ pub(crate) fn emit_status(
         invoke_progress_cb(state, cb, dto.clone());
     }
     emit_global_progress(state, dto);
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::inner::test_support::{live_download_state, live_download_state_with_preset};
+
+    fn inner_of(
+        state: &crate::inner::scheduler_state::SchedulerState,
+        key: &crate::inner::UniqueId,
+    ) -> crate::inner::inner_task::InnerTask {
+        state
+            .groups()
+            .get(key)
+            .expect("group")
+            .entry()
+            .inner()
+            .clone()
+    }
+
+    /// 运行期值存在（下载常态：预设 0）→ 取运行期值。
+    #[tokio::test]
+    async fn effective_total_prefers_runtime_over_unset_preset() {
+        let (mut state, key) = live_download_state("eff_runtime").await;
+        state.known_totals_mut().insert(key.clone(), 4096);
+        let inner = inner_of(&state, &key);
+        assert_eq!(super::effective_total(&state, &key, &inner), 4096);
+    }
+
+    /// 双方都为 0 → 返回 0（total 未知，由 emit_status 按未知处理）。
+    #[tokio::test]
+    async fn effective_total_returns_zero_when_nothing_known() {
+        let (state, key) = live_download_state("eff_zero").await;
+        let inner = inner_of(&state, &key);
+        assert_eq!(super::effective_total(&state, &key, &inner), 0);
+    }
+
+    /// 无运行期记录时回退到预设值（with_total_size）。
+    #[tokio::test]
+    async fn effective_total_falls_back_to_preset_when_no_runtime() {
+        let (state, key) = live_download_state_with_preset("eff_fallback", 8192).await;
+        let inner = inner_of(&state, &key);
+        assert_eq!(super::effective_total(&state, &key, &inner), 8192);
+    }
+
+    /// 回归防护（finding #5）：运行期真值小于预设值时，必须采信运行期真值，
+    /// 不得因取 max 把 total 永久抬高到错误的预设值。
+    #[tokio::test]
+    async fn effective_total_runtime_wins_over_larger_preset() {
+        let (mut state, key) = live_download_state_with_preset("eff_shrink", 10000).await;
+        state.known_totals_mut().insert(key.clone(), 4096);
+        let inner = inner_of(&state, &key);
+        assert_eq!(
+            super::effective_total(&state, &key, &inner),
+            4096,
+            "运行期探测值必须压过更大的预设值"
+        );
+    }
 }
