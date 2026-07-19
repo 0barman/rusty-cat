@@ -87,15 +87,18 @@ pub(crate) async fn try_start_next(
 
             let inner = group.leader_inner().clone();
             let current = state.offsets().get(&key).copied().unwrap_or(0);
-            // 下载任务在 prepare 之前可能还不知道远端 total（inner.total_size()==0）；
-            // 这时先不发送 Transmission，避免对外看到 total=0 的误导进度。
-            if !(direction == Direction::Download && group.entry().inner().total_size() == 0) {
+            // 下载任务在 prepare 之前可能还不知道远端 total；优先取调度器记录的
+            // 运行期值（pause→resume 场景仍可用），仍为 0 时不发送 Transmission，
+            // 避免对外看到 total=0 的误导进度。
+            let start_total =
+                crate::inner::exec_impl::emit::effective_total(state, &key, group.entry().inner());
+            if !(direction == Direction::Download && start_total == 0) {
                 crate::inner::exec_impl::emit::emit_status(
                     state,
                     group.entry(),
                     TransferStatus::Transmission,
                     current,
-                    group.entry().inner().total_size(),
+                    start_total,
                 );
             }
 
@@ -119,6 +122,7 @@ pub(crate) async fn try_start_next(
             tokio::spawn(async move {
                 let panic_key = key.clone();
                 let panic_tx = worker_tx_clone.clone();
+                let panic_total = inner.total_size();
                 let worker = tokio::spawn(async move {
                     run_group(key, inner, cancel, worker_tx_clone, executor, start_offset).await;
                 });
@@ -143,6 +147,7 @@ pub(crate) async fn try_start_next(
                         .send(WorkerEvent::Failed {
                             key: panic_key,
                             error: err,
+                            total_size: panic_total,
                         })
                         .await;
                 }
@@ -207,7 +212,10 @@ async fn run_group(
     } = loop {
         if cancel.is_cancelled() {
             let _ = worker_tx
-                .send(WorkerEvent::Canceled { key: key.clone() })
+                .send(WorkerEvent::Canceled {
+                    key: key.clone(),
+                    total_size: inner.total_size(),
+                })
                 .await;
             return;
         }
@@ -216,7 +224,10 @@ async fn run_group(
             Err(e) => {
                 if cancel.is_cancelled() {
                     let _ = worker_tx
-                        .send(WorkerEvent::Canceled { key: key.clone() })
+                        .send(WorkerEvent::Canceled {
+                            key: key.clone(),
+                            total_size: inner.total_size(),
+                        })
                         .await;
                     return;
                 }
@@ -243,7 +254,13 @@ async fn run_group(
                         }
                         log
                     });
-                    let _ = worker_tx.send(WorkerEvent::Failed { key, error: e }).await;
+                    let _ = worker_tx
+                        .send(WorkerEvent::Failed {
+                            key,
+                            error: e,
+                            total_size: inner.total_size(),
+                        })
+                        .await;
                     return;
                 }
                 let delay_ms =
@@ -259,7 +276,12 @@ async fn run_group(
                 );
                 tokio::select! {
                     _ = cancel.cancelled() => {
-                        let _ = worker_tx.send(WorkerEvent::Canceled { key: key.clone() }).await;
+                        let _ = worker_tx
+                            .send(WorkerEvent::Canceled {
+                                key: key.clone(),
+                                total_size: inner.total_size(),
+                            })
+                            .await;
                         return;
                     }
                     _ = sleep(Duration::from_millis(delay_ms)) => {}
@@ -311,7 +333,12 @@ async fn run_group(
                 inner.task_id(),
                 offset
             );
-            let _ = worker_tx.send(WorkerEvent::Canceled { key }).await;
+            let _ = worker_tx
+                .send(WorkerEvent::Canceled {
+                    key,
+                    total_size: known_total,
+                })
+                .await;
             return;
         }
         // 分片传输通过独立 retry 模块执行：
@@ -339,7 +366,12 @@ async fn run_group(
                     inner.task_id(),
                     offset
                 );
-                let _ = worker_tx.send(WorkerEvent::Canceled { key }).await;
+                let _ = worker_tx
+                    .send(WorkerEvent::Canceled {
+                        key,
+                        total_size: known_total,
+                    })
+                    .await;
                 return;
             }
             crate::inner::exec_impl::retry::ChunkRetryResult::Failed(e) => {
@@ -362,7 +394,13 @@ async fn run_group(
                     }
                     log
                 });
-                let _ = worker_tx.send(WorkerEvent::Failed { key, error: e }).await;
+                let _ = worker_tx
+                    .send(WorkerEvent::Failed {
+                        key,
+                        error: e,
+                        total_size: known_total,
+                    })
+                    .await;
                 return;
             }
         };
@@ -513,7 +551,13 @@ async fn run_group_parallel(
                         }
                         log
                     });
-                    let _ = worker_tx.send(WorkerEvent::Failed { key, error: e }).await;
+                    let _ = worker_tx
+                        .send(WorkerEvent::Failed {
+                            key,
+                            error: e,
+                            total_size: known_total,
+                        })
+                        .await;
                 }
             }
         } else {
@@ -569,7 +613,13 @@ async fn run_group_parallel(
                     .with_task_id(inner.task_id().to_string())
                     .with_error_code(err.code())
                 });
-                let _ = worker_tx.send(WorkerEvent::Failed { key, error: err }).await;
+                let _ = worker_tx
+                    .send(WorkerEvent::Failed {
+                        key,
+                        error: err,
+                        total_size: known_total,
+                    })
+                    .await;
                 return;
             }
             Ok((off, ChunkRetryResult::Done(_))) => {
@@ -656,7 +706,13 @@ async fn run_group_parallel(
             }
             log
         });
-        let _ = worker_tx.send(WorkerEvent::Failed { key, error: e }).await;
+        let _ = worker_tx
+            .send(WorkerEvent::Failed {
+                key,
+                error: e,
+                total_size: known_total,
+            })
+            .await;
     } else if cancelled || cancel.is_cancelled() {
         // FLAW-1: re-check cancel right before finalizing so `complete` can never
         // race the `abort_upload` that `cancel_group` issues; treat a late cancel
@@ -668,7 +724,12 @@ async fn run_group_parallel(
             inner.task_id(),
             window.watermark()
         );
-        let _ = worker_tx.send(WorkerEvent::Canceled { key }).await;
+        let _ = worker_tx
+            .send(WorkerEvent::Canceled {
+                key,
+                total_size: known_total,
+            })
+            .await;
     } else {
         if !window.is_complete() {
             // Internal invariant: the success path must finalize only a fully
@@ -699,7 +760,13 @@ async fn run_group_parallel(
                 }
                 log
             });
-            let _ = worker_tx.send(WorkerEvent::Failed { key, error: err }).await;
+            let _ = worker_tx
+                .send(WorkerEvent::Failed {
+                    key,
+                    error: err,
+                    total_size: known_total,
+                })
+                .await;
             return;
         }
         match executor.complete(task).await {
@@ -736,7 +803,13 @@ async fn run_group_parallel(
                     }
                     log
                 });
-                let _ = worker_tx.send(WorkerEvent::Failed { key, error: e }).await;
+                let _ = worker_tx
+                    .send(WorkerEvent::Failed {
+                        key,
+                        error: e,
+                        total_size: known_total,
+                    })
+                    .await;
             }
         }
     }

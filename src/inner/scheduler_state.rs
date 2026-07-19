@@ -31,6 +31,12 @@ pub(crate) struct SchedulerState {
     active: HashMap<UniqueId, ActiveState>,
     /// 每个去重键的当前传输偏移（断点进度）；用于进度回调、失败恢复与重启续传。
     offsets: HashMap<UniqueId, u64>,
+    /// 每个去重键在运行期发现的文件总大小（来自 worker 的 Progress 事件）。
+    /// 下载任务构建时 total 往往未预设（为 0），真实值由 prepare/分片响应探测得到；
+    /// 终态与控制面事件发射时优先读这里（见 `exec_impl::emit::effective_total`），
+    /// 避免把已知总大小回退成未预设的 0。生命周期与 `offsets` 逐条对齐：
+    /// Progress 时写入、终态事件清理、Close 时清空、pause 期间保留。
+    known_totals: HashMap<UniqueId, u64>,
     /// 用户回调投递句柄；调度路径只通过它把 `(cb, dto)` 推到独立的回调线程，
     /// 不再在调度循环中同步调用闭包。
     /// 在 `Close` 命令处理路径中会被 `take()` 后 drop，从而关闭分发 channel
@@ -56,6 +62,7 @@ impl SchedulerState {
             paused_set: HashSet::new(),
             active: HashMap::new(),
             offsets: HashMap::new(),
+            known_totals: HashMap::new(),
             cb_submit: Some(cb_submit),
         }
     }
@@ -120,6 +127,14 @@ impl SchedulerState {
 
     pub(crate) fn offsets_mut(&mut self) -> &mut HashMap<UniqueId, u64> {
         &mut self.offsets
+    }
+
+    pub(crate) fn known_totals(&self) -> &HashMap<UniqueId, u64> {
+        &self.known_totals
+    }
+
+    pub(crate) fn known_totals_mut(&mut self) -> &mut HashMap<UniqueId, u64> {
+        &mut self.known_totals
     }
 
     pub(crate) fn task_id_to_dedupe(&self) -> &HashMap<TaskId, UniqueId> {

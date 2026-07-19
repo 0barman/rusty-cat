@@ -146,12 +146,17 @@ fn worker_loop(
 
                                         if let Some(group) = state.groups().get(&key) {
                                             let current = state.offsets().get(&key).copied().unwrap_or(0);
+                                            let total = crate::inner::exec_impl::emit::effective_total(
+                                                &state,
+                                                &key,
+                                                group.entry().inner(),
+                                            );
                                             crate::inner::exec_impl::emit::emit_status(
                                                 &state,
                                                 group.entry(),
                                                 TransferStatus::Pending,
                                                 current,
-                                                group.entry().inner().total_size(),
+                                                total,
                                             );
                                             if should_send_running {
                                                 crate::inner::exec_impl::emit::emit_status(
@@ -159,7 +164,7 @@ fn worker_loop(
                                                     group.entry(),
                                                     TransferStatus::Transmission,
                                                     current,
-                                                    group.entry().inner().total_size(),
+                                                    total,
                                                 );
                                             }
                                         }
@@ -240,12 +245,17 @@ fn worker_loop(
                                             // from their own persisted record.
                                             let current =
                                                 state.offsets().get(&key).copied().unwrap_or(0);
+                                            let total = crate::inner::exec_impl::emit::effective_total(
+                                                &state,
+                                                &key,
+                                                group.entry().inner(),
+                                            );
                                             crate::inner::exec_impl::emit::emit_status(
                                                 &state,
                                                 group.entry(),
                                                 TransferStatus::Paused,
                                                 current,
-                                                group.entry().inner().total_size(),
+                                                total,
                                             );
                                         }
                                         crate::meow_key_log!(
@@ -387,12 +397,17 @@ fn worker_loop(
                                         // 终态收进队列；下一步关闭 channel 后线程会先 drain 再退出。
                                         for (key, group) in state.groups().iter() {
                                             let current = state.offsets().get(key).copied().unwrap_or(0);
+                                            let total = crate::inner::exec_impl::emit::effective_total(
+                                                &state,
+                                                key,
+                                                group.entry().inner(),
+                                            );
                                             crate::inner::exec_impl::emit::emit_status(
                                                 &state,
                                                 group.entry(),
                                                 TransferStatus::Paused,
                                                 current,
-                                                group.entry().inner().total_size(),
+                                                total,
                                             );
                                         }
                                         state.active_mut().clear();
@@ -402,6 +417,7 @@ fn worker_loop(
                                         state.queued_set_mut().clear();
                                         state.paused_set_mut().clear();
                                         state.offsets_mut().clear();
+                                        state.known_totals_mut().clear();
                                         // 关闭回调 channel：drop 唯一持有的 sender。
                                         // 之后阻塞 join 分发线程，确保所有终态回调（包括上面刚 emit
                                         // 的 Paused）在 close().await 返回前已经被回放完毕。
@@ -475,12 +491,13 @@ async fn pause_group(state: &mut SchedulerState, key: &UniqueId) {
         let entry = group.entry();
         // 使用当前 offset 作为暂停进度，保持对外可观测进度连续。
         let current = state.offsets().get(key).copied().unwrap_or(0);
+        let total = crate::inner::exec_impl::emit::effective_total(state, key, entry.inner());
         crate::inner::exec_impl::emit::emit_status(
             state,
             entry,
             TransferStatus::Paused,
             current,
-            entry.inner().total_size(),
+            total,
         );
         crate::meow_flow_log!(
             "pause_group",
@@ -540,12 +557,13 @@ async fn resume_group(state: &mut SchedulerState, key: &UniqueId) -> Result<(), 
     };
     // 当前 offset 继续作为恢复起点，通知外部进入 Pending（待调度）状态。
     let current = state.offsets().get(key).copied().unwrap_or(0);
+    let total = crate::inner::exec_impl::emit::effective_total(state, key, group.entry().inner());
     crate::inner::exec_impl::emit::emit_status(
         state,
         group.entry(),
         TransferStatus::Pending,
         current,
-        group.entry().inner().total_size(),
+        total,
     );
     // 仅当不在 active 且不在 queued 时重新入队，避免重复排队。
     if !state.active().contains_key(key) && !state.queued_set().contains(key) {
@@ -610,12 +628,13 @@ async fn cancel_group(
             .remove(&group.leader_inner().task_id());
         let entry = group.entry();
         let current = state.offsets().get(key).copied().unwrap_or(0);
+        let total = crate::inner::exec_impl::emit::effective_total(state, key, entry.inner());
         crate::inner::exec_impl::emit::emit_status(
             state,
             entry,
             TransferStatus::Canceled,
             current,
-            entry.inner().total_size(),
+            total,
         );
         crate::meow_flow_log!(
             "cancel_group",
@@ -623,6 +642,12 @@ async fn cancel_group(
             crate::inner::safe_key(key),
             current
         );
+        // 控制面取消自成闭环：同步清理断点/总大小记录，不再依赖一个可能永远
+        // 不会到达的 worker Canceled 事件（对已 paused 的任务，run_group 早已退出，
+        // 没有 worker 再发终态事件）。否则 offsets/known_totals 会残留成孤儿，
+        // 并被后续复用同一去重键(URL)的新任务读到陈旧值。
+        state.offsets_mut().remove(key);
+        state.known_totals_mut().remove(key);
     }
 }
 
@@ -1072,4 +1097,149 @@ fn to_record_inner(
         status,
         inner.direction(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+
+    use super::{cancel_group, pause_group, resume_group};
+    use crate::chunk_outcome::ChunkOutcome;
+    use crate::error::MeowError;
+    use crate::inner::test_support::{attach_capture, live_download_state, wait_for_record};
+    use crate::prepare_outcome::PrepareOutcome;
+    use crate::transfer_executor_trait::TransferTrait;
+    use crate::transfer_status::TransferStatus;
+    use crate::transfer_task::TransferTask;
+
+    /// 什么都不做的传输执行器：cancel_group 需要一个 `Arc<dyn TransferTrait>`
+    /// 来触发（可选的）远端 abort，测试里用默认的 `cancel()=Ok(())` 即可。
+    struct NoopTransfer;
+
+    #[async_trait]
+    impl TransferTrait for NoopTransfer {
+        async fn prepare(
+            &self,
+            _task: &TransferTask,
+            local_offset: u64,
+        ) -> Result<PrepareOutcome, MeowError> {
+            Ok(PrepareOutcome {
+                next_offset: local_offset,
+                total_size: 0,
+            })
+        }
+
+        async fn transfer_chunk(
+            &self,
+            _task: &TransferTask,
+            offset: u64,
+            _chunk_size: u64,
+            remote_total_size: u64,
+        ) -> Result<ChunkOutcome, MeowError> {
+            Ok(ChunkOutcome {
+                next_offset: offset,
+                total_size: remote_total_size,
+                done: true,
+                completion_payload: None,
+            })
+        }
+    }
+
+    /// pause 中途的下载：Paused 记录必须携带运行期 total 与真实进度
+    /// （修复前为 total=0/progress=0，暂停期间消费端 DB 进度被清零）。
+    #[tokio::test]
+    async fn pause_group_emits_paused_with_runtime_total() {
+        let (mut state, key) = live_download_state("pause_total").await;
+        let records = attach_capture(&state);
+        state.offsets_mut().insert(key.clone(), 512);
+        state.known_totals_mut().insert(key.clone(), 4096);
+
+        pause_group(&mut state, &key).await;
+
+        let paused =
+            wait_for_record(&records, |r| matches!(r.status(), TransferStatus::Paused)).await;
+        assert_eq!(paused.total_size(), 4096);
+        assert!((paused.progress() - 0.125).abs() < f32::EPSILON);
+    }
+
+    /// resume 发出的 Pending 记录同样携带运行期 total（known_totals 在
+    /// pause 期间保留，见 handle_worker_event 的 pause 流测试）。
+    #[tokio::test]
+    async fn resume_group_emits_pending_with_runtime_total() {
+        let (mut state, key) = live_download_state("resume_total").await;
+        let records = attach_capture(&state);
+        state.offsets_mut().insert(key.clone(), 512);
+        state.known_totals_mut().insert(key.clone(), 4096);
+        pause_group(&mut state, &key).await;
+
+        resume_group(&mut state, &key).await.expect("resume");
+
+        let pending =
+            wait_for_record(&records, |r| matches!(r.status(), TransferStatus::Pending)).await;
+        assert_eq!(pending.total_size(), 4096);
+    }
+
+    /// 主动 cancel 的终态 Canceled 记录必须携带运行期 total。
+    #[tokio::test]
+    async fn cancel_group_emits_canceled_with_runtime_total() {
+        let (mut state, key) = live_download_state("cancel_total").await;
+        let records = attach_capture(&state);
+        state.offsets_mut().insert(key.clone(), 512);
+        state.known_totals_mut().insert(key.clone(), 4096);
+        let executor: Arc<dyn TransferTrait> = Arc::new(NoopTransfer);
+
+        cancel_group(&mut state, &key, &executor).await;
+
+        let canceled =
+            wait_for_record(&records, |r| matches!(r.status(), TransferStatus::Canceled)).await;
+        assert_eq!(canceled.total_size(), 4096);
+        assert!((canceled.progress() - 0.125).abs() < f32::EPSILON);
+        assert!(!state.groups().contains_key(&key));
+        // finding #1: 控制面取消必须自清理 offsets/known_totals，不留孤儿条目
+        // （否则复用同一 URL 的新任务会读到陈旧值）。
+        assert!(
+            state.offsets().get(&key).is_none(),
+            "cancel_group 必须清理 offsets"
+        );
+        assert!(
+            state.known_totals().get(&key).is_none(),
+            "cancel_group 必须清理 known_totals"
+        );
+    }
+
+    /// finding #8: resume 后 try_start_next 重启下载时，启动 Transmission 必须用
+    /// known_totals 里保留的运行期 total（而非被 `Download && total==0` 守卫抑制）。
+    /// 直接驱动 try_start_next：它在 spawn worker 前同步 emit 启动 Transmission，
+    /// 而 spawn 出的 NoopTransfer worker 只把事件发往 worker_rx（不经回调），
+    /// 因此监听器只会收到这条启动 Transmission，断言是确定性的。
+    #[tokio::test]
+    async fn resumed_download_start_transmission_carries_known_total() {
+        use tokio::sync::mpsc;
+
+        let (mut state, key) = live_download_state("restart_total").await;
+        let records = attach_capture(&state);
+        state.offsets_mut().insert(key.clone(), 512);
+        state.known_totals_mut().insert(key.clone(), 4096);
+        // 模拟 resume：重新进入待调度队列，且不在 active/paused 中。
+        state.queued_mut().push_back(key.clone());
+        state.queued_set_mut().insert(key.clone());
+
+        let (worker_tx, _worker_rx) = mpsc::channel(8);
+        let executor: Arc<dyn TransferTrait> = Arc::new(NoopTransfer);
+        let _ =
+            crate::inner::exec_impl::exec::try_start_next(&worker_tx, &mut state, &executor).await;
+
+        let transmission = wait_for_record(&records, |r| {
+            matches!(r.status(), TransferStatus::Transmission)
+        })
+        .await;
+        assert_eq!(
+            transmission.total_size(),
+            4096,
+            "resume 重启的 Transmission 必须带运行期 total，而非被 total=0 守卫抑制"
+        );
+        assert!((transmission.progress() - 0.125).abs() < f32::EPSILON);
+    }
 }
