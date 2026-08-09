@@ -10,6 +10,10 @@ pub use crate::aliyun_oss_presigned;
 pub use crate::azure_blob_direct;
 #[cfg(feature = "azure-blob-sas")]
 pub use crate::azure_blob_sas;
+pub use crate::binary::{
+    BinaryDownloadConfig, BinaryDownloadConfigBuilder, BinaryDownloadOutput, BinaryTask,
+    BINARY_ABSOLUTE_MAX_BODY_BYTES, DEFAULT_BINARY_MAX_BODY_BYTES,
+};
 pub use crate::chunk_outcome::ChunkOutcome;
 pub use crate::dflt::default_http_transfer::DefaultHttpTransfer;
 pub use crate::direction::Direction;

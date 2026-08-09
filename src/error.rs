@@ -53,6 +53,10 @@ pub enum InnerErrorCode {
     /// Local source/target file was removed or replaced while a transfer was
     /// in progress (for example the user deleted it mid-download).
     LocalFileRemoved = 122,
+    /// Binary task capacity (queued, active, or callback pending) is exhausted.
+    BinaryTaskQueueFull = 123,
+    /// A binary response exceeded its configured in-memory body limit.
+    BinaryBodyTooLarge = 124,
 }
 
 /// Library error type returned by most public APIs.

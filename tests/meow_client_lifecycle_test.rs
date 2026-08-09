@@ -2,17 +2,45 @@
 mod dev_server;
 
 use std::fs;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rusty_cat::api::BinaryTask;
 use rusty_cat::down_pounce_builder::DownloadPounceBuilder;
 use rusty_cat::error::InnerErrorCode;
 use rusty_cat::file_transfer_record::FileTransferRecord;
 use rusty_cat::meow_config::MeowConfig;
 use rusty_cat::transfer_status::TransferStatus;
 use rusty_cat::MeowClient;
+
+struct ThreadWake(std::thread::Thread);
+
+impl Wake for ThreadWake {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+fn block_on_without_tokio<F: Future>(future: F) -> F::Output {
+    let mut future = pin!(future);
+    let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+    let mut context = Context::from_waker(&waker);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => std::thread::park_timeout(Duration::from_secs(2)),
+        }
+    }
+}
 
 fn temp_download_path(case: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
@@ -47,6 +75,47 @@ async fn close_without_executor_initialization_marks_client_closed() {
         .await
         .expect_err("second close should be rejected");
     assert_eq!(second_close.code(), InnerErrorCode::ClientClosed as i32);
+}
+
+#[test]
+fn fresh_close_does_not_require_a_tokio_runtime() {
+    let client = MeowClient::new(MeowConfig::default());
+    block_on_without_tokio(client.close()).expect("fresh close outside Tokio runtime");
+    assert!(client.is_closed());
+
+    let error = block_on_without_tokio(client.close()).expect_err("second close");
+    assert_eq!(error.code(), InnerErrorCode::ClientClosed as i32);
+}
+
+#[tokio::test]
+async fn fast_concurrent_close_never_misses_completion_notification() {
+    for _ in 0..50 {
+        let client = Arc::new(MeowClient::new(MeowConfig::default()));
+        let barrier = Arc::new(tokio::sync::Barrier::new(8));
+        let mut callers = Vec::new();
+        for _ in 0..8 {
+            let client = Arc::clone(&client);
+            let barrier = Arc::clone(&barrier);
+            callers.push(tokio::spawn(async move {
+                barrier.wait().await;
+                client.close().await
+            }));
+        }
+
+        let results = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut results = Vec::new();
+            for caller in callers {
+                results.push(caller.await.expect("close caller task"));
+            }
+            results
+        })
+        .await
+        .expect("concurrent close callers must all finish");
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        for error in results.into_iter().filter_map(Result::err) {
+            assert_eq!(error.code(), InnerErrorCode::ClientClosed as i32);
+        }
+    }
 }
 
 #[tokio::test]
@@ -210,6 +279,89 @@ async fn close_active_transfer_should_emit_pause_or_terminal_status() {
         }),
         "after close there should be at least one paused/terminal status observable"
     );
+
+    let _ = fs::remove_file(&path);
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn mixed_close_drains_active_pounce_and_binary_paths() {
+    let payload = b"mixed-close-payload".repeat(64 * 1024);
+    let server = dev_server::DevFileServer::spawn(payload);
+    let client = MeowClient::new(
+        MeowConfig::builder()
+            .max_download_concurrency(1)
+            .build()
+            .expect("config"),
+    );
+    let path = temp_download_path("mixed_close");
+    let statuses = Arc::new(Mutex::new(Vec::new()));
+    let status_capture = Arc::clone(&statuses);
+    client
+        .try_enqueue(
+            DownloadPounceBuilder::new(
+                "mixed.bin",
+                &path,
+                1024,
+                format!("{}/download/mixed.bin", server.base_url()),
+            )
+            .build(),
+            move |record| {
+                status_capture
+                    .lock()
+                    .expect("statuses")
+                    .push(record.status().clone());
+            },
+            |_, _| {},
+        )
+        .await
+        .expect("enqueue Pounce task");
+    let (binary_tx, binary_rx) = tokio::sync::oneshot::channel();
+    client
+        .try_enqueue_binary_task(
+            BinaryTask::new(format!("{}/download/mixed.bin", server.base_url())).with_header(
+                reqwest::header::RANGE,
+                reqwest::header::HeaderValue::from_str(&format!(
+                    "bytes=0-{}",
+                    64 * 1024 * b"mixed-close-payload".len() - 1
+                ))
+                .expect("range header"),
+            ),
+            move |_, result| {
+                let _ = binary_tx.send(result);
+            },
+        )
+        .expect("enqueue Binary task");
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !statuses
+            .lock()
+            .expect("statuses")
+            .iter()
+            .any(|status| matches!(status, TransferStatus::Transmission))
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Pounce task entered transmission");
+    client.close().await.expect("mixed close");
+    let binary_result = tokio::time::timeout(Duration::from_secs(2), binary_rx)
+        .await
+        .expect("Binary callback timeout")
+        .expect("Binary callback sender");
+    if let Err(error) = binary_result {
+        assert_eq!(error.code(), InnerErrorCode::ClientClosed as i32);
+    }
+    assert!(statuses.lock().expect("statuses").iter().any(|status| {
+        matches!(
+            status,
+            TransferStatus::Paused
+                | TransferStatus::Canceled
+                | TransferStatus::Complete
+                | TransferStatus::Failed(_)
+        )
+    }));
 
     let _ = fs::remove_file(&path);
     server.shutdown();

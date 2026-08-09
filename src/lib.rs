@@ -54,6 +54,7 @@ pub mod azure_blob_direct;
 #[cfg(feature = "azure-blob-sas")]
 #[path = "azure-blob-sas/mod.rs"]
 pub mod azure_blob_sas;
+pub mod binary;
 pub mod chunk_outcome;
 pub(crate) mod dflt;
 pub mod direction;
@@ -78,5 +79,4 @@ pub mod transfer_task;
 pub mod up_pounce_builder;
 pub(crate) mod upload_source;
 pub mod upload_trait;
-
 pub use api::*;
