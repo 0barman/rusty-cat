@@ -821,10 +821,7 @@ impl Executor {
                 )
             })?
             .map_err(|_| {
-                crate::meow_error_log!(
-                    "executor_close",
-                    "worker thread panicked during shutdown"
-                );
+                crate::meow_error_log!("executor_close", "worker thread panicked during shutdown");
                 MeowError::from_code_str(
                     InnerErrorCode::Unknown,
                     "worker thread panicked during shutdown",
@@ -1074,6 +1071,10 @@ impl Executor {
             self.close_invoked.store(true, Ordering::SeqCst);
         }
         result
+    }
+
+    pub(crate) fn is_close_complete(&self) -> bool {
+        self.close_invoked.load(Ordering::SeqCst)
     }
 }
 

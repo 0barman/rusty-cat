@@ -1,8 +1,10 @@
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock};
 
 use tokio::sync::oneshot;
 
+use crate::binary::{BinaryCompleteCb, BinaryDownloadOutput, BinaryExecutor, BinaryTask};
 use crate::dflt::default_http_transfer::{
     build_internal_client, default_breakpoint_arcs, DefaultHttpTransfer,
 };
@@ -27,7 +29,7 @@ pub type GlobalProgressListener = ProgressCb;
 /// Main entry point of the `rusty-cat` SDK.
 ///
 /// `MeowClient` owns runtime state and provides high-level operations:
-/// enqueue, pause, resume, cancel, snapshot, and close.
+/// enqueue, bounded binary GET, pause, resume, cancel, snapshot, and close.
 ///
 /// # Usage pattern
 ///
@@ -40,8 +42,8 @@ pub type GlobalProgressListener = ProgressCb;
 ///
 /// # Lifecycle contract: you **must** call [`Self::close`]
 ///
-/// The background scheduler runs on a dedicated [`std::thread`] that drives
-/// its own Tokio runtime. The clean shutdown protocol is an explicit
+/// Transfer and binary schedulers use separate threads, runtimes, HTTP clients,
+/// command queues and callback dispatchers. The clean shutdown protocol is an explicit
 /// `close().await` command which:
 ///
 /// - cancels in-flight transfers,
@@ -116,17 +118,34 @@ pub struct TaskOutcome {
 pub struct MeowClient {
     /// Lazily initialized task executor.
     ///
-    /// Deliberately **not** wrapped in `Arc`: `MeowClient` is not `Clone`, so
-    /// there is exactly one owner of this `OnceLock`. Share the whole client
-    /// via `Arc<MeowClient>` when multi-owner access is needed.
-    executor: OnceLock<Executor>,
+    /// The `OnceLock` itself has one owner because `MeowClient` is not `Clone`.
+    /// Its executor is held by `Arc` only so an already-started mixed close can
+    /// finish safely if the caller drops the close Future. Share the client
+    /// itself via `Arc<MeowClient>` when multi-owner access is needed.
+    executor: OnceLock<Arc<Executor>>,
     executor_init: StdMutex<()>,
+    /// Lazily initialized executor dedicated to bounded in-memory GETs.
+    binary_executor: OnceLock<Arc<BinaryExecutor>>,
+    /// Serializes BinaryExecutor publication/task admission with close.
+    binary_lifecycle: Arc<StdMutex<BinaryLifecycle>>,
+    close_notify: Arc<tokio::sync::Notify>,
     /// Immutable runtime configuration.
     config: MeowConfig,
     /// Global listeners receiving progress records for all tasks.
     global_progress_listener: Arc<RwLock<Vec<(GlobalProgressListenerId, GlobalProgressListener)>>>,
     /// Global closed flag. Once set to `true`, task control APIs reject calls.
     closed: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BinaryLifecycle {
+    Open,
+    Closing,
+    Closed,
+    CloseFailed {
+        pounce_closed: bool,
+        binary_closed: bool,
+    },
 }
 
 impl std::fmt::Debug for MeowClient {
@@ -156,6 +175,9 @@ impl MeowClient {
         MeowClient {
             executor: Default::default(),
             executor_init: StdMutex::new(()),
+            binary_executor: Default::default(),
+            binary_lifecycle: Arc::new(StdMutex::new(BinaryLifecycle::Open)),
+            close_notify: Arc::new(tokio::sync::Notify::new()),
             config,
             global_progress_listener: Arc::new(RwLock::new(Vec::new())),
             closed: Arc::new(AtomicBool::new(false)),
@@ -192,8 +214,8 @@ impl MeowClient {
         // Build through the shared helper so this client carries the exact same
         // transport policy (connect timeout + idle connection pool) as the
         // transfer backend, rather than reqwest's bare defaults.
-        build_internal_client(self.config.http_timeout(), self.config.tcp_keepalive())
-            .map_err(|e| {
+        build_internal_client(self.config.http_timeout(), self.config.tcp_keepalive()).map_err(
+            |e| {
                 MeowError::from_source(
                     InnerErrorCode::HttpClientBuildFailed,
                     format!(
@@ -203,13 +225,14 @@ impl MeowClient {
                     ),
                     e,
                 )
-            })
+            },
+        )
     }
 
     fn get_exec(&self) -> Result<&Executor, MeowError> {
         if let Some(exec) = self.executor.get() {
             crate::meow_flow_log!("executor", "reuse existing executor");
-            return Ok(exec);
+            return Ok(exec.as_ref());
         }
 
         let _init_guard = self.executor_init.lock().map_err(|e| {
@@ -223,7 +246,7 @@ impl MeowClient {
                 "executor",
                 "reuse executor initialized by concurrent caller"
             );
-            return Ok(exec);
+            return Ok(exec.as_ref());
         }
 
         let default_http_transfer = DefaultHttpTransfer::try_with_http_timeouts(
@@ -236,11 +259,11 @@ impl MeowClient {
             self.config.http_timeout(),
             self.config.tcp_keepalive()
         );
-        let exec = Executor::new(
+        let exec = Arc::new(Executor::new(
             self.config.clone(),
             Arc::new(default_http_transfer),
             self.global_progress_listener.clone(),
-        )?;
+        )?);
         self.executor.set(exec).map_err(|_| {
             crate::meow_error_log!(
                 "executor",
@@ -251,7 +274,7 @@ impl MeowClient {
                 "executor init race failed",
             )
         })?;
-        self.executor.get().ok_or_else(|| {
+        self.executor.get().map(Arc::as_ref).ok_or_else(|| {
             crate::meow_error_log!(
                 "executor",
                 "executor init race failed after set; returning RuntimeCreationFailedError"
@@ -259,6 +282,27 @@ impl MeowClient {
             MeowError::from_code_str(
                 InnerErrorCode::RuntimeCreationFailedError,
                 "executor init race failed",
+            )
+        })
+    }
+
+    /// Returns the isolated binary executor. The caller must hold
+    /// `binary_lifecycle` so publication cannot race with `close()`.
+    fn get_binary_exec_locked(&self) -> Result<&BinaryExecutor, MeowError> {
+        if let Some(exec) = self.binary_executor.get() {
+            return Ok(exec.as_ref());
+        }
+        let exec = Arc::new(BinaryExecutor::new(&self.config)?);
+        self.binary_executor.set(exec).map_err(|_| {
+            MeowError::from_code_str(
+                InnerErrorCode::RuntimeCreationFailedError,
+                "binary executor publication raced unexpectedly",
+            )
+        })?;
+        self.binary_executor.get().map(Arc::as_ref).ok_or_else(|| {
+            MeowError::from_code_str(
+                InnerErrorCode::RuntimeCreationFailedError,
+                "binary executor was not available after publication",
             )
         })
     }
@@ -831,7 +875,7 @@ impl MeowClient {
         }
     }
 
-    /// Pauses a running or pending task by ID.
+    /// Pauses a running or pending PounceTask by ID.
     ///
     /// This API sends a control command to the internal scheduler worker
     /// thread. It does not execute transfer pause logic on the caller thread.
@@ -842,7 +886,9 @@ impl MeowClient {
     ///
     /// # Errors
     ///
-    /// Returns `ClientClosed`, `TaskNotFound`, or state-transition errors.
+    /// BinaryTask IDs return `InvalidTaskState` because binary tasks only
+    /// support cancellation. Other errors include `ClientClosed`,
+    /// `TaskNotFound`, or Pounce state-transition errors.
     ///
     /// # Examples
     ///
@@ -858,10 +904,18 @@ impl MeowClient {
     pub async fn pause(&self, task_id: TaskId) -> Result<(), MeowError> {
         self.ensure_open()?;
         crate::meow_key_log!("client_api", "pause called: task_id={:?}", task_id);
+        if let Some(exec) = self.binary_executor.get() {
+            if exec.contains_task(task_id)? {
+                return Err(MeowError::from_code_str(
+                    InnerErrorCode::InvalidTaskState,
+                    "binary tasks do not support pause",
+                ));
+            }
+        }
         self.get_exec()?.pause(task_id).await
     }
 
-    /// Resumes a previously paused task.
+    /// Resumes a previously paused PounceTask.
     ///
     /// The same [`TaskId`] continues to identify the task after resume.
     /// The resume command is forwarded to the internal scheduler worker
@@ -885,13 +939,21 @@ impl MeowClient {
     pub async fn resume(&self, task_id: TaskId) -> Result<(), MeowError> {
         self.ensure_open()?;
         crate::meow_key_log!("client_api", "resume called: task_id={:?}", task_id);
+        if let Some(exec) = self.binary_executor.get() {
+            if exec.contains_task(task_id)? {
+                return Err(MeowError::from_code_str(
+                    InnerErrorCode::InvalidTaskState,
+                    "binary tasks do not support resume",
+                ));
+            }
+        }
         self.get_exec()?.resume(task_id).await
     }
 
     /// Cancels a task by ID.
     ///
-    /// Cancellation is requested through the internal scheduler worker thread.
-    /// Transfer cancellation execution happens in background runtime workers.
+    /// Cancellation is routed to the isolated Binary executor for a live
+    /// BinaryTask ID; all other IDs retain the existing Pounce scheduler path.
     ///
     /// # Usage rules
     ///
@@ -915,13 +977,18 @@ impl MeowClient {
     pub async fn cancel(&self, task_id: TaskId) -> Result<(), MeowError> {
         self.ensure_open()?;
         crate::meow_key_log!("client_api", "cancel called: task_id={:?}", task_id);
+        if let Some(exec) = self.binary_executor.get() {
+            if exec.contains_task(task_id)? {
+                return exec.cancel(task_id).await;
+            }
+        }
         self.get_exec()?.cancel(task_id).await
     }
 
-    /// Returns a snapshot of queue and active transfer groups.
+    /// Returns a snapshot of queue and active Pounce transfer groups.
     ///
     /// Useful for diagnostics and external monitoring dashboards.
-    /// Snapshot collection is coordinated by internal scheduler worker state.
+    /// BinaryTask state is intentionally excluded and never queried here.
     ///
     /// # Errors
     ///
@@ -946,7 +1013,7 @@ impl MeowClient {
         self.get_exec()?.snapshot().await
     }
 
-    /// Closes this client and its underlying executor.
+    /// Closes this client and every initialized Pounce/Binary executor.
     ///
     /// `close` is the terminal lifecycle operation for a `MeowClient`. After
     /// it succeeds, this client stays permanently closed; submit more work by
@@ -971,11 +1038,18 @@ impl MeowClient {
     /// # Idempotency
     ///
     /// Calling `close` more than once returns `ClientClosed`.
+    /// A client that initialized BinaryExecutor performs mixed teardown on an
+    /// SDK-owned coordinator, so dropping the close Future does not strand the
+    /// lifecycle and does not require an additional caller-side Tokio runtime.
+    /// If BinaryExecutor was never initialized, close does not create any
+    /// Binary runtime, thread, HTTP client, or channel.
     ///
     /// # Retry behavior
     ///
-    /// If executor close fails, the closed flag is rolled back so caller can
-    /// retry close. A successful close is not restartable.
+    /// If BinaryExecutor was never initialized, the existing Pounce-only close
+    /// failure behavior is preserved: the closed flag is rolled back so callers
+    /// can retry. For a mixed client, a partial close never reopens business
+    /// APIs; another `close` call retries only unfinished teardown.
     ///
     /// # Errors
     ///
@@ -994,29 +1068,122 @@ impl MeowClient {
     /// # }
     /// ```
     pub async fn close(&self) -> Result<(), MeowError> {
-        if self
-            .closed
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            crate::meow_flow_log!("client_api", "close rejected: already closed");
-            return Err(MeowError::from_code_str(
-                InnerErrorCode::ClientClosed,
-                "meow client is already closed",
-            ));
-        }
-        if let Some(exec) = self.executor.get() {
-            crate::meow_key_log!("client_api", "close forwarding to executor");
-            if let Err(e) = exec.close().await {
-                // Roll back closed flag so caller can retry close.
-                self.closed.store(false, Ordering::SeqCst);
-                return Err(e);
+        let close_notification = self.close_notify.notified();
+        tokio::pin!(close_notification);
+        // `notify_waiters` does not retain a permit for a Future that has not
+        // registered yet. Register before inspecting the lifecycle so a fast
+        // concurrent close cannot publish completion between the state check
+        // and this caller awaiting the notification.
+        close_notification.as_mut().enable();
+        let close_plan = {
+            let mut lifecycle = self.binary_lifecycle.lock().map_err(|error| {
+                MeowError::from_code(
+                    InnerErrorCode::LockPoisoned,
+                    format!("binary lifecycle lock poisoned: {error}"),
+                )
+            })?;
+            match *lifecycle {
+                BinaryLifecycle::Closing => None,
+                BinaryLifecycle::Closed => return Err(client_closed_error()),
+                BinaryLifecycle::CloseFailed {
+                    pounce_closed,
+                    binary_closed,
+                } => {
+                    *lifecycle = BinaryLifecycle::Closing;
+                    Some((pounce_closed, binary_closed, true))
+                }
+                BinaryLifecycle::Open => {
+                    if self
+                        .closed
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_err()
+                    {
+                        return Err(client_closed_error());
+                    }
+                    *lifecycle = BinaryLifecycle::Closing;
+                    Some((false, false, self.binary_executor.get().is_some()))
+                }
             }
-            Ok(())
-        } else {
-            crate::meow_key_log!("client_api", "close with no executor initialized");
-            Ok(())
+        };
+        let Some((pounce_already_closed, binary_already_closed, mixed)) = close_plan else {
+            close_notification.await;
+            return Err(client_closed_error());
+        };
+
+        if !mixed {
+            let result = if let Some(exec) = self.executor.get() {
+                exec.close().await
+            } else {
+                Ok(())
+            };
+            if let Ok(mut lifecycle) = self.binary_lifecycle.lock() {
+                if result.is_ok() {
+                    *lifecycle = BinaryLifecycle::Closed;
+                } else {
+                    *lifecycle = BinaryLifecycle::Open;
+                    self.closed.store(false, Ordering::SeqCst);
+                }
+            }
+            self.close_notify.notify_waiters();
+            return result;
         }
+
+        let pounce = self.executor.get().cloned();
+        let binary = self.binary_executor.get().cloned();
+        let lifecycle = Arc::clone(&self.binary_lifecycle);
+        let close_notify = Arc::clone(&self.close_notify);
+        let progress = Arc::new(CloseProgress::new(
+            pounce_already_closed,
+            binary_already_closed,
+        ));
+        let (result_tx, result_rx) = oneshot::channel();
+
+        // Mixed teardown is detached from the caller's Future and runs on an
+        // SDK-owned coordinator thread. This preserves cancellation safety
+        // without adding a caller-side Tokio runtime requirement.
+        let thread_lifecycle = Arc::clone(&lifecycle);
+        let thread_notify = Arc::clone(&close_notify);
+        let thread_progress = Arc::clone(&progress);
+        let pounce_probe = pounce.clone();
+        let binary_probe = binary.clone();
+        let spawn_result = std::thread::Builder::new()
+            .name("rusty-cat-close-supervisor".to_owned())
+            .spawn(move || {
+                let attempt_result = run_guarded_close_attempt(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|error| {
+                            MeowError::from_code(
+                                InnerErrorCode::RuntimeCreationFailedError,
+                                format!("create close supervisor runtime failed: {error}"),
+                            )
+                        })?;
+                    runtime.block_on(run_mixed_close_attempt(pounce, binary, &thread_progress))
+                });
+                reconcile_close_progress(&thread_progress, &pounce_probe, &binary_probe);
+                let result =
+                    publish_mixed_close_result(&thread_lifecycle, &thread_progress, attempt_result);
+                thread_notify.notify_waiters();
+                let _ = result_tx.send(result);
+            });
+
+        if let Err(error) = spawn_result {
+            let spawn_error = MeowError::from_code(
+                InnerErrorCode::RuntimeCreationFailedError,
+                format!("spawn close supervisor failed: {error}"),
+            );
+            let result = publish_mixed_close_result(&lifecycle, &progress, Err(spawn_error));
+            close_notify.notify_waiters();
+            return result;
+        }
+
+        result_rx.await.map_err(|error| {
+            MeowError::from_code(
+                InnerErrorCode::CommandResponseFailed,
+                format!("close teardown task ended without a result: {error}"),
+            )
+        })?
     }
 
     /// Returns whether this client is currently closed.
@@ -1034,6 +1201,116 @@ impl MeowClient {
     }
 }
 
+fn run_guarded_close_attempt<F>(attempt: F) -> Result<(), MeowError>
+where
+    F: FnOnce() -> Result<(), MeowError>,
+{
+    match std::panic::catch_unwind(AssertUnwindSafe(attempt)) {
+        Ok(result) => result,
+        Err(_) => Err(MeowError::from_code_str(
+            InnerErrorCode::Unknown,
+            "mixed close supervisor panicked",
+        )),
+    }
+}
+
+struct CloseProgress {
+    pounce_closed: AtomicBool,
+    binary_closed: AtomicBool,
+}
+
+impl CloseProgress {
+    fn new(pounce_closed: bool, binary_closed: bool) -> Self {
+        Self {
+            pounce_closed: AtomicBool::new(pounce_closed),
+            binary_closed: AtomicBool::new(binary_closed),
+        }
+    }
+
+    fn snapshot(&self) -> (bool, bool) {
+        (
+            self.pounce_closed.load(Ordering::SeqCst),
+            self.binary_closed.load(Ordering::SeqCst),
+        )
+    }
+}
+
+fn reconcile_close_progress(
+    progress: &CloseProgress,
+    pounce: &Option<Arc<Executor>>,
+    binary: &Option<Arc<BinaryExecutor>>,
+) {
+    if pounce.as_ref().is_none_or(|exec| exec.is_close_complete()) {
+        progress.pounce_closed.store(true, Ordering::SeqCst);
+    }
+    if binary.as_ref().is_none_or(|exec| exec.is_close_complete()) {
+        progress.binary_closed.store(true, Ordering::SeqCst);
+    }
+}
+
+fn publish_mixed_close_result(
+    lifecycle: &Arc<StdMutex<BinaryLifecycle>>,
+    progress: &CloseProgress,
+    attempt_result: Result<(), MeowError>,
+) -> Result<(), MeowError> {
+    let (pounce_closed, binary_closed) = progress.snapshot();
+    let mut state = lifecycle.lock().map_err(|error| {
+        MeowError::from_code(
+            InnerErrorCode::LockPoisoned,
+            format!("binary lifecycle lock poisoned after mixed close: {error}"),
+        )
+    })?;
+    *state = if pounce_closed && binary_closed {
+        BinaryLifecycle::Closed
+    } else {
+        BinaryLifecycle::CloseFailed {
+            pounce_closed,
+            binary_closed,
+        }
+    };
+    attempt_result
+}
+
+async fn run_mixed_close_attempt(
+    pounce: Option<Arc<Executor>>,
+    binary: Option<Arc<BinaryExecutor>>,
+    progress: &CloseProgress,
+) -> Result<(), MeowError> {
+    let pounce_close = async {
+        if progress.pounce_closed.load(Ordering::SeqCst) {
+            Ok(())
+        } else if let Some(executor) = pounce {
+            let result = executor.close().await;
+            if result.is_ok() || executor.is_close_complete() {
+                progress.pounce_closed.store(true, Ordering::SeqCst);
+            }
+            result
+        } else {
+            progress.pounce_closed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    };
+    let binary_close = async {
+        if progress.binary_closed.load(Ordering::SeqCst) {
+            Ok(())
+        } else if let Some(executor) = binary {
+            let result = executor.close().await;
+            if result.is_ok() || executor.is_close_complete() {
+                progress.binary_closed.store(true, Ordering::SeqCst);
+            }
+            result
+        } else {
+            progress.binary_closed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    };
+    let (pounce_result, binary_result) = tokio::join!(pounce_close, binary_close);
+    match (pounce_result, binary_result) {
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
 fn send_terminal_once(
     slot: &Arc<StdMutex<Option<oneshot::Sender<Result<(TaskId, Option<String>), MeowError>>>>>,
     msg: Result<(TaskId, Option<String>), MeowError>,
@@ -1042,5 +1319,120 @@ fn send_terminal_once(
         if let Some(sender) = guard.take() {
             let _ = sender.send(msg);
         }
+    }
+}
+
+fn client_closed_error() -> MeowError {
+    MeowError::from_code_str(
+        InnerErrorCode::ClientClosed,
+        "meow client is already closed",
+    )
+}
+
+impl MeowClient {
+    /// Enqueues one bounded, in-memory HTTP GET on an isolated executor.
+    ///
+    /// Binary tasks support [`Self::cancel`] only. They do not support
+    /// pause/resume and are deliberately excluded from [`Self::snapshot`].
+    /// The callback may run concurrently before this method returns. It owns a
+    /// [`BinaryDownloadOutput`]; move or clone its `Bytes` when retaining data.
+    /// The callback must return in bounded time and must not synchronously wait
+    /// for `close()` on this same client because close drains callbacks.
+    ///
+    /// At most two binary HTTP requests run concurrently. At most 1024 accepted
+    /// tasks may be queued, active, or waiting for their callback to return.
+    pub fn try_enqueue_binary_task<CCB>(
+        &self,
+        task: BinaryTask,
+        complete_cb: CCB,
+    ) -> Result<TaskId, MeowError>
+    where
+        CCB: FnOnce(TaskId, Result<BinaryDownloadOutput, MeowError>) + Send + 'static,
+    {
+        let lifecycle = self.binary_lifecycle.lock().map_err(|error| {
+            MeowError::from_code(
+                InnerErrorCode::LockPoisoned,
+                format!("binary lifecycle lock poisoned: {error}"),
+            )
+        })?;
+        if !matches!(*lifecycle, BinaryLifecycle::Open) || self.closed.load(Ordering::SeqCst) {
+            return Err(client_closed_error());
+        }
+        let binary_config = self
+            .config
+            .binary_download_config()
+            .cloned()
+            .unwrap_or_default();
+        let parsed_url = task.validate(binary_config.max_body_bytes())?;
+        let executor = self.get_binary_exec_locked()?;
+        let callback: BinaryCompleteCb = Box::new(complete_cb);
+        executor.try_enqueue(task, parsed_url, callback)
+    }
+}
+
+#[cfg(test)]
+mod close_tests {
+    use super::*;
+
+    #[test]
+    fn supervisor_panic_preserves_completed_executor_progress() {
+        let lifecycle = Arc::new(StdMutex::new(BinaryLifecycle::Closing));
+        let progress = CloseProgress::new(false, false);
+        let attempt = run_guarded_close_attempt(|| {
+            progress.pounce_closed.store(true, Ordering::SeqCst);
+            panic!("injected close panic after Pounce completed");
+        });
+        let error = publish_mixed_close_result(&lifecycle, &progress, attempt)
+            .expect_err("panic must remain observable");
+        assert_eq!(error.code(), InnerErrorCode::Unknown as i32);
+        assert!(matches!(
+            *lifecycle.lock().unwrap(),
+            BinaryLifecycle::CloseFailed {
+                pounce_closed: true,
+                binary_closed: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn fully_completed_teardown_publishes_closed_even_if_reporting_failed() {
+        let lifecycle = Arc::new(StdMutex::new(BinaryLifecycle::Closing));
+        let progress = CloseProgress::new(true, true);
+        let error = publish_mixed_close_result(
+            &lifecycle,
+            &progress,
+            Err(MeowError::from_code_str(
+                InnerErrorCode::Unknown,
+                "late close reporting failure",
+            )),
+        )
+        .expect_err("reporting error remains observable");
+        assert_eq!(error.code(), InnerErrorCode::Unknown as i32);
+        assert!(matches!(
+            *lifecycle.lock().unwrap(),
+            BinaryLifecycle::Closed
+        ));
+    }
+
+    #[test]
+    fn supervisor_start_failure_never_leaves_lifecycle_closing() {
+        let lifecycle = Arc::new(StdMutex::new(BinaryLifecycle::Closing));
+        let progress = CloseProgress::new(false, false);
+        publish_mixed_close_result(
+            &lifecycle,
+            &progress,
+            Err(MeowError::from_code_str(
+                InnerErrorCode::RuntimeCreationFailedError,
+                "injected supervisor thread start failure",
+            )),
+        )
+        .expect_err("start failure");
+        assert!(matches!(
+            *lifecycle.lock().unwrap(),
+            BinaryLifecycle::CloseFailed {
+                pounce_closed: false,
+                binary_closed: false,
+            }
+        ));
     }
 }

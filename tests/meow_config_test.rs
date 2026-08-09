@@ -4,6 +4,7 @@ use reqwest::Client;
 use rusty_cat::error::InnerErrorCode;
 use rusty_cat::http_breakpoint::BreakpointDownloadHttpConfig;
 use rusty_cat::meow_config::MeowConfig;
+use rusty_cat::BinaryDownloadConfig;
 
 #[test]
 fn meow_config_default_and_builder_paths_work_as_expected() {
@@ -20,6 +21,7 @@ fn meow_config_default_and_builder_paths_work_as_expected() {
         default_cfg.breakpoint_download_http().range_accept,
         "application/octet-stream"
     );
+    assert!(default_cfg.binary_download_config().is_none());
 
     let custom_bp = BreakpointDownloadHttpConfig {
         range_accept: "application/custom-binary".to_string(),
@@ -30,6 +32,13 @@ fn meow_config_default_and_builder_paths_work_as_expected() {
         .http_client(Client::new())
         .http_timeout(Duration::from_secs(11))
         .tcp_keepalive(Duration::from_secs(17))
+        .binary_download_config(
+            BinaryDownloadConfig::builder()
+                .max_body_bytes(4096)
+                .request_timeout(Duration::from_secs(3))
+                .build()
+                .expect("binary config"),
+        )
         .breakpoint_download_http(custom_bp.clone())
         .build()
         .expect("valid custom config");
@@ -39,6 +48,13 @@ fn meow_config_default_and_builder_paths_work_as_expected() {
     assert_eq!(custom_cfg.http_timeout(), Duration::from_secs(11));
     assert_eq!(custom_cfg.tcp_keepalive(), Duration::from_secs(17));
     assert_eq!(custom_cfg.breakpoint_download_http(), &custom_bp);
+    assert_eq!(
+        custom_cfg
+            .binary_download_config()
+            .expect("binary config")
+            .max_body_bytes(),
+        4096
+    );
 }
 
 #[test]

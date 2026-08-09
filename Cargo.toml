@@ -1,6 +1,6 @@
 [package]
 name = "rusty-cat"
-version = "0.3.3"
+version = "0.3.4-bata.1"
 edition = "2021"
 description = "Async HTTP client for resumable file upload and download."
 license = "MIT"
@@ -39,6 +39,7 @@ tokio = { version = "1.50.0", default-features = false, features = [
 reqwest = { version = "0.12.28", default-features = false, features = [
     "multipart",
     "rustls-tls",
+    "stream",
 ] }
 async-trait = "0.1.89"
 tokio-util = { version = "0.7.18", default-features = false }

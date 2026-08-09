@@ -18,6 +18,7 @@ impl TaskCallbacks {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn empty() -> Self {
         Self {
             progress_cb: None,

@@ -17,7 +17,8 @@ fn next_non_zero(counter: &AtomicU64) -> u64 {
         .unwrap_or_else(|current| current)
 }
 
-/// Task ID returned by [`crate::MeowClient::try_enqueue`].
+/// Task ID returned by [`crate::MeowClient::try_enqueue`] or
+/// [`crate::MeowClient::try_enqueue_binary_task`].
 ///
 /// Use this ID for pause/resume/cancel operations on the same task.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

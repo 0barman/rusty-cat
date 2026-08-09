@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use crate::binary::BinaryDownloadConfig;
 use crate::error::{InnerErrorCode, MeowError};
 use crate::http_breakpoint::BreakpointDownloadHttpConfig;
 
@@ -53,6 +54,8 @@ pub struct MeowConfig {
     ///
     /// Recommended range: `32..=8192`.
     worker_event_queue_capacity: usize,
+    /// Optional settings for the isolated in-memory binary downloader.
+    binary_download_config: Option<BinaryDownloadConfig>,
 }
 
 /// Builder for validated [`MeowConfig`] construction.
@@ -70,6 +73,7 @@ pub struct MeowConfigBuilder {
     tcp_keepalive: Duration,
     command_queue_capacity: usize,
     worker_event_queue_capacity: usize,
+    binary_download_config: Option<BinaryDownloadConfig>,
 }
 
 impl Default for MeowConfig {
@@ -84,6 +88,7 @@ impl Default for MeowConfig {
             tcp_keepalive: builder.tcp_keepalive,
             command_queue_capacity: builder.command_queue_capacity,
             worker_event_queue_capacity: builder.worker_event_queue_capacity,
+            binary_download_config: builder.binary_download_config,
         }
     }
 }
@@ -99,6 +104,7 @@ impl Default for MeowConfigBuilder {
             tcp_keepalive: Duration::from_secs(30),
             command_queue_capacity: 128,
             worker_event_queue_capacity: 256,
+            binary_download_config: None,
         }
     }
 }
@@ -166,6 +172,14 @@ impl MeowConfig {
     /// Returns worker event queue capacity.
     pub fn worker_event_queue_capacity(&self) -> usize {
         self.worker_event_queue_capacity
+    }
+
+    /// Returns the explicitly configured binary downloader settings.
+    ///
+    /// `None` does not disable binary downloads; safe defaults are resolved
+    /// lazily from this client's HTTP timeout and keepalive.
+    pub fn binary_download_config(&self) -> Option<&BinaryDownloadConfig> {
+        self.binary_download_config.as_ref()
     }
 }
 
@@ -310,6 +324,12 @@ impl MeowConfigBuilder {
         self
     }
 
+    /// Configures the isolated in-memory binary downloader.
+    pub fn binary_download_config(mut self, config: BinaryDownloadConfig) -> Self {
+        self.binary_download_config = Some(config);
+        self
+    }
+
     /// Overrides range-download HTTP behavior configuration.
     ///
     /// Use this to customize request headers (for example `Accept`) for range
@@ -344,6 +364,9 @@ impl MeowConfigBuilder {
         )?;
         validate_positive_duration("http_timeout", self.http_timeout)?;
         validate_positive_duration("tcp_keepalive", self.tcp_keepalive)?;
+        if let Some(config) = &self.binary_download_config {
+            config.validate()?;
+        }
         Ok(MeowConfig {
             max_upload_concurrency: self.max_upload_concurrency,
             max_download_concurrency: self.max_download_concurrency,
@@ -353,6 +376,7 @@ impl MeowConfigBuilder {
             tcp_keepalive: self.tcp_keepalive,
             command_queue_capacity: self.command_queue_capacity,
             worker_event_queue_capacity: self.worker_event_queue_capacity,
+            binary_download_config: self.binary_download_config,
         })
     }
 }
