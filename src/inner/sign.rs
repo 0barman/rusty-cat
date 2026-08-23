@@ -1,8 +1,12 @@
+#[cfg(test)]
 use tokio::fs::File;
+#[cfg(test)]
 use tokio::io::AsyncReadExt;
 
+#[cfg(test)]
 use crate::error::{InnerErrorCode, MeowError};
 
+#[cfg(test)]
 pub(crate) async fn calculate_sign(file: &File) -> Result<String, MeowError> {
     crate::meow_key_log!("sign", "calculate_sign start");
     let mut hasher = md5::Context::new();

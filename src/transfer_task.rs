@@ -1,15 +1,50 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use reqwest::header::HeaderMap;
 use reqwest::Method;
-use tokio::fs::File;
 use tokio::sync::Mutex;
 
 use crate::direction::Direction;
 use crate::http_breakpoint::{BreakpointDownload, BreakpointDownloadHttpConfig, BreakpointUpload};
 use crate::inner::inner_task::InnerTask;
+use crate::upload_file::UploadFileSnapshot;
 use crate::upload_source::UploadSource;
+
+fn arm_download_checkpoint_timer(
+    progress: Arc<StdMutex<Option<crate::dflt::download_progress::DownloadProgress>>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        tokio::time::sleep(crate::dflt::download_progress::DEFAULT_CHECKPOINT_INTERVAL).await;
+        let result = tokio::task::spawn_blocking(move || {
+            let mut guard = progress
+                .lock()
+                .map_err(|_| std::io::Error::other("download checkpoint timer lock poisoned"))?;
+            if let Some(state) = guard.as_mut() {
+                state.checkpoint_timer_fired()?;
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                crate::meow_warn_log!(
+                    "download_checkpoint",
+                    "timed .rcdl checkpoint failed: {}",
+                    error
+                );
+            }
+            Err(error) => {
+                crate::meow_warn_log!(
+                    "download_checkpoint",
+                    "timed .rcdl checkpoint worker failed: {}",
+                    error
+                );
+            }
+        }
+    })
+}
 
 /// Immutable task snapshot exposed to transfer executor implementations.
 ///
@@ -25,6 +60,7 @@ pub struct TransferTask {
     file_path: PathBuf,
     /// Upload-only source descriptor.
     upload_source: Option<UploadSource>,
+    upload_file_snapshot: Option<UploadFileSnapshot>,
     /// Transfer direction.
     direction: Direction,
     /// Total file size in bytes.
@@ -45,17 +81,20 @@ pub struct TransferTask {
     breakpoint_download: Arc<dyn BreakpointDownload + Send + Sync>,
     /// Optional per-task custom HTTP client.
     http_client: Option<reqwest::Client>,
-    /// Task-level upload file handle slot to avoid reopening per chunk.
-    upload_file_slot: Arc<Mutex<Option<File>>>,
     /// Task-level download file handle slot to avoid reopening per chunk.
-    download_file_slot: Arc<Mutex<Option<File>>>,
+    download_file_slot: Arc<Mutex<Option<tokio::fs::File>>>,
+    /// Makes provider abort idempotent when several parallel readers observe the
+    /// same source-generation failure concurrently.
+    upload_abort_started: Arc<std::sync::atomic::AtomicBool>,
+    /// Cross-client/process ownership of the visible download target.
+    target_lease: Arc<StdMutex<Option<crate::target_lease::TargetLease>>>,
     /// Max parts of this file transferred concurrently (intra-file parallel).
     /// `1` means the strict-serial legacy path.
     max_parts_in_flight: usize,
     /// Shared progress bitmap for the concurrent download path (None until the
     /// parallel `download_prepare` initializes it). Guarded so concurrent parts
     /// can flip their bit without racing.
-    download_progress: Arc<Mutex<Option<crate::dflt::download_progress::DownloadProgress>>>,
+    download_progress: Arc<StdMutex<Option<crate::dflt::download_progress::DownloadProgress>>>,
     /// Max retries after first failed upload prepare (`BreakpointUpload::prepare`).
     max_upload_prepare_retries: u32,
 }
@@ -92,6 +131,7 @@ impl TransferTask {
             file_name: inner.file_name_arc(),
             file_path: inner.file_path().to_path_buf(),
             upload_source: inner.upload_source().cloned(),
+            upload_file_snapshot: inner.upload_file_snapshot().cloned(),
             direction: inner.direction(),
             total_size: inner.total_size(),
             chunk_size: inner.chunk_size(),
@@ -102,10 +142,11 @@ impl TransferTask {
             breakpoint_upload: inner.breakpoint_upload().clone(),
             breakpoint_download: inner.breakpoint_download().clone(),
             http_client: inner.http_client_ref().cloned(),
-            upload_file_slot: Arc::new(Mutex::new(None)),
             download_file_slot: Arc::new(Mutex::new(None)),
+            upload_abort_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            target_lease: Arc::new(StdMutex::new(None)),
             max_parts_in_flight: inner.max_parts_in_flight(),
-            download_progress: Arc::new(Mutex::new(None)),
+            download_progress: Arc::new(StdMutex::new(None)),
             max_upload_prepare_retries: inner.max_upload_prepare_retries(),
         }
     }
@@ -288,13 +329,55 @@ impl TransferTask {
         self.http_client.as_ref()
     }
 
-    /// Returns upload file handle slot used by executor.
-    pub(crate) fn upload_file_slot(&self) -> &Arc<Mutex<Option<File>>> {
-        &self.upload_file_slot
+    pub(crate) fn upload_file_snapshot(&self) -> Option<&UploadFileSnapshot> {
+        self.upload_file_snapshot.as_ref()
+    }
+
+    pub(crate) fn begin_upload_abort(&self) -> bool {
+        self.upload_abort_started
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub(crate) async fn ensure_download_target_lease(&self) -> Result<(), crate::MeowError> {
+        let slot = Arc::clone(&self.target_lease);
+        let path = self.file_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut guard = slot.lock().map_err(|_| {
+                crate::MeowError::from_code_str(
+                    crate::InnerErrorCode::LockPoisoned,
+                    "download target lease lock poisoned",
+                )
+            })?;
+            if guard.is_none() {
+                *guard = Some(
+                    crate::target_lease::TargetLease::acquire(&path).map_err(|e| {
+                        crate::MeowError::from_source(
+                            crate::InnerErrorCode::InvalidTaskState,
+                            format!("acquire download target lease failed: {}", path.display()),
+                            e,
+                        )
+                    })?,
+                );
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            crate::MeowError::from_code(
+                crate::InnerErrorCode::IoError,
+                format!("download target lease worker failed: {e}"),
+            )
+        })?
     }
 
     /// Returns download file handle slot used by executor.
-    pub(crate) fn download_file_slot(&self) -> &Arc<Mutex<Option<File>>> {
+    pub(crate) fn download_file_slot(&self) -> &Arc<Mutex<Option<tokio::fs::File>>> {
         &self.download_file_slot
     }
 
@@ -306,7 +389,146 @@ impl TransferTask {
     /// Returns the shared concurrent-download progress slot.
     pub(crate) fn download_progress(
         &self,
-    ) -> &Arc<Mutex<Option<crate::dflt::download_progress::DownloadProgress>>> {
+    ) -> &Arc<StdMutex<Option<crate::dflt::download_progress::DownloadProgress>>> {
         &self.download_progress
+    }
+
+    pub(crate) async fn stage_download_part(
+        &self,
+        offset: u64,
+        digest: [u8; 32],
+    ) -> Result<(), crate::MeowError> {
+        let progress = Arc::clone(&self.download_progress);
+        let timer_progress = Arc::clone(&progress);
+        let outcome = tokio::task::spawn_blocking(move || {
+            let mut guard = progress.lock().map_err(|_| {
+                crate::MeowError::from_code_str(
+                    crate::InnerErrorCode::LockPoisoned,
+                    "download checkpoint lock poisoned",
+                )
+            })?;
+            let state = guard.as_mut().ok_or_else(|| {
+                crate::MeowError::from_code_str(
+                    crate::InnerErrorCode::InvalidTaskState,
+                    "download checkpoint state missing",
+                )
+            })?;
+            state.stage_done_with_digest(offset, digest).map_err(|e| {
+                crate::MeowError::from_io("persist .rcdl checkpoint failed".to_owned(), e)
+            })
+        })
+        .await
+        .map_err(|e| {
+            crate::MeowError::from_code(
+                crate::InnerErrorCode::IoError,
+                format!("download checkpoint worker failed: {e}"),
+            )
+        })??;
+        if outcome.arm_timer {
+            // The progress object itself suppresses duplicate timers. The task
+            // may complete before this wake-up; then the shared slot is empty
+            // and the timer exits without touching the completed file.
+            drop(arm_download_checkpoint_timer(timer_progress));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn force_download_checkpoint(&self) -> Result<(), crate::MeowError> {
+        let progress = Arc::clone(&self.download_progress);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = progress.lock().map_err(|_| {
+                crate::MeowError::from_code_str(
+                    crate::InnerErrorCode::LockPoisoned,
+                    "download checkpoint lock poisoned",
+                )
+            })?;
+            if let Some(state) = guard.as_mut() {
+                state.force_checkpoint().map_err(|e| {
+                    crate::MeowError::from_io("force .rcdl checkpoint failed".to_owned(), e)
+                })?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            crate::MeowError::from_code(
+                crate::InnerErrorCode::IoError,
+                format!("download checkpoint worker failed: {e}"),
+            )
+        })?
+    }
+
+    pub(crate) async fn take_download_progress_after_checkpoint(
+        &self,
+    ) -> Result<Option<crate::dflt::download_progress::DownloadProgress>, crate::MeowError> {
+        let progress = Arc::clone(&self.download_progress);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = progress.lock().map_err(|_| {
+                crate::MeowError::from_code_str(
+                    crate::InnerErrorCode::LockPoisoned,
+                    "download checkpoint lock poisoned",
+                )
+            })?;
+            if let Some(state) = guard.as_mut() {
+                state.force_checkpoint().map_err(|e| {
+                    crate::MeowError::from_io("final .rcdl checkpoint failed".to_owned(), e)
+                })?;
+                state.validate_committed_content().map_err(|e| {
+                    crate::MeowError::from_source(
+                        crate::InnerErrorCode::ChecksumMismatch,
+                        "validate completed download content failed".to_owned(),
+                        e,
+                    )
+                })?;
+            }
+            Ok(guard.take())
+        })
+        .await
+        .map_err(|e| {
+            crate::MeowError::from_code(
+                crate::InnerErrorCode::IoError,
+                format!("download checkpoint worker failed: {e}"),
+            )
+        })?
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_timer_tests {
+    use super::arm_download_checkpoint_timer;
+    use crate::dflt::download_progress::{sidecar_path, DownloadProgress};
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn lone_staged_part_is_checkpointed_by_wall_clock_timer() {
+        let target = std::env::temp_dir().join(format!(
+            "rusty_cat_checkpoint_timer_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::write(&target, vec![7_u8; 20]).expect("target");
+        let mut progress =
+            DownloadProgress::load_or_create(&target, 20, 10, 4, "timer-test").expect("progress");
+        assert!(!progress.stage_done(0).expect("stage"));
+        assert!(!progress.is_done(0), "the batch threshold was not reached");
+
+        let slot = Arc::new(Mutex::new(Some(progress)));
+        arm_download_checkpoint_timer(Arc::clone(&slot))
+            .await
+            .expect("timer task");
+        assert!(
+            slot.lock()
+                .expect("progress lock")
+                .as_ref()
+                .expect("progress")
+                .is_done(0),
+            "the 250 ms wall-clock wake-up must publish the staged part"
+        );
+
+        let _ = std::fs::remove_file(sidecar_path(&target));
+        let _ = std::fs::remove_file(target);
     }
 }

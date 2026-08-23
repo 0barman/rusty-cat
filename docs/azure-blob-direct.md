@@ -48,8 +48,8 @@ High-level process:
 3. Create `AzureBlobDirectUpload::new(account_name, account_key)`.
 4. Build an upload task with `UploadPounceBuilder`.
 5. Attach the protocol with `with_breakpoint_upload(Arc::new(upload_protocol))`.
-6. Submit with `try_enqueue(...)`.
-7. Wait for completion through callbacks or global listeners.
+6. Submit with `enqueue_and_wait(...)` (or manage terminal callbacks yourself).
+7. Wait for the terminal result.
 8. Close the client explicitly during shutdown.
 
 The blob URL must identify the final blob that should be created. The provider plugin appends Azure query parameters such as `comp=block` and `comp=blocklist` internally when uploading and committing blocks.
@@ -77,15 +77,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_max_chunk_retries(3)
         .build()?;
 
-    let task_id = client
-        .try_enqueue(
+    let outcome = client
+        .enqueue_and_wait(
             task,
             |record| println!("upload progress={:.2}%", record.progress() * 100.0),
-            |task_id, payload| println!("upload {task_id} complete: {payload:?}"),
         )
         .await?;
 
-    println!("submitted upload task: {task_id}");
+    println!("upload {} complete: {:?}", outcome.task_id, outcome.payload);
     client.close().await?;
     Ok(())
 }
@@ -112,7 +111,7 @@ High-level process:
 2. Create `AzureBlobDirectDownload::new(account_name, account_key)`.
 3. Build a `DownloadPounceBuilder` task with a local output path and chunk size.
 4. Attach the provider plugin with `with_breakpoint_download(Arc::new(download_protocol))`.
-5. Submit the task with `try_enqueue(...)` and monitor `FileTransferRecord` updates.
+5. Submit with `enqueue_and_wait(...)` and monitor `FileTransferRecord` updates.
 6. Close the client explicitly when your application shuts down.
 
 ```rust,no_run
@@ -134,15 +133,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_breakpoint_download(Arc::new(download_protocol))
         .build();
 
-    let task_id = client
-        .try_enqueue(
+    let outcome = client
+        .enqueue_and_wait(
             task,
             |record| println!("download progress={:.2}%", record.progress() * 100.0),
-            |task_id, _| println!("download {task_id} complete"),
         )
         .await?;
 
-    println!("submitted download task: {task_id}");
+    println!("download {} complete", outcome.task_id);
     client.close().await?;
     Ok(())
 }
@@ -150,9 +148,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 ## Restart recovery and database notes
 
-The SDK has no built-in database. Persist your own business record with blob URL, local path, direction, chunk size, provider type, status, and credential reference. On restart, rebuild the task and protocol and call `try_enqueue(...)` again.
+The SDK has no built-in database. Persist your own business record with blob URL, local path, direction, chunk size, provider type, status, and credential reference. Downloads can be rebuilt and recover according to the serial/concurrent download rules. Direct uploads can pause and resume in the same process, but the current public API cannot inject prior block-session progress into a new protocol instance after restart; reconcile or clean uncommitted blocks and start again.
 
-For direct Azure mode, avoid storing raw account keys in your transfer table. Store a credential reference or load the key from your secret manager at runtime. This keeps transfer persistence separate from credential storage and reduces the blast radius of a database leak.
+Canceling a direct Azure upload runs the provider abort hook, which deletes the target blob. Confirm that this cleanup policy is appropriate for your application before exposing cancel to users.
+
+For direct Azure mode, avoid storing raw account keys in your transfer table. Store a credential reference or load the key from your secret manager at runtime. This keeps transfer persistence separate from credential storage and reduces the blast radius of a database leak. See the [restart capability matrix](resume-after-restart.md).
 
 ## Troubleshooting
 

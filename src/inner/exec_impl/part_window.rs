@@ -57,7 +57,7 @@ impl PartWindow {
             return None;
         }
         let off = self.next_dispatch;
-        self.next_dispatch = (off + self.chunk).min(self.total);
+        self.next_dispatch = off.saturating_add(self.chunk).min(self.total);
         self.in_flight += 1;
         Some(off)
     }
@@ -81,7 +81,7 @@ impl PartWindow {
         self.completed.insert(offset);
         let before = self.watermark;
         while self.watermark < self.total && self.completed.remove(&self.watermark) {
-            self.watermark = (self.watermark + self.chunk).min(self.total);
+            self.watermark = self.watermark.saturating_add(self.chunk).min(self.total);
         }
         if self.watermark != before {
             Ok(Some(self.watermark))
@@ -183,6 +183,16 @@ mod tests {
         // Completing the short last part must reach exactly total, not 30.
         assert_eq!(w.on_done(20).unwrap(), Some(25));
         assert_eq!(w.watermark(), 25);
+        assert!(w.is_complete());
+    }
+
+    #[test]
+    fn offsets_near_u64_max_clamp_instead_of_wrapping() {
+        let start = u64::MAX - 2;
+        let mut w = PartWindow::new(start, u64::MAX, u64::MAX, 1);
+        assert_eq!(w.take_dispatch(), Some(start));
+        assert_eq!(w.take_dispatch(), None, "dispatch must clamp to total");
+        assert_eq!(w.on_done(start).unwrap(), Some(u64::MAX));
         assert!(w.is_complete());
     }
 

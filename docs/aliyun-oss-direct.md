@@ -48,8 +48,8 @@ High-level process:
 3. Create `AliOssDirectUpload::new(bucket, access_key_id, access_key_secret, region)`.
 4. Build an upload task with `UploadPounceBuilder`.
 5. Attach the protocol with `with_breakpoint_upload(Arc::new(upload_protocol))`.
-6. Submit with `MeowClient::try_enqueue(...)`.
-7. Wait for the completion callback or watch status records from the progress callback.
+6. Submit with `MeowClient::enqueue_and_wait(...)` (or manage terminal callbacks yourself).
+7. Wait for the terminal result.
 8. Persist your own business state if the upload must survive process restarts.
 9. Call `client.close().await` during shutdown.
 
@@ -79,15 +79,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_max_chunk_retries(3)
         .build()?;
 
-    let task_id = client
-        .try_enqueue(
+    let outcome = client
+        .enqueue_and_wait(
             task,
             |record| println!("upload progress={:.2}%", record.progress() * 100.0),
-            |task_id, payload| println!("upload {task_id} complete: {payload:?}"),
         )
         .await?;
 
-    println!("submitted upload task: {task_id}");
+    println!("upload {} complete: {:?}", outcome.task_id, outcome.payload);
     client.close().await?;
     Ok(())
 }
@@ -114,7 +113,7 @@ High-level process:
 2. Create `AliOssDirectDownload::new(bucket, access_key_id, access_key_secret, region)`.
 3. Build a `DownloadPounceBuilder` task with a local output path and chunk size.
 4. Attach the provider plugin with `with_breakpoint_download(Arc::new(download_protocol))`.
-5. Submit the task with `try_enqueue(...)` and monitor `FileTransferRecord` updates.
+5. Submit with `enqueue_and_wait(...)` and monitor `FileTransferRecord` updates.
 6. Close the client explicitly when your application shuts down.
 
 ```rust,no_run
@@ -139,15 +138,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_max_chunk_retries(3)
         .build();
 
-    let task_id = client
-        .try_enqueue(
+    let outcome = client
+        .enqueue_and_wait(
             task,
             |record| println!("download progress={:.2}%", record.progress() * 100.0),
-            |task_id, _| println!("download {task_id} complete"),
         )
         .await?;
 
-    println!("submitted download task: {task_id}");
+    println!("download {} complete", outcome.task_id);
     client.close().await?;
     Ok(())
 }
@@ -159,10 +157,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 1. Persist your own record containing object URL, object key, local path, direction, chunk size, and current status.
 2. Persist credential references, not raw secrets, whenever possible.
-3. On restart, recreate the same `AliOssDirectUpload` or `AliOssDirectDownload` protocol and rebuild the same logical task.
-4. Call `try_enqueue(...)` again. The provider implementation and executor will use available local and remote state to continue where possible.
+3. On restart, recreate the download protocol and rebuild the same logical download; it can recover from the partial file or a validated concurrent-download sidecar.
+4. Treat a direct upload differently: the current public API cannot inject a prior multipart session into a new protocol instance. Clean up the orphaned upload and start a new session.
 
-The direct upload protocol exposes the in-flight OSS multipart `UploadId` via `AliOssDirectUpload::current_upload_id()`. Persisting it lets you abort an orphaned multipart session out of band (so uncommitted parts stop accruing storage cost) if the user abandons the upload. For the full restart/crash recovery walkthrough, see [Resuming uploads and downloads after a restart](resume-after-restart.md).
+The direct upload protocol exposes the in-flight OSS multipart `UploadId` via `AliOssDirectUpload::current_upload_id()`. Persisting it lets you abort an orphaned multipart session out of band (so uncommitted parts stop accruing storage cost); it does not make that session injectable into a newly constructed SDK task. For the full restart/crash recovery matrix, see [Resume after a process restart](resume-after-restart.md).
 
 Do not store raw `access_key_secret` values in the same transfer table unless your security policy explicitly allows it. A safer pattern is to store a credential reference and resolve the actual secret from a secret manager when the task is rebuilt.
 

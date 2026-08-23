@@ -1,11 +1,11 @@
 use crate::error::{InnerErrorCode, MeowError};
 use crate::file_transfer_record::FileTransferRecord;
-use crate::ids::{GlobalProgressListenerId, TaskId};
+use crate::ids::TaskId;
 use crate::inner::cb_dispatcher;
 use crate::inner::group_state::{GroupState, RecordEntry};
 use crate::inner::inner_task::InnerTask;
 use crate::inner::scheduler_state::SchedulerState;
-use crate::inner::task_callbacks::{ProgressCb, TaskCallbacks};
+use crate::inner::task_callbacks::TaskCallbacks;
 use crate::inner::worker_event::WorkerEvent;
 use crate::inner::UniqueId;
 use crate::meow_config::MeowConfig;
@@ -14,7 +14,7 @@ use crate::transfer_snapshot::TransferSnapshot;
 use crate::transfer_status::TransferStatus;
 use crate::transfer_task::TransferTask;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use tokio::sync::mpsc;
 
@@ -410,7 +410,7 @@ fn worker_loop(
                                                 total,
                                             );
                                         }
-                                        state.active_mut().clear();
+                                        state.clear_active();
                                         state.groups_mut().clear();
                                         state.task_id_to_dedupe_mut().clear();
                                         state.queued_mut().clear();
@@ -431,17 +431,21 @@ fn worker_loop(
                             maybe_event = worker_rx.recv() => {
                                 let Some(event) = maybe_event else { continue; };
                                 crate::meow_trace_log!("worker_loop", "worker event received");
+                                let should_try_start_next =
+                                    event.may_change_scheduler_readiness();
                                 crate::inner::exec_impl::handle_worker_event::handle_worker_event(
                                     event,
                                     &mut state,
                                 )
                                 .await;
-                                let _ = crate::inner::exec_impl::exec::try_start_next(
-                                    &worker_tx,
-                                    &mut state,
-                                    &executor,
-                                )
-                                .await;
+                                if should_try_start_next {
+                                    let _ = crate::inner::exec_impl::exec::try_start_next(
+                                        &worker_tx,
+                                        &mut state,
+                                        &executor,
+                                    )
+                                    .await;
+                                }
                             }
                         }
                     }
@@ -598,7 +602,7 @@ async fn cancel_group(
         state.paused_set().contains(key)
     );
     // 取消优先终止执行态。
-    if let Some(active) = state.active_mut().remove(key) {
+    if let Some(active) = state.remove_active(key) {
         active.cancel().cancel();
     }
     // 取消后不应继续排队。
@@ -693,7 +697,7 @@ impl Executor {
     pub(crate) fn new(
         config: MeowConfig,
         executor: Arc<dyn TransferTrait>,
-        global_progress_listener: Arc<RwLock<Vec<(GlobalProgressListenerId, ProgressCb)>>>,
+        global_progress_listener: crate::inner::scheduler_state::GlobalProgressStore,
     ) -> Result<Self, MeowError> {
         crate::meow_key_log!(
             "executor",

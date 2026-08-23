@@ -46,7 +46,7 @@ High-level process:
 3. Create a `PresignedMultipartUploadPlan` with total size, chunk size, and part descriptors.
 4. Create `PresignedMultipartUpload::new(plan)`.
 5. Attach it to `UploadPounceBuilder` with `with_breakpoint_upload(...)`.
-6. Submit with `try_enqueue(...)`.
+6. Submit with `enqueue_and_wait(...)` (or manage terminal callbacks yourself).
 7. Complete the multipart upload either through a configured completion request or through your backend after all parts have been verified.
 
 The `offset` and `size` values in every part descriptor must match the local chunk plan. If the backend and client disagree about chunk boundaries, the SDK will send bytes to the wrong part URL or fail plan validation.
@@ -91,15 +91,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_breakpoint_upload(Arc::new(upload_protocol))
         .build()?;
 
-    let task_id = client
-        .try_enqueue(
+    let outcome = client
+        .enqueue_and_wait(
             task,
             |record| println!("upload progress={:.2}%", record.progress() * 100.0),
-            |task_id, payload| println!("upload {task_id} complete: {payload:?}"),
         )
         .await?;
 
-    println!("submitted upload task: {task_id}");
+    println!("upload {} complete: {:?}", outcome.task_id, outcome.payload);
     client.close().await?;
     Ok(())
 }
@@ -118,9 +117,9 @@ For production systems, prefer short-lived URLs plus a backend refresh endpoint.
 1. The provider **`upload_id`** your backend created (also surfaced at runtime via `UploadResumeInfo::provider_upload_id`). It is not a secret.
 2. Every `PresignedUploadedPart` as it completes — read them from a clone of the `PresignedMultipartUpload` via `uploaded_parts().await`.
 
-On restart, request a **fresh** plan from your backend (presigned URLs expire) carrying the **same** `upload_id`, then re-inject the saved parts with `PresignedMultipartUpload::new(plan).with_resumed_parts(saved_parts)` before `try_enqueue`. The SDK resumes past the verified contiguous prefix and re-sends the rest. Persisting the `upload_id` also lets you abort an orphaned multipart session out of band if the user abandons the upload.
+On restart, request a **fresh** plan from your backend (presigned URLs expire) carrying the **same** `upload_id`, reconcile it with provider state, then re-inject confirmed parts with `PresignedMultipartUpload::new(plan).with_resumed_parts(saved_parts)` before enqueue. The SDK resumes past the verified contiguous prefix and re-sends the rest. Persisting the `upload_id` also lets you abort an orphaned multipart session out of band if the user abandons the upload.
 
-See [Resuming uploads and downloads after a restart](resume-after-restart.md) for the complete walkthrough and code.
+See [Presigned multipart lifecycle](presigned-lifecycle.md) and [Resume after a process restart](resume-after-restart.md).
 
 ## Download flow
 
@@ -132,7 +131,7 @@ High-level process:
 2. Create `PresignedRangeDownloadPlan::new(download_url)`.
 3. If the backend already knows object size, call `with_total_size(size)`.
 4. Attach the protocol with `with_breakpoint_download(...)`.
-5. Submit with `try_enqueue(...)`.
+5. Submit with `enqueue_and_wait(...)` and await the terminal result.
 6. If the URL expires during a long download, request a refreshed plan from your backend and retry or re-enqueue according to your application policy.
 
 ```rust,no_run
@@ -162,15 +161,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .with_breakpoint_download(Arc::new(download_protocol))
     .build();
 
-    let task_id = client
-        .try_enqueue(
+    let outcome = client
+        .enqueue_and_wait(
             task,
             |record| println!("download progress={:.2}%", record.progress() * 100.0),
-            |task_id, _| println!("download {task_id} complete"),
         )
         .await?;
 
-    println!("submitted download task: {task_id}");
+    println!("download {} complete", outcome.task_id);
     client.close().await?;
     Ok(())
 }

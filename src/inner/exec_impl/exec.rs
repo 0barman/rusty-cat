@@ -9,12 +9,78 @@ use crate::prepare_outcome::PrepareOutcome;
 use crate::transfer_executor_trait::TransferTrait;
 use crate::transfer_status::TransferStatus;
 use crate::transfer_task::TransferTask;
+use crate::upload_file::UploadFileSnapshot;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
+
+const MAX_PARALLEL_PART_TASKS: u128 = 256;
+const MAX_PARALLEL_WINDOW_BYTES: u128 = 512 * 1024 * 1024;
+
+/// Releases the lazily opened upload descriptor on every run-group exit path
+/// (success, failure, cancel and pause). Part tasks are drained before the
+/// parallel driver returns, so no positioned read can still be using the slot.
+struct UploadFileHandleRelease(Option<UploadFileSnapshot>);
+
+impl Drop for UploadFileHandleRelease {
+    fn drop(&mut self) {
+        if let Some(snapshot) = self.0.as_ref() {
+            snapshot.release_handle();
+        }
+    }
+}
+
+/// Checks task-count and byte-allocation bounds only after the protocol has
+/// opted into the parallel driver. The configured window is capped by the
+/// remaining file's real part grid, so serial fallbacks and tiny files are not
+/// rejected just because the builder contains a large maximum.
+fn validate_parallel_part_window(
+    max_parts_in_flight: usize,
+    chunk_size: u64,
+    remaining_bytes: u64,
+) -> Result<(), MeowError> {
+    if remaining_bytes == 0 {
+        return Ok(());
+    }
+    let part_count = remaining_bytes
+        .checked_sub(1)
+        .and_then(|last| last.checked_div(chunk_size))
+        .and_then(|parts_before_last| parts_before_last.checked_add(1))
+        .ok_or_else(|| {
+            MeowError::from_code_str(
+                InnerErrorCode::IoError,
+                "parallel part count overflow or zero chunk size",
+            )
+        })?;
+    let effective_parts = (max_parts_in_flight.max(1) as u128).min(part_count as u128);
+    if effective_parts > MAX_PARALLEL_PART_TASKS {
+        return Err(MeowError::from_code(
+            InnerErrorCode::IoError,
+            format!(
+                "parallel part window exceeds task limit: requested={effective_parts} limit={MAX_PARALLEL_PART_TASKS}"
+            ),
+        ));
+    }
+    let max_part_bytes = remaining_bytes.min(chunk_size) as u128;
+    let budget = effective_parts.checked_mul(max_part_bytes).ok_or_else(|| {
+        MeowError::from_code_str(
+            InnerErrorCode::IoError,
+            "parallel part window size overflow",
+        )
+    })?;
+    if budget > MAX_PARALLEL_WINDOW_BYTES {
+        return Err(MeowError::from_code(
+            InnerErrorCode::IoError,
+            format!(
+                "parallel part window exceeds memory limit: requested={budget} limit={MAX_PARALLEL_WINDOW_BYTES}"
+            ),
+        ));
+    }
+    Ok(())
+}
 
 pub(crate) async fn try_start_next(
     worker_tx: &mpsc::Sender<WorkerEvent>,
@@ -103,9 +169,7 @@ pub(crate) async fn try_start_next(
             }
 
             let cancel = CancellationToken::new();
-            state
-                .active_mut()
-                .insert(key.clone(), ActiveState::new(cancel.clone()));
+            state.insert_active(key.clone(), ActiveState::new(cancel.clone()));
             started_keys.insert(key.clone());
             scheduled_in_this_round = true;
 
@@ -172,11 +236,7 @@ pub(crate) async fn try_start_next(
 }
 
 fn can_start_direction(state: &SchedulerState, direction: Direction) -> bool {
-    let active = state
-        .active()
-        .keys()
-        .filter(|(d, _)| *d == direction)
-        .count();
+    let active = state.active_direction_count(direction);
     match direction {
         Direction::Upload => active < state.max_upload_concurrency(),
         Direction::Download => active < state.max_download_concurrency(),
@@ -199,6 +259,7 @@ async fn run_group(
         start_offset
     );
     let task = TransferTask::from_inner(&inner);
+    let _upload_file_handle_release = UploadFileHandleRelease(task.upload_file_snapshot().cloned());
     // 上传 `prepare` 已在 `DefaultHttpTransfer::upload_prepare` 内按 `max_upload_prepare_retries` 重试；
     // 此处仅对下载 `prepare`（HEAD 等）做外层连接级重试，避免与上传语义叠加或改写错误码。
     let max_prep_retries = match inner.direction() {
@@ -310,7 +371,22 @@ async fn run_group(
     // （默认 `==1` / 不支持的协议）落到下面逐字未变的串行 loop，行为字节一致。
     // A windowed download needs a known total to build the part grid and pre-size
     // the file; when the size is unknown (0), fall back to the serial loop.
-    if inner.max_parts_in_flight() > 1 && known_total > 0 && executor.supports_parallel_parts(&task) {
+    if inner.max_parts_in_flight() > 1 && known_total > 0 && executor.supports_parallel_parts(&task)
+    {
+        if let Err(error) = validate_parallel_part_window(
+            inner.max_parts_in_flight(),
+            inner.chunk_size(),
+            known_total.saturating_sub(offset),
+        ) {
+            let _ = worker_tx
+                .send(WorkerEvent::Failed {
+                    key,
+                    error,
+                    total_size: known_total,
+                })
+                .await;
+            return;
+        }
         run_group_parallel(
             key,
             &inner,
@@ -436,6 +512,22 @@ async fn run_group(
     }
 }
 
+#[cfg(test)]
+mod resource_budget_tests {
+    use super::validate_parallel_part_window;
+
+    #[test]
+    fn parallel_window_uses_real_grid_and_rejects_task_or_memory_exhaustion() {
+        validate_parallel_part_window(usize::MAX, 1024 * 1024, 2 * 1024 * 1024)
+            .expect("a huge configured maximum is harmless for a two-part file");
+        assert!(validate_parallel_part_window(257, 1, 257).is_err());
+        assert!(
+            validate_parallel_part_window(3, 256 * 1024 * 1024, 3 * 256 * 1024 * 1024,).is_err()
+        );
+        assert!(validate_parallel_part_window(2, 0, 1).is_err());
+    }
+}
+
 /// Spawns one in-flight part (upload of a single chunk at `offset`) onto the
 /// JoinSet, driven through the shared per-chunk retry loop in `Part` mode so it
 /// never finalizes the upload. Each part owns cheap clones of the executor Arc,
@@ -443,10 +535,7 @@ async fn run_group(
 /// is consistent), the dedupe key, and the shared cancellation token.
 #[allow(clippy::too_many_arguments)]
 fn spawn_part(
-    set: &mut tokio::task::JoinSet<(
-        u64,
-        crate::inner::exec_impl::retry::ChunkRetryResult,
-    )>,
+    set: &mut tokio::task::JoinSet<(u64, crate::inner::exec_impl::retry::ChunkRetryResult)>,
     executor: &Arc<dyn TransferTrait>,
     task: &TransferTask,
     key: &UniqueId,
@@ -574,7 +663,12 @@ async fn run_group_parallel(
 
     let chunk = inner.chunk_size();
     let max_retries = inner.max_chunk_retries();
-    let mut window = PartWindow::new(start_offset, chunk, known_total, inner.max_parts_in_flight());
+    let mut window = PartWindow::new(
+        start_offset,
+        chunk,
+        known_total,
+        inner.max_parts_in_flight(),
+    );
     let mut set: tokio::task::JoinSet<(u64, ChunkRetryResult)> = tokio::task::JoinSet::new();
     let mut cancelled = false;
     let mut failed: Option<MeowError> = None;
@@ -582,7 +676,15 @@ async fn run_group_parallel(
     // Fill the window with the first batch of parts.
     while let Some(off) = window.take_dispatch() {
         spawn_part(
-            &mut set, executor, task, &key, cancel, off, chunk, known_total, max_retries,
+            &mut set,
+            executor,
+            task,
+            &key,
+            cancel,
+            off,
+            chunk,
+            known_total,
+            max_retries,
         );
     }
 
@@ -663,7 +765,14 @@ async fn run_group_parallel(
                 if !cancelled && failed.is_none() {
                     while let Some(next_off) = window.take_dispatch() {
                         spawn_part(
-                            &mut set, executor, task, &key, cancel, next_off, chunk, known_total,
+                            &mut set,
+                            executor,
+                            task,
+                            &key,
+                            cancel,
+                            next_off,
+                            chunk,
+                            known_total,
                             max_retries,
                         );
                     }
@@ -690,6 +799,15 @@ async fn run_group_parallel(
     // prioritizing a genuine failure over a cancel (the retry layer already maps
     // user-cancel in-flight errors to Cancelled, so `failed` means a real error).
     if let Some(e) = failed {
+        if task.direction() == Direction::Download {
+            if let Err(checkpoint_error) = task.force_download_checkpoint().await {
+                crate::meow_warn_log!(
+                    "run_group_parallel",
+                    "checkpoint while settling failed download also failed: {}",
+                    crate::log::redact_secrets(&checkpoint_error.to_string())
+                );
+            }
+        }
         crate::log::emit_lazy(|| {
             let mut log = crate::log::Log::error(
                 "run_group_parallel",
@@ -714,6 +832,18 @@ async fn run_group_parallel(
             })
             .await;
     } else if cancelled || cancel.is_cancelled() {
+        if task.direction() == Direction::Download {
+            if let Err(error) = task.force_download_checkpoint().await {
+                let _ = worker_tx
+                    .send(WorkerEvent::Failed {
+                        key,
+                        error,
+                        total_size: known_total,
+                    })
+                    .await;
+                return;
+            }
+        }
         // FLAW-1: re-check cancel right before finalizing so `complete` can never
         // race the `abort_upload` that `cancel_group` issues; treat a late cancel
         // as Canceled even if every part already finished.

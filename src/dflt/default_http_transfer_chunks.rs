@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use bytes::BytesMut;
-use reqwest::header::CONTENT_RANGE;
+use reqwest::header::{HeaderMap, HeaderValue, CONTENT_ENCODING, CONTENT_RANGE, ETAG, IF_MATCH};
+use sha2::{Digest, Sha256};
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 use crate::chunk_outcome::ChunkOutcome;
 use crate::error::{InnerErrorCode, MeowError};
@@ -14,6 +14,47 @@ use crate::transfer_task::TransferTask;
 use crate::upload_source::UploadSource;
 
 const MAX_ERROR_BODY_PREVIEW_BYTES: usize = 4096;
+
+fn strong_response_etag(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let etag = headers.get(ETAG)?.to_str().ok()?.trim();
+    if etag.len() < 2
+        || etag
+            .get(..2)
+            .map(|prefix| prefix.eq_ignore_ascii_case("W/"))
+            .unwrap_or(false)
+        || !etag.starts_with('"')
+        || !etag.ends_with('"')
+    {
+        return None;
+    }
+    Some(etag.to_owned())
+}
+
+async fn build_download_range_request(
+    download: Arc<dyn BreakpointDownload + Send + Sync>,
+    task: &TransferTask,
+    range_value: &str,
+    base: HeaderMap,
+) -> Result<(String, HeaderMap), MeowError> {
+    let task = task.clone();
+    let range_value = range_value.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let mut headers = base;
+        download.merge_range_get_headers(DownloadRangeGetCtx {
+            task: &task,
+            range_value: &range_value,
+            base: &mut headers,
+        })?;
+        Ok((download.range_url(&task), headers))
+    })
+    .await
+    .map_err(|error| {
+        MeowError::from_code(
+            InnerErrorCode::InvalidTaskState,
+            format!("download range request builder worker failed: {error}"),
+        )
+    })?
+}
 
 /// Maps `reqwest::Error` into SDK error type.
 pub(crate) fn map_reqwest(e: reqwest::Error) -> MeowError {
@@ -52,18 +93,28 @@ async fn rollback_download_file(file: &mut File, offset: u64, path: &std::path::
 /// is gone → `NotFound`) as well as a delete-then-recreate (the visible file is
 /// shorter than what we have written → length check).
 async fn ensure_download_file_present(
+    file: &File,
     path: &std::path::Path,
     expected_min_len: u64,
 ) -> Result<(), MeowError> {
+    let handle_meta = file.metadata().await.map_err(|e| {
+        MeowError::from_io(
+            format!("stat opened download file failed: {}", path.display()),
+            e,
+        )
+    })?;
     match tokio::fs::metadata(path).await {
-        Ok(meta) if meta.len() >= expected_min_len => Ok(()),
+        Ok(meta) if meta.len() >= expected_min_len && same_file_generation(&handle_meta, &meta) => {
+            Ok(())
+        }
         Ok(meta) => Err(MeowError::from_code(
             InnerErrorCode::LocalFileRemoved,
             format!(
-                "download file replaced during transfer: path={} expected_len>={} visible_len={}",
+                "download file replaced during transfer: path={} expected_len>={} visible_len={} same_generation={}",
                 path.display(),
                 expected_min_len,
-                meta.len()
+                meta.len(),
+                same_file_generation(&handle_meta, &meta)
             ),
         )),
         Err(e) => Err(MeowError::from_io(
@@ -74,6 +125,26 @@ async fn ensure_download_file_present(
             e,
         )),
     }
+}
+
+#[cfg(unix)]
+fn same_file_generation(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(windows)]
+fn same_file_generation(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    left.volume_serial_number() == right.volume_serial_number()
+        && left.file_index() == right.file_index()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file_generation(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
+        && left.created().ok() == right.created().ok()
 }
 
 async fn read_error_body_preview(resp: &mut reqwest::Response, max_bytes: usize) -> String {
@@ -104,10 +175,10 @@ async fn read_error_body_preview(resp: &mut reqwest::Response, max_bytes: usize)
 ///
 /// Returns `Some((chunk_bytes, uploaded_len))`, or `None` when `offset` is at or
 /// past `total` (nothing left to upload at this offset). For the file source it
-/// reads straight into a per-chunk [`bytes::BytesMut`] and `freeze()`s it into a
-/// `Bytes` body with no extra copy, holding the per-task file slot lock only
-/// across the `seek + read` (released before the caller's network upload). For
-/// the in-memory source it slices the shared `Bytes` (a refcount bump, no copy).
+/// reads from the stable task-owned handle with positioned I/O, so concurrent
+/// parts never share a mutable cursor. The resulting `Bytes` owns the allocation
+/// and retry clones are O(1). For the in-memory source it slices the shared
+/// `Bytes` (a refcount bump, no copy).
 ///
 /// Shared by the serial [`upload_one_chunk`] and the parallel
 /// [`upload_one_chunk_part`] paths so the read logic cannot drift between them.
@@ -124,58 +195,39 @@ async fn read_upload_chunk(
     if read_len == 0 {
         return Ok(None);
     }
-    let read_len_usize = read_len as usize;
+    let read_len_usize = usize::try_from(read_len).map_err(|_| {
+        MeowError::from_code_str(
+            InnerErrorCode::IoError,
+            "upload chunk length does not fit this target architecture",
+        )
+    })?;
 
     match task.upload_source() {
-        Some(UploadSource::File(path)) => {
-            // Read straight into a per-chunk `BytesMut`, then `freeze()` it into a
-            // `Bytes` handle with no extra copy: `freeze` reuses the same
-            // allocation, so the reqwest `Body::from(Bytes)` and the `Bytes::clone`
-            // on retries are all O(1).
-            let mut buf = BytesMut::with_capacity(read_len_usize);
-            buf.resize(read_len_usize, 0);
-
-            let mut slot = task.upload_file_slot().lock().await;
-            if slot.is_none() {
-                let opened = File::open(path).await.map_err(|e| {
-                    MeowError::from_io(
-                        format!("open upload source failed: {}", path.display()),
-                        e,
-                    )
-                })?;
-                *slot = Some(opened);
-            }
-            let file = slot.as_mut().ok_or_else(|| {
+        Some(UploadSource::File(_path)) => {
+            let snapshot = task.upload_file_snapshot().ok_or_else(|| {
                 MeowError::from_code_str(
-                    InnerErrorCode::IoError,
-                    "upload file slot unexpectedly empty after open",
+                    InnerErrorCode::InvalidTaskState,
+                    "upload file snapshot missing for file source",
                 )
             })?;
-            file.seek(std::io::SeekFrom::Start(offset))
-                .await
-                .map_err(|e| {
-                    MeowError::from_io(
-                        format!(
-                            "seek upload source failed: offset={offset} path={}",
-                            path.display()
-                        ),
-                        e,
-                    )
-                })?;
-            file.read_exact(&mut buf[..]).await.map_err(|e| {
-                MeowError::from_io(
-                    format!("read upload source failed: path={}", path.display()),
-                    e,
-                )
-            })?;
-            drop(slot);
-            let chunk = buf.freeze();
+            snapshot.validate_generation(false).await?;
+            let chunk = snapshot.read_exact_at(offset, read_len).await?;
             let chunk_len = chunk.len() as u64;
             Ok(Some((chunk, chunk_len)))
         }
         Some(UploadSource::Bytes(bytes)) => {
-            let start = offset as usize;
-            let end = start + read_len_usize;
+            let start = usize::try_from(offset).map_err(|_| {
+                MeowError::from_code_str(
+                    InnerErrorCode::InvalidRange,
+                    "upload bytes offset does not fit this target architecture",
+                )
+            })?;
+            let end = start.checked_add(read_len_usize).ok_or_else(|| {
+                MeowError::from_code_str(
+                    InnerErrorCode::InvalidRange,
+                    "upload bytes range overflow",
+                )
+            })?;
             if end > bytes.len() {
                 return Err(MeowError::from_code(
                     InnerErrorCode::InvalidRange,
@@ -198,6 +250,47 @@ async fn read_upload_chunk(
     }
 }
 
+async fn abort_upload_once(
+    client: &reqwest::Client,
+    task: &TransferTask,
+    upload: &Arc<dyn BreakpointUpload + Send + Sync>,
+) {
+    if task.begin_upload_abort() {
+        if let Err(abort_error) = upload.abort_upload(client, task).await {
+            crate::meow_warn_log!(
+                "upload_source",
+                "abort after source validation failure also failed: {}",
+                crate::log::redact_secrets(&abort_error.to_string())
+            );
+        }
+    }
+}
+
+async fn validate_serial_upload_before_last_part(
+    client: &reqwest::Client,
+    task: &TransferTask,
+    upload: &Arc<dyn BreakpointUpload + Send + Sync>,
+    offset: u64,
+    len: u64,
+) -> Result<(), MeowError> {
+    let is_last = offset
+        .checked_add(len)
+        .map(|end| end >= task.total_size())
+        .ok_or_else(|| {
+            MeowError::from_code_str(InnerErrorCode::InvalidRange, "upload part end overflow")
+        })?;
+    if !is_last {
+        return Ok(());
+    }
+    if let Some(snapshot) = task.upload_file_snapshot() {
+        if let Err(error) = snapshot.validate_generation(true).await {
+            abort_upload_once(client, task, upload).await;
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 /// Uploads exactly one chunk WITHOUT finalizing the upload, returning this part's
 /// next offset.
 ///
@@ -217,9 +310,14 @@ pub(crate) async fn upload_one_chunk_part(
     chunk_size: u64,
 ) -> Result<ChunkOutcome, MeowError> {
     let total = task.total_size();
-    let Some((chunk_bytes, uploaded_chunk_len)) =
-        read_upload_chunk(task, offset, chunk_size).await?
-    else {
+    let read = match read_upload_chunk(task, offset, chunk_size).await {
+        Ok(read) => read,
+        Err(error) => {
+            abort_upload_once(client, task, &upload).await;
+            return Err(error);
+        }
+    };
+    let Some((chunk_bytes, uploaded_chunk_len)) = read else {
         return Ok(ChunkOutcome {
             next_offset: offset,
             total_size: total,
@@ -227,6 +325,9 @@ pub(crate) async fn upload_one_chunk_part(
             completion_payload: None,
         });
     };
+    let uploaded_end = offset.checked_add(uploaded_chunk_len).ok_or_else(|| {
+        MeowError::from_code_str(InnerErrorCode::InvalidRange, "upload part end overflow")
+    })?;
     let info = upload
         .upload_chunk(UploadChunkCtx {
             client,
@@ -253,7 +354,7 @@ pub(crate) async fn upload_one_chunk_part(
             });
             e
         })?;
-    let next = info.next_byte.unwrap_or(offset + uploaded_chunk_len).min(total);
+    let next = info.next_byte.unwrap_or(uploaded_end).min(total);
     Ok(ChunkOutcome {
         next_offset: next,
         total_size: total,
@@ -276,9 +377,14 @@ pub(crate) async fn upload_one_chunk(
     chunk_size: u64,
 ) -> Result<ChunkOutcome, MeowError> {
     let total = task.total_size();
-    let Some((chunk_bytes, uploaded_chunk_len)) =
-        read_upload_chunk(task, offset, chunk_size).await?
-    else {
+    let read = match read_upload_chunk(task, offset, chunk_size).await {
+        Ok(read) => read,
+        Err(error) => {
+            abort_upload_once(client, task, &upload).await;
+            return Err(error);
+        }
+    };
+    let Some((chunk_bytes, uploaded_chunk_len)) = read else {
         return Ok(ChunkOutcome {
             next_offset: offset,
             total_size: total,
@@ -286,6 +392,16 @@ pub(crate) async fn upload_one_chunk(
             completion_payload: None,
         });
     };
+    // A serial protocol may finalize inside its last `upload_chunk`, so verify
+    // the source exactly once before sending that last buffered part. Parallel
+    // uploads intentionally skip this checkpoint and perform their sole full
+    // re-hash after every part has settled, immediately before multipart
+    // completion.
+    validate_serial_upload_before_last_part(client, task, &upload, offset, uploaded_chunk_len)
+        .await?;
+    let uploaded_end = offset.checked_add(uploaded_chunk_len).ok_or_else(|| {
+        MeowError::from_code_str(InnerErrorCode::InvalidRange, "upload chunk end overflow")
+    })?;
     let info = upload
         .upload_chunk(UploadChunkCtx {
             client,
@@ -312,6 +428,18 @@ pub(crate) async fn upload_one_chunk(
             });
             e
         })?;
+    if offset
+        .checked_add(uploaded_chunk_len)
+        .map(|end| end >= total)
+        .unwrap_or(true)
+    {
+        if let Some(snapshot) = task.upload_file_snapshot() {
+            if let Err(error) = snapshot.validate_generation(false).await {
+                abort_upload_once(client, task, &upload).await;
+                return Err(error);
+            }
+        }
+    }
     if info.completed_file_id.is_some() {
         return Ok(ChunkOutcome {
             next_offset: total,
@@ -320,33 +448,27 @@ pub(crate) async fn upload_one_chunk(
             completion_payload: info.completed_file_id,
         });
     }
-    let next = info
-        .next_byte
-        .unwrap_or(offset + uploaded_chunk_len)
-        .min(total);
+    let next = info.next_byte.unwrap_or(uploaded_end).min(total);
     let mut completion_payload = None;
     if next >= total {
-        completion_payload = upload
-            .complete_upload(client, task)
-            .await
-            .map_err(|e| {
-                crate::log::emit_lazy(|| {
-                    let mut log = crate::log::Log::error(
-                        "complete",
-                        format!("complete_upload finalize failed: {}", e),
-                    )
-                    .with_key(task.file_name())
-                    .with_offset(offset)
-                    .with_byte_len(total)
-                    .with_url(task.url());
-                    if let Some(status) = e.http_status() {
-                        log = log.with_http_status(status);
-                    }
-                    log = log.with_error_code(e.code());
-                    log
-                });
-                e
-            })?;
+        completion_payload = upload.complete_upload(client, task).await.map_err(|e| {
+            crate::log::emit_lazy(|| {
+                let mut log = crate::log::Log::error(
+                    "complete",
+                    format!("complete_upload finalize failed: {}", e),
+                )
+                .with_key(task.file_name())
+                .with_offset(offset)
+                .with_byte_len(total)
+                .with_url(task.url());
+                if let Some(status) = e.http_status() {
+                    log = log.with_http_status(status);
+                }
+                log = log.with_error_code(e.code());
+                log
+            });
+            e
+        })?;
         crate::log::emit_lazy(|| {
             crate::log::Log::key("complete", "complete_upload finalized")
                 .with_key(task.file_name())
@@ -367,7 +489,9 @@ fn range_spec(start: u64, chunk_size: u64, total: u64) -> String {
     if total == 0 {
         return format!("bytes={start}-");
     }
-    let end = (start + chunk_size - 1).min(total.saturating_sub(1));
+    let end = start
+        .saturating_add(chunk_size.saturating_sub(1))
+        .min(total.saturating_sub(1));
     format!("bytes={start}-{end}")
 }
 
@@ -466,14 +590,8 @@ pub(crate) async fn download_one_chunk(
     }
 
     let spec = range_spec(offset, chunk_size, total);
-    let mut headers = task.headers().clone();
-    download.merge_range_get_headers(DownloadRangeGetCtx {
-        task,
-        range_value: &spec,
-        base: &mut headers,
-    })?;
-
-    let range_url = download.range_url(task);
+    let (range_url, headers) =
+        build_download_range_request(download, task, &spec, task.headers().clone()).await?;
     // Sanitized snapshot for logging only: the raw `range_url` is a presigned/SAS
     // URL and is moved into `client.get(..)` below, so capture a redacted copy now.
     let sanitized_range_url = crate::log::sanitize_url(&range_url);
@@ -531,7 +649,10 @@ pub(crate) async fn download_one_chunk(
             crate::log::emit_lazy(|| {
                 crate::log::Log::error(
                     "range_get",
-                    format!("missing content-range header: offset={} spec={}", offset, spec),
+                    format!(
+                        "missing content-range header: offset={} spec={}",
+                        offset, spec
+                    ),
                 )
                 .with_key(task.file_name())
                 .with_offset(offset)
@@ -561,6 +682,17 @@ pub(crate) async fn download_one_chunk(
             format!("download content-range start mismatch: expected {offset}, got {range_start}"),
         ));
     }
+    let requested_end = offset
+        .saturating_add(chunk_size.saturating_sub(1))
+        .min(total.saturating_sub(1));
+    if range_end != requested_end {
+        return Err(MeowError::from_code(
+            InnerErrorCode::InvalidRange,
+            format!(
+                "download content-range end mismatch: expected {requested_end}, got {range_end}"
+            ),
+        ));
+    }
     if let Some(rt) = range_total {
         if rt != total {
             crate::log::emit_lazy(|| {
@@ -581,7 +713,15 @@ pub(crate) async fn download_one_chunk(
             ));
         }
     }
-    let expected_len = range_end - range_start + 1;
+    let expected_len = range_end
+        .checked_sub(range_start)
+        .and_then(|len| len.checked_add(1))
+        .ok_or_else(|| {
+            MeowError::from_code_str(
+                InnerErrorCode::InvalidRange,
+                "content-range length overflow",
+            )
+        })?;
 
     let path = task.file_path();
     if offset == 0 {
@@ -615,6 +755,9 @@ pub(crate) async fn download_one_chunk(
         let opened = OpenOptions::new()
             .write(true)
             .create(true)
+            // Resume must preserve already-written bytes beyond the current
+            // offset; spell this out so platform defaults cannot drift.
+            .truncate(false)
             .open(path)
             .await
             .map_err(|e| {
@@ -695,7 +838,9 @@ pub(crate) async fn download_one_chunk(
         if chunk.is_empty() {
             continue;
         }
-        let next_written = written_len + chunk.len() as u64;
+        let next_written = written_len.checked_add(chunk.len() as u64).ok_or_else(|| {
+            MeowError::from_code_str(InnerErrorCode::InvalidRange, "range body length overflow")
+        })?;
         if next_written > expected_len {
             rollback_download_file(f, offset, path).await;
             crate::meow_error_log!(
@@ -758,7 +903,9 @@ pub(crate) async fn download_one_chunk(
         ));
     }
 
-    let next = offset + written_len;
+    let next = offset.checked_add(written_len).ok_or_else(|| {
+        MeowError::from_code_str(InnerErrorCode::InvalidRange, "download offset overflow")
+    })?;
     if let Err(e) = f.flush().await {
         rollback_download_file(f, offset, path).await;
         return Err(MeowError::from_io(
@@ -769,7 +916,7 @@ pub(crate) async fn download_one_chunk(
     // Detect a file deleted/replaced while this chunk was being written. On Unix
     // such a deletion does not fail `write_all` (the handle keeps an orphaned
     // inode alive), so without this check the failure would be silent.
-    ensure_download_file_present(path, next).await?;
+    ensure_download_file_present(f, path, next).await?;
     crate::meow_trace_log!(
         "download_chunk",
         "chunk write success: file={} offset={} next={} total={}",
@@ -797,24 +944,43 @@ pub(crate) async fn download_one_chunk_part_positioned(
     offset: u64,
     chunk_size: u64,
     remote_total_size: u64,
-) -> Result<ChunkOutcome, MeowError> {
+) -> Result<(ChunkOutcome, [u8; 32]), MeowError> {
     let total = remote_total_size;
     if offset >= total {
-        return Ok(ChunkOutcome {
-            next_offset: offset,
-            total_size: total,
-            done: true,
-            completion_payload: None,
-        });
+        return Ok((
+            ChunkOutcome {
+                next_offset: offset,
+                total_size: total,
+                done: true,
+                completion_payload: None,
+            },
+            Sha256::digest([]).into(),
+        ));
     }
     let spec = range_spec(offset, chunk_size, total);
-    let mut headers = task.headers().clone();
-    download.merge_range_get_headers(DownloadRangeGetCtx {
-        task,
-        range_value: &spec,
-        base: &mut headers,
-    })?;
-    let range_url = download.range_url(task);
+    let (range_url, mut headers) =
+        build_download_range_request(download, task, &spec, task.headers().clone()).await?;
+    let expected_validator = {
+        let progress = task.download_progress().lock().map_err(|_| {
+            MeowError::from_code_str(
+                InnerErrorCode::LockPoisoned,
+                "download checkpoint lock poisoned",
+            )
+        })?;
+        progress
+            .as_ref()
+            .and_then(|progress| progress.expected_validator())
+            .map(str::to_owned)
+    };
+    if let Some(validator) = expected_validator.as_deref() {
+        let value = HeaderValue::from_str(validator).map_err(|e| {
+            MeowError::from_code(
+                InnerErrorCode::InvalidRange,
+                format!("invalid stored download validator: {e}"),
+            )
+        })?;
+        headers.insert(IF_MATCH, value);
+    }
     let mut resp = client
         .get(range_url)
         .headers(headers)
@@ -841,6 +1007,53 @@ pub(crate) async fn download_one_chunk_part_positioned(
             format!("range GET requires 206, got {status}: {body}"),
         ));
     }
+    if let Some(encoding) = resp.headers().get(CONTENT_ENCODING) {
+        let encoding = encoding.to_str().unwrap_or("<invalid>");
+        if !encoding.eq_ignore_ascii_case("identity") {
+            return Err(MeowError::from_code(
+                InnerErrorCode::InvalidRange,
+                format!("parallel range response used content-encoding {encoding}"),
+            ));
+        }
+    }
+    // Every range in one positioned download must prove that it belongs to one
+    // immutable remote generation. HEAD may have supplied the validator; when
+    // callers intentionally skip HEAD, the first 206 latches it under the
+    // progress lock and every concurrent response is compared with that value.
+    // Missing/weak ETags fail closed because byte digests only validate local
+    // persistence, not that disjoint ranges came from the same object version.
+    let actual_validator = strong_response_etag(resp.headers()).ok_or_else(|| {
+        MeowError::from_code_str(
+            InnerErrorCode::InvalidRange,
+            "parallel range response must include a strong ETag",
+        )
+    })?;
+    {
+        let mut progress = task.download_progress().lock().map_err(|_| {
+            MeowError::from_code_str(
+                InnerErrorCode::LockPoisoned,
+                "download checkpoint lock poisoned",
+            )
+        })?;
+        let progress = progress.as_mut().ok_or_else(|| {
+            MeowError::from_code_str(
+                InnerErrorCode::InvalidTaskState,
+                "parallel download progress missing while validating generation",
+            )
+        })?;
+        match progress.expected_validator() {
+            Some(expected) if expected != actual_validator => {
+                return Err(MeowError::from_code(
+                    InnerErrorCode::InvalidRange,
+                    format!(
+                        "parallel range response generation mismatch: expected ETag {expected}, got {actual_validator}"
+                    ),
+                ));
+            }
+            Some(_) => {}
+            None => progress.set_expected_validator(actual_validator),
+        }
+    }
     let content_range = resp
         .headers()
         .get(CONTENT_RANGE)
@@ -859,6 +1072,15 @@ pub(crate) async fn download_one_chunk_part_positioned(
             format!("content-range start mismatch: expected {offset}, got {range_start}"),
         ));
     }
+    let requested_end = offset
+        .saturating_add(chunk_size.saturating_sub(1))
+        .min(total.saturating_sub(1));
+    if range_end != requested_end {
+        return Err(MeowError::from_code(
+            InnerErrorCode::InvalidRange,
+            format!("content-range end mismatch: expected {requested_end}, got {range_end}"),
+        ));
+    }
     if let Some(rt) = range_total {
         if rt != total {
             return Err(MeowError::from_code(
@@ -871,7 +1093,18 @@ pub(crate) async fn download_one_chunk_part_positioned(
             ));
         }
     }
-    let expected_len = range_end - range_start + 1;
+    let expected_len = range_end
+        .checked_sub(range_start)
+        .and_then(|len| len.checked_add(1))
+        .ok_or_else(|| {
+            MeowError::from_code_str(
+                InnerErrorCode::InvalidRange,
+                "content-range length overflow",
+            )
+        })?;
+    let part_end = offset.checked_add(expected_len).ok_or_else(|| {
+        MeowError::from_code_str(InnerErrorCode::InvalidRange, "download part end overflow")
+    })?;
 
     // Own handle: independent OS cursor; disjoint ranges never conflict.
     let path = task.file_path();
@@ -886,24 +1119,25 @@ pub(crate) async fn download_one_chunk_part_positioned(
     // Defensive precondition: the file MUST already be pre-sized to at least
     // `offset + expected_len` (download_prepare `set_len(total)`). Seeking past
     // EOF and writing would otherwise silently create a sparse hole on POSIX.
-    let flen = f
-        .metadata()
-        .await
-        .map(|m| m.len())
-        .map_err(|e| MeowError::from_io(format!("stat download file failed: {}", path.display()), e))?;
-    if flen < offset + expected_len {
+    let flen = f.metadata().await.map(|m| m.len()).map_err(|e| {
+        MeowError::from_io(format!("stat download file failed: {}", path.display()), e)
+    })?;
+    if flen < part_end {
         return Err(MeowError::from_code(
             InnerErrorCode::InvalidRange,
             format!(
                 "download file not pre-sized for positioned write: len={flen}, need>={}",
-                offset + expected_len
+                part_end
             ),
         ));
     }
-    f.seek(std::io::SeekFrom::Start(offset)).await.map_err(|e| {
-        MeowError::from_io(format!("seek download file failed: offset={offset}"), e)
-    })?;
+    f.seek(std::io::SeekFrom::Start(offset))
+        .await
+        .map_err(|e| {
+            MeowError::from_io(format!("seek download file failed: offset={offset}"), e)
+        })?;
     let mut written_len = 0_u64;
+    let mut digest = Sha256::new();
     loop {
         let chunk = match resp.chunk().await {
             Ok(v) => v,
@@ -913,16 +1147,19 @@ pub(crate) async fn download_one_chunk_part_positioned(
         if chunk.is_empty() {
             continue;
         }
-        let next_written = written_len + chunk.len() as u64;
+        let next_written = written_len.checked_add(chunk.len() as u64).ok_or_else(|| {
+            MeowError::from_code_str(InnerErrorCode::InvalidRange, "range body length overflow")
+        })?;
         if next_written > expected_len {
             return Err(MeowError::from_code(
                 InnerErrorCode::InvalidRange,
                 format!("range body too long: expected {expected_len}, got >= {next_written}"),
             ));
         }
-        f.write_all(&chunk)
-            .await
-            .map_err(|e| MeowError::from_io(format!("write download file failed at {offset}"), e))?;
+        f.write_all(&chunk).await.map_err(|e| {
+            MeowError::from_io(format!("write download file failed at {offset}"), e)
+        })?;
+        digest.update(&chunk);
         written_len = next_written;
     }
     if written_len != expected_len {
@@ -931,20 +1168,23 @@ pub(crate) async fn download_one_chunk_part_positioned(
             format!("range body short: expected {expected_len}, got {written_len}"),
         ));
     }
-    // Durable before the sidecar bit is set by the caller.
-    f.sync_data()
-        .await
-        .map_err(|e| MeowError::from_io("sync download part failed".to_string(), e))?;
-    Ok(ChunkOutcome {
-        next_offset: (offset + expected_len).min(total),
-        total_size: total,
-        done: (offset + expected_len) >= total,
-        completion_payload: None,
-    })
+    // D1 durability is coordinated after this handle is dropped: completed
+    // writes enter an epoch and one target `sync_data` covers the frozen batch
+    // before any of its sidecar bits become visible.
+    Ok((
+        ChunkOutcome {
+            next_offset: part_end.min(total),
+            total_size: total,
+            done: part_end >= total,
+            completion_payload: None,
+        },
+        digest.finalize().into(),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
+    use super::ensure_download_file_present;
     use super::parse_content_range;
     use super::range_spec;
 
@@ -956,12 +1196,52 @@ mod tests {
     }
 
     #[test]
+    fn range_spec_near_u64_max_does_not_wrap() {
+        assert_eq!(
+            range_spec(u64::MAX - 2, u64::MAX, u64::MAX),
+            format!("bytes={}-{}", u64::MAX - 2, u64::MAX - 1)
+        );
+    }
+
+    #[test]
     fn parse_content_range_ok() -> Result<(), crate::error::MeowError> {
         let (start, end, total) = parse_content_range("bytes 10-99/1000")?;
         assert_eq!(start, 10);
         assert_eq!(end, 99);
         assert_eq!(total, Some(1000));
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn same_length_visible_path_replacement_is_not_mistaken_for_open_handle() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "rusty_cat_serial_download_generation_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let replacement = path.with_extension("replacement");
+        std::fs::write(&path, vec![b'A'; 128]).expect("original");
+        let handle = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .await
+            .expect("handle");
+        std::fs::write(&replacement, vec![b'B'; 128]).expect("replacement");
+        std::fs::rename(&replacement, &path).expect("replace");
+
+        let error = ensure_download_file_present(&handle, &path, 128)
+            .await
+            .expect_err("same-length replacement must be detected");
+        assert_eq!(
+            error.code(),
+            crate::error::InnerErrorCode::LocalFileRemoved as i32
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -1004,9 +1284,10 @@ mod tests {
             tokio::fs::write(&path, vec![0u8; 1024])
                 .await
                 .expect("write temp file");
+            let handle = tokio::fs::File::open(&path).await.expect("open handle");
 
             // Expected length equals the actual length: should pass.
-            let result = ensure_download_file_present(&path, 1024).await;
+            let result = ensure_download_file_present(&handle, &path, 1024).await;
             assert!(result.is_ok(), "expected Ok, got {result:?}");
 
             let _ = tokio::fs::remove_file(&path).await;
@@ -1015,13 +1296,19 @@ mod tests {
         #[tokio::test]
         async fn replaced_shorter_file_is_local_file_removed() {
             let path = unique_temp_path("shrank");
-            // Only 10 bytes on disk while we claim 4096 bytes "written" → the path
-            // no longer points to the inode we are writing (deleted then recreated).
-            tokio::fs::write(&path, vec![0u8; 10])
+            tokio::fs::write(&path, vec![0u8; 4096])
                 .await
                 .expect("write temp file");
+            let handle = tokio::fs::File::open(&path).await.expect("open handle");
+            let replacement = path.with_extension("replacement");
+            tokio::fs::write(&replacement, vec![0u8; 10])
+                .await
+                .expect("write replacement");
+            tokio::fs::rename(&replacement, &path)
+                .await
+                .expect("replace path");
 
-            let err = ensure_download_file_present(&path, 4096)
+            let err = ensure_download_file_present(&handle, &path, 4096)
                 .await
                 .expect_err("expected LocalFileRemoved error");
             assert_eq!(err.code(), InnerErrorCode::LocalFileRemoved as i32);
@@ -1032,8 +1319,12 @@ mod tests {
         #[tokio::test]
         async fn missing_file_is_local_file_removed() {
             let path = unique_temp_path("missing");
-            // Intentionally skip creating the file, simulating a mid-transfer delete.
-            let err = ensure_download_file_present(&path, 1)
+            tokio::fs::write(&path, vec![0u8; 1])
+                .await
+                .expect("write temp file");
+            let handle = tokio::fs::File::open(&path).await.expect("open handle");
+            tokio::fs::remove_file(&path).await.expect("remove path");
+            let err = ensure_download_file_present(&handle, &path, 1)
                 .await
                 .expect_err("expected LocalFileRemoved error");
             assert_eq!(err.code(), InnerErrorCode::LocalFileRemoved as i32);

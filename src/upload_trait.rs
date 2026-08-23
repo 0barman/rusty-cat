@@ -32,7 +32,7 @@ pub struct UploadChunkCtx<'a> {
     /// Raw bytes for the current chunk.
     ///
     /// `Bytes` is cheap to clone and can be converted into `reqwest::Body`
-    /// without copying. Avoid calling [`bytes::Bytes::to_vec`] on hot paths.
+    /// without copying. Avoid calling `Bytes::to_vec` on hot paths.
     pub chunk: Bytes,
     /// Start offset of this chunk in the full file.
     ///

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use reqwest::header::{CONTENT_LENGTH, ETAG};
+use reqwest::header::{CONTENT_ENCODING, CONTENT_LENGTH, ETAG};
 use reqwest::{Client, Method};
 use std::sync::Arc;
 use std::time::Duration;
@@ -178,17 +178,16 @@ impl DefaultHttpTransfer {
         http_timeout: Duration,
         tcp_keepalive: Duration,
     ) -> Result<Self, MeowError> {
-        let client = build_internal_client(http_timeout, tcp_keepalive)
-            .map_err(|e| {
-                MeowError::from_source(
-                    InnerErrorCode::HttpClientBuildFailed,
-                    format!(
-                        "build reqwest client failed (timeout={:?}, keepalive={:?})",
-                        http_timeout, tcp_keepalive
-                    ),
-                    e,
-                )
-            })?;
+        let client = build_internal_client(http_timeout, tcp_keepalive).map_err(|e| {
+            MeowError::from_source(
+                InnerErrorCode::HttpClientBuildFailed,
+                format!(
+                    "build reqwest client failed (timeout={:?}, keepalive={:?})",
+                    http_timeout, tcp_keepalive
+                ),
+                e,
+            )
+        })?;
         Ok(Self {
             client,
             fallback_upload: Arc::new(DefaultStyleUpload::default()),
@@ -353,6 +352,10 @@ async fn upload_prepare_once(
     upload: Arc<dyn BreakpointUpload + Send + Sync>,
     local_offset: u64,
 ) -> Result<PrepareOutcome, MeowError> {
+    if let Some(snapshot) = task.upload_file_snapshot() {
+        snapshot.validate_total_size(task.total_size())?;
+        snapshot.validate_generation(false).await?;
+    }
     let info = upload
         .prepare(UploadPrepareCtx {
             client,
@@ -405,16 +408,104 @@ fn download_is_parallel(
         && download.supports_parallel_parts()
 }
 
-/// Stable identity for a download target, binding a `.rcdl` sidecar to this URL
-/// so a same-path/different-URL re-download does not reuse stale bits. A cheap
-/// FNV-1a of the range URL is sufficient (no crypto needed).
-fn download_identity(url: &str) -> String {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in url.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x00000100000001B3);
+struct VerifiedDownloadGeneration {
+    identity: String,
+    validator: String,
+}
+
+fn strong_etag(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let etag = headers.get(ETAG)?.to_str().ok()?.trim();
+    if etag.len() < 2
+        || etag
+            .get(..2)
+            .map(|prefix| prefix.eq_ignore_ascii_case("W/"))
+            .unwrap_or(false)
+        || !etag.starts_with('"')
+        || !etag.ends_with('"')
+    {
+        return None;
     }
-    format!("{h:016x}")
+    Some(etag.to_string())
+}
+
+fn is_legacy_presigned_auth_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    matches!(
+        key.as_str(),
+        "signature" | "awsaccesskeyid" | "ossaccesskeyid" | "googleaccessid" | "expires"
+    )
+}
+
+fn is_azure_sas_auth_key(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        // Representation selectors such as `snapshot`, `versionid`, `comp`
+        // and response-content overrides are deliberately not included.
+        "sig"
+            | "sv"
+            | "ss"
+            | "srt"
+            | "sp"
+            | "se"
+            | "st"
+            | "spr"
+            | "sip"
+            | "si"
+            | "skoid"
+            | "sktid"
+            | "skt"
+            | "ske"
+            | "sks"
+            | "skv"
+            | "sr"
+    )
+}
+
+/// Binds a validator to the canonical resource URL. Only known presigned-auth
+/// credentials are discarded; semantic query parameters (for example S3
+/// `versionId` or Azure `snapshot`) remain part of the identity so two objects
+/// with the same length/ETag cannot accidentally share completed parts.
+fn download_identity(url: &str, validator: &str) -> String {
+    let resource = reqwest::Url::parse(url)
+        .map(|mut parsed| {
+            let pairs: Vec<(String, String)> = parsed
+                .query_pairs()
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect();
+            let has_key = |wanted: &str| {
+                pairs
+                    .iter()
+                    .any(|(key, _)| key.eq_ignore_ascii_case(wanted))
+            };
+            let aws_v4 = has_key("X-Amz-Signature");
+            let google_v4 = has_key("X-Goog-Signature");
+            let oss_v4 = has_key("x-oss-signature");
+            let legacy = has_key("Signature")
+                && (has_key("AWSAccessKeyId")
+                    || has_key("OSSAccessKeyId")
+                    || has_key("GoogleAccessId"));
+            let azure_sas = has_key("sig")
+                && (has_key("sv") || has_key("se") || has_key("sp") || has_key("sr"));
+            let semantic_pairs: Vec<(String, String)> = pairs
+                .into_iter()
+                .filter(|(key, _)| {
+                    let lower = key.to_ascii_lowercase();
+                    !((aws_v4 && lower.starts_with("x-amz-"))
+                        || (google_v4 && lower.starts_with("x-goog-"))
+                        || (oss_v4 && lower.starts_with("x-oss-"))
+                        || (legacy && is_legacy_presigned_auth_key(key))
+                        || (azure_sas && is_azure_sas_auth_key(key)))
+                })
+                .collect();
+            parsed.set_query(None);
+            if !semantic_pairs.is_empty() {
+                parsed.query_pairs_mut().extend_pairs(semantic_pairs);
+            }
+            parsed.set_fragment(None);
+            parsed.to_string()
+        })
+        .unwrap_or_else(|_| url.split('#').next().unwrap_or(url).to_string());
+    format!("resource={resource}\nstrong-etag={validator}")
 }
 
 /// Shared tail of [`download_prepare`]: given a resolved remote `total`
@@ -427,6 +518,7 @@ async fn download_prepare_finish(
     download: &Arc<dyn BreakpointDownload + Send + Sync>,
     start: u64,
     total: u64,
+    generation: Option<VerifiedDownloadGeneration>,
 ) -> Result<PrepareOutcome, MeowError> {
     let path = task.file_path();
     if download_is_parallel(task, download) {
@@ -452,15 +544,28 @@ async fn download_prepare_finish(
         // target's on-disk length differs from `total`; if we presized first,
         // the length would already equal `total` and the guard could never
         // fire, letting a stale bitmap survive a deleted/truncated target.
-        let identity = download_identity(&download.range_url(task));
-        let progress = crate::dflt::download_progress::DownloadProgress::load_or_create(
-            path,
-            total,
-            task.chunk_size(),
-            task.max_parts_in_flight(),
-            &identity,
-        )
-        .map_err(|e| MeowError::from_io("load .rcdl sidecar failed".to_string(), e))?;
+        let progress = match generation {
+            Some(generation) => {
+                let mut progress =
+                    crate::dflt::download_progress::DownloadProgress::load_or_create(
+                        path,
+                        total,
+                        task.chunk_size(),
+                        task.max_parts_in_flight(),
+                        &generation.identity,
+                    )
+                    .map_err(|e| MeowError::from_io("load .rcdl sidecar failed".to_string(), e))?;
+                progress.set_expected_validator(generation.validator);
+                progress
+            }
+            None => crate::dflt::download_progress::DownloadProgress::create_unverified(
+                path,
+                total,
+                task.chunk_size(),
+                task.max_parts_in_flight(),
+            )
+            .map_err(|e| MeowError::from_io("create .rcdl sidecar failed".to_string(), e))?,
+        };
         let watermark = progress.contiguous_watermark();
 
         // Pre-size once so every part can positioned-write into its slot. Never
@@ -570,6 +675,7 @@ async fn download_prepare(
         task.file_name(),
         task.file_path().display()
     );
+    task.ensure_download_target_lease().await?;
     let path = task.file_path();
     let local_len = match tokio::fs::metadata(path).await {
         Ok(meta) => meta.len(),
@@ -599,14 +705,17 @@ async fn download_prepare(
     //   2) builder-supplied `task.total_size()` (`with_total_size`),
     //   3) a HEAD request (only when both hints are absent/zero).
     // Whichever source resolves `total`, the same parallel/serial branch runs.
-    if let Some(hinted) = download.total_size_hint(task) {
+    // Match builder/HEAD semantics: zero means "unknown", never "already
+    // complete". Treating `Some(0)` as a real total would let an invalid custom
+    // protocol complete without issuing HEAD or GET.
+    if let Some(hinted) = download.total_size_hint(task).filter(|hinted| *hinted > 0) {
         crate::meow_key_log!(
             "download_prepare",
             "resolved total from total_size_hint: start={} remote_total={}",
             start,
             hinted
         );
-        return download_prepare_finish(task, &download, start, hinted).await;
+        return download_prepare_finish(task, &download, start, hinted, None).await;
     }
     if task.total_size() > 0 {
         // Builder supplied a known size via with_total_size(): skip HEAD.
@@ -617,7 +726,7 @@ async fn download_prepare(
             start,
             hinted
         );
-        return download_prepare_finish(task, &download, start, hinted).await;
+        return download_prepare_finish(task, &download, start, hinted, None).await;
     }
 
     let head_url = download.head_url(task);
@@ -631,7 +740,10 @@ async fn download_prepare(
             crate::log::emit_lazy(|| {
                 crate::log::Log::warn(
                     "head",
-                    format!("merge_head_headers failed: err={}", crate::log::redact_secrets(&e.to_string())),
+                    format!(
+                        "merge_head_headers failed: err={}",
+                        crate::log::redact_secrets(&e.to_string())
+                    ),
                 )
                 .with_key(task.file_name())
                 .with_url(head_url.as_str())
@@ -647,7 +759,10 @@ async fn download_prepare(
             crate::log::emit_lazy(|| {
                 crate::log::Log::error(
                     "head",
-                    format!("HEAD send failed: err={}", crate::log::redact_secrets(&e.to_string())),
+                    format!(
+                        "HEAD send failed: err={}",
+                        crate::log::redact_secrets(&e.to_string())
+                    ),
                 )
                 .with_key(task.file_name())
                 .with_url(head_url.as_str())
@@ -657,13 +772,10 @@ async fn download_prepare(
     if !head_resp.status().is_success() {
         let head_status = head_resp.status();
         crate::log::emit_lazy(|| {
-            crate::log::Log::error(
-                "head",
-                format!("head failed: status={}", head_status),
-            )
-            .with_key(task.file_name())
-            .with_http_status(head_status.as_u16())
-            .with_url(head_url.as_str())
+            crate::log::Log::error("head", format!("head failed: status={}", head_status))
+                .with_key(task.file_name())
+                .with_http_status(head_status.as_u16())
+                .with_url(head_url.as_str())
         });
         return Err(MeowError::from_code(
             InnerErrorCode::ResponseStatusError,
@@ -694,15 +806,33 @@ async fn download_prepare(
             crate::log::emit_lazy(|| {
                 crate::log::Log::error(
                     "head",
-                    format!("total_size_from_head parse failed: err={}", crate::log::redact_secrets(&e.to_string())),
+                    format!(
+                        "total_size_from_head parse failed: err={}",
+                        crate::log::redact_secrets(&e.to_string())
+                    ),
                 )
                 .with_key(task.file_name())
                 .with_url(head_url.as_str())
             });
             e
         })?;
+    if download_is_parallel(task, &download) {
+        if let Some(encoding) = head_resp.headers().get(CONTENT_ENCODING) {
+            let encoding = encoding.to_str().unwrap_or("<invalid>");
+            if !encoding.eq_ignore_ascii_case("identity") {
+                return Err(MeowError::from_code(
+                    InnerErrorCode::InvalidRange,
+                    format!("parallel download requires identity content-encoding, got {encoding}"),
+                ));
+            }
+        }
+    }
+    let generation = strong_etag(head_resp.headers()).map(|validator| VerifiedDownloadGeneration {
+        identity: download_identity(&download.range_url(task), &validator),
+        validator,
+    });
     // HEAD resolved the size; run the shared parallel/serial branch.
-    download_prepare_finish(task, &download, start, total).await
+    download_prepare_finish(task, &download, start, total, generation).await
 }
 
 #[async_trait]
@@ -756,6 +886,9 @@ impl TransferTrait for DefaultHttpTransfer {
         if task.direction() != Direction::Upload {
             return Ok(());
         }
+        if !task.begin_upload_abort() {
+            return Ok(());
+        }
         let client = self.client_for(task);
         self.upload_arc(task).abort_upload(&client, task).await
     }
@@ -781,26 +914,33 @@ impl TransferTrait for DefaultHttpTransfer {
         let client = self.client_for(task);
         match task.direction() {
             Direction::Upload => {
-                upload_one_chunk_part(&client, task, self.upload_arc(task), offset, chunk_size).await
+                upload_one_chunk_part(&client, task, self.upload_arc(task), offset, chunk_size)
+                    .await
             }
             Direction::Download => {
                 // Resume short-circuit: a part already recorded done in the
                 // sidecar needs no network I/O. Keep the lock scope short and
                 // never hold it across the network call below.
                 {
-                    let guard = task.download_progress().lock().await;
+                    let guard = task.download_progress().lock().map_err(|_| {
+                        MeowError::from_code_str(
+                            InnerErrorCode::LockPoisoned,
+                            "download checkpoint lock poisoned",
+                        )
+                    })?;
                     if let Some(p) = guard.as_ref() {
                         if p.is_done(offset) {
+                            let part_end = offset.saturating_add(chunk_size).min(remote_total_size);
                             return Ok(ChunkOutcome {
-                                next_offset: (offset + chunk_size).min(remote_total_size),
+                                next_offset: part_end,
                                 total_size: remote_total_size,
-                                done: (offset + chunk_size) >= remote_total_size,
+                                done: part_end >= remote_total_size,
                                 completion_payload: None,
                             });
                         }
                     }
                 }
-                let outcome = download_one_chunk_part_positioned(
+                let (outcome, digest) = download_one_chunk_part_positioned(
                     &client,
                     task,
                     self.download_arc(task),
@@ -809,15 +949,10 @@ impl TransferTrait for DefaultHttpTransfer {
                     remote_total_size,
                 )
                 .await?;
-                // Bytes are durably written (sync_data) — now record the bit.
-                {
-                    let mut guard = task.download_progress().lock().await;
-                    if let Some(p) = guard.as_mut() {
-                        p.mark_done_and_persist(offset).map_err(|e| {
-                            MeowError::from_io("persist .rcdl progress failed".to_string(), e)
-                        })?;
-                    }
-                }
+                // Stage this completed write in the open checkpoint epoch. The
+                // blocking durability work runs off Tokio workers and happens
+                // once per batch; a bit is never published before data sync.
+                task.stage_download_part(offset, digest).await?;
                 Ok(outcome)
             }
         }
@@ -833,15 +968,27 @@ impl TransferTrait for DefaultHttpTransfer {
         match task.direction() {
             Direction::Upload => {
                 let client = self.client_for(task);
-                self.upload_arc(task).complete_upload(&client, task).await
+                let upload = self.upload_arc(task);
+                if let Some(snapshot) = task.upload_file_snapshot() {
+                    if let Err(error) = snapshot.validate_generation(true).await {
+                        if task.begin_upload_abort() {
+                            if let Err(abort_error) = upload.abort_upload(&client, task).await {
+                                crate::meow_warn_log!(
+                                    "upload_complete",
+                                    "abort after source validation failure also failed: {}",
+                                    crate::log::redact_secrets(&abort_error.to_string())
+                                );
+                            }
+                        }
+                        return Err(error);
+                    }
+                }
+                upload.complete_upload(&client, task).await
             }
             Direction::Download => {
                 // Only the concurrent path sets up progress; serial downloads
                 // never reach complete() with progress (they finalize inline).
-                let progress = {
-                    let mut guard = task.download_progress().lock().await;
-                    guard.take()
-                };
+                let progress = task.take_download_progress_after_checkpoint().await?;
                 if let Some(p) = progress {
                     let expected = p.total();
                     let actual = tokio::fs::metadata(task.file_path())
@@ -873,5 +1020,63 @@ impl TransferTrait for DefaultHttpTransfer {
                 Ok(None)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::download_identity;
+
+    #[test]
+    fn refreshed_presigned_credentials_keep_the_same_identity() {
+        let old = download_identity(
+            "https://example.test/object?part=1&X-Amz-Signature=old&X-Amz-Date=1",
+            "\"etag\"",
+        );
+        let refreshed = download_identity(
+            "https://example.test/object?X-Amz-Date=2&X-Amz-Signature=new&part=1",
+            "\"etag\"",
+        );
+        assert_eq!(old, refreshed);
+    }
+
+    #[test]
+    fn semantic_query_parameters_are_part_of_download_identity() {
+        let v1 = download_identity(
+            "https://example.test/object?versionId=v1&X-Amz-Signature=old",
+            "\"etag\"",
+        );
+        let v2 = download_identity(
+            "https://example.test/object?versionId=v2&X-Amz-Signature=new",
+            "\"etag\"",
+        );
+        assert_ne!(v1, v2);
+    }
+
+    #[test]
+    fn short_query_names_are_semantic_without_a_recognized_signature_bundle() {
+        let first = download_identity("https://example.test/object?sp=chapter-1", "\"etag\"");
+        let second = download_identity("https://example.test/object?sp=chapter-2", "\"etag\"");
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn repeated_semantic_query_order_is_not_assumed_commutative() {
+        let first = download_identity("https://example.test/object?a=1&a=2", "\"etag\"");
+        let second = download_identity("https://example.test/object?a=2&a=1", "\"etag\"");
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn azure_sas_refresh_drops_only_auth_fields() {
+        let first = download_identity(
+            "https://example.test/object?versionid=v1&sv=1&sp=r&sig=old",
+            "\"etag\"",
+        );
+        let refreshed = download_identity(
+            "https://example.test/object?sig=new&sp=r&sv=2&versionid=v1",
+            "\"etag\"",
+        );
+        assert_eq!(first, refreshed);
     }
 }

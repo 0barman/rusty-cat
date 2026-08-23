@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
 
+use crate::direction::Direction;
 use crate::ids::{GlobalProgressListenerId, TaskId};
 
 use super::active_state::ActiveState;
@@ -9,13 +10,16 @@ use super::group_state::GroupState;
 use super::task_callbacks::ProgressCb;
 use super::UniqueId;
 
+pub(crate) type GlobalProgressSnapshot = Arc<[(GlobalProgressListenerId, ProgressCb)]>;
+pub(crate) type GlobalProgressStore = Arc<RwLock<GlobalProgressSnapshot>>;
+
 pub(crate) struct SchedulerState {
     /// 上传方向的并发上限；调度器在尝试拉起队列任务时据此限制同时运行的上传组数量。
     max_upload_concurrency: usize,
     /// 下载方向的并发上限；与 `max_upload_concurrency` 对称，控制下载组的并行度。
     max_download_concurrency: usize,
     /// 全局进度监听器集合（监听器 id + 回调）；每次状态变更时会广播到这里注册的回调。
-    global_progress_listener: Arc<RwLock<Vec<(GlobalProgressListenerId, ProgressCb)>>>,
+    global_progress_listener: GlobalProgressStore,
 
     /// 去重键 -> 任务组状态；同一去重键（同 URL 下载或同签名上传）在任意时刻只保留一个组入口。
     groups: HashMap<UniqueId, GroupState>,
@@ -29,6 +33,10 @@ pub(crate) struct SchedulerState {
     paused_set: HashSet<UniqueId>,
     /// 正在执行中的任务组；值里持有取消令牌等运行态信息，供取消与并发统计使用。
     active: HashMap<UniqueId, ActiveState>,
+    /// Active group counts by direction. These are updated atomically with
+    /// `active` through the methods below so scheduler capacity checks are O(1).
+    active_uploads: usize,
+    active_downloads: usize,
     /// 每个去重键的当前传输偏移（断点进度）；用于进度回调、失败恢复与重启续传。
     offsets: HashMap<UniqueId, u64>,
     /// 每个去重键在运行期发现的文件总大小（来自 worker 的 Progress 事件）。
@@ -48,7 +56,7 @@ impl SchedulerState {
     pub(crate) fn new(
         max_upload_concurrency: usize,
         max_download_concurrency: usize,
-        global_progress_listener: Arc<RwLock<Vec<(GlobalProgressListenerId, ProgressCb)>>>,
+        global_progress_listener: GlobalProgressStore,
         cb_submit: CbSubmit,
     ) -> Self {
         Self {
@@ -61,6 +69,8 @@ impl SchedulerState {
             queued_set: HashSet::new(),
             paused_set: HashSet::new(),
             active: HashMap::new(),
+            active_uploads: 0,
+            active_downloads: 0,
             offsets: HashMap::new(),
             known_totals: HashMap::new(),
             cb_submit: Some(cb_submit),
@@ -75,9 +85,7 @@ impl SchedulerState {
         self.max_download_concurrency
     }
 
-    pub(crate) fn global_progress_listener(
-        &self,
-    ) -> &Arc<RwLock<Vec<(GlobalProgressListenerId, ProgressCb)>>> {
+    pub(crate) fn global_progress_listener(&self) -> &GlobalProgressStore {
         &self.global_progress_listener
     }
 
@@ -117,9 +125,72 @@ impl SchedulerState {
         &self.active
     }
 
-    pub(crate) fn active_mut(&mut self) -> &mut HashMap<UniqueId, ActiveState> {
-        &mut self.active
+    pub(crate) fn active_direction_count(&self, direction: Direction) -> usize {
+        match direction {
+            Direction::Upload => self.active_uploads,
+            Direction::Download => self.active_downloads,
+        }
     }
+
+    pub(crate) fn insert_active(
+        &mut self,
+        key: UniqueId,
+        active: ActiveState,
+    ) -> Option<ActiveState> {
+        let direction = key.0;
+        let previous = self.active.insert(key, active);
+        if previous.is_none() {
+            match direction {
+                Direction::Upload => self.active_uploads += 1,
+                Direction::Download => self.active_downloads += 1,
+            }
+        }
+        self.debug_assert_active_counts();
+        previous
+    }
+
+    pub(crate) fn remove_active(&mut self, key: &UniqueId) -> Option<ActiveState> {
+        let previous = self.active.remove(key);
+        if previous.is_some() {
+            let count = match key.0 {
+                Direction::Upload => &mut self.active_uploads,
+                Direction::Download => &mut self.active_downloads,
+            };
+            debug_assert!(
+                *count > 0,
+                "active direction count must match the active map"
+            );
+            *count = count.saturating_sub(1);
+        }
+        self.debug_assert_active_counts();
+        previous
+    }
+
+    pub(crate) fn clear_active(&mut self) {
+        self.active.clear();
+        self.active_uploads = 0;
+        self.active_downloads = 0;
+        self.debug_assert_active_counts();
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_assert_active_counts(&self) {
+        let uploads = self
+            .active
+            .keys()
+            .filter(|key| key.0 == Direction::Upload)
+            .count();
+        let downloads = self
+            .active
+            .keys()
+            .filter(|key| key.0 == Direction::Download)
+            .count();
+        debug_assert_eq!(self.active_uploads, uploads);
+        debug_assert_eq!(self.active_downloads, downloads);
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn debug_assert_active_counts(&self) {}
 
     pub(crate) fn offsets(&self) -> &HashMap<UniqueId, u64> {
         &self.offsets
@@ -160,5 +231,57 @@ impl SchedulerState {
     /// "close 时所有终态回调已完成"的同步语义。
     pub(crate) fn take_cb_submit(&mut self) -> Option<CbSubmit> {
         self.cb_submit.take()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SchedulerState;
+    use crate::direction::Direction;
+    use crate::inner::active_state::ActiveState;
+    use std::sync::{Arc, RwLock};
+    use tokio_util::sync::CancellationToken;
+
+    fn state() -> SchedulerState {
+        let (cb_submit, cb_join) = crate::inner::cb_dispatcher::start().expect("dispatcher");
+        std::mem::forget(cb_join);
+        SchedulerState::new(3, 4, Arc::new(RwLock::new(Arc::from([]))), cb_submit)
+    }
+
+    fn key(direction: Direction, suffix: &str) -> crate::inner::UniqueId {
+        (direction, suffix.to_string())
+    }
+
+    fn active() -> ActiveState {
+        ActiveState::new(CancellationToken::new())
+    }
+
+    #[test]
+    fn active_direction_counts_follow_insert_remove_and_clear_exactly_once() {
+        let mut state = state();
+        let upload = key(Direction::Upload, "upload");
+        let download = key(Direction::Download, "download");
+
+        assert_eq!(state.active_direction_count(Direction::Upload), 0);
+        assert_eq!(state.active_direction_count(Direction::Download), 0);
+
+        assert!(state.insert_active(upload.clone(), active()).is_none());
+        assert!(state.insert_active(download.clone(), active()).is_none());
+        assert_eq!(state.active_direction_count(Direction::Upload), 1);
+        assert_eq!(state.active_direction_count(Direction::Download), 1);
+
+        // Replacing the same key is not a second active group.
+        assert!(state.insert_active(upload.clone(), active()).is_some());
+        assert_eq!(state.active_direction_count(Direction::Upload), 1);
+
+        assert!(state.remove_active(&upload).is_some());
+        assert!(state.remove_active(&upload).is_none());
+        assert_eq!(state.active_direction_count(Direction::Upload), 0);
+        assert_eq!(state.active_direction_count(Direction::Download), 1);
+
+        state.clear_active();
+        assert!(state.active().is_empty());
+        assert_eq!(state.active_direction_count(Direction::Upload), 0);
+        assert_eq!(state.active_direction_count(Direction::Download), 0);
     }
 }

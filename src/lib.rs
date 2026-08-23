@@ -72,11 +72,13 @@ pub mod pounce_task;
 pub mod prepare_outcome;
 #[cfg(feature = "presigned")]
 pub mod presigned;
+pub(crate) mod target_lease;
 pub mod transfer_executor_trait;
 pub mod transfer_snapshot;
 pub mod transfer_status;
 pub mod transfer_task;
 pub mod up_pounce_builder;
+pub(crate) mod upload_file;
 pub(crate) mod upload_source;
 pub mod upload_trait;
 pub use api::*;

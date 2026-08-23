@@ -69,7 +69,7 @@ async fn live_download_state_inner(
     // 与 handle_worker_event 既有测试相同的理由：detach join 守卫，
     // 避免断言 panic 时 sender 尚存导致 Drop 阻塞死锁。
     std::mem::forget(cb_join);
-    let mut state = SchedulerState::new(1, 1, Arc::new(RwLock::new(Vec::new())), cb_submit);
+    let mut state = SchedulerState::new(1, 1, Arc::new(RwLock::new(Arc::from([]))), cb_submit);
 
     state
         .task_id_to_dedupe_mut()
@@ -91,11 +91,14 @@ pub(crate) fn attach_capture(state: &SchedulerState) -> Arc<Mutex<Vec<FileTransf
     let cb: ProgressCb = Arc::new(move |rec: FileTransferRecord| {
         sink.lock().expect("records lock").push(rec);
     });
-    state
+    let mut listeners = state
         .global_progress_listener()
         .write()
-        .expect("listener lock")
-        .push((GlobalProgressListenerId::new(), cb));
+        .expect("listener lock");
+    let mut next = listeners.as_ref().to_vec();
+    next.push((GlobalProgressListenerId::new(), cb));
+    *listeners = Arc::from(next);
+    drop(listeners);
     records
 }
 

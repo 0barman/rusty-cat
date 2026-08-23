@@ -27,7 +27,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -48,7 +48,17 @@ use rusty_cat::api::{
 /// same URL or the sidecar is treated as stale.
 struct RangeServer {
     /// Exact source payload; every 206 slices out of this.
-    body: Vec<u8>,
+    body: RwLock<Vec<u8>>,
+    etag: RwLock<String>,
+    range_etag_override: RwLock<Option<String>>,
+    omit_range_etag: AtomicBool,
+    /// Optional second generation used for ranges whose start offset is at or
+    /// beyond `alternate_from`. This makes an in-run generation switch fully
+    /// deterministic even when requests finish out of order.
+    alternate_body: RwLock<Option<Vec<u8>>>,
+    alternate_etag: RwLock<Option<String>>,
+    alternate_from: AtomicI64,
+    matching_if_match_hits: AtomicUsize,
     /// Count of range GETs served (the resume/refetch witness). Resettable.
     hits: AtomicUsize,
     /// Live concurrent range handlers and the max ever observed (fan-out proof).
@@ -71,7 +81,14 @@ struct RangeServer {
 impl RangeServer {
     fn new(body: Vec<u8>) -> Arc<Self> {
         Arc::new(Self {
-            body,
+            body: RwLock::new(body),
+            etag: RwLock::new("\"generation-a\"".to_string()),
+            range_etag_override: RwLock::new(None),
+            omit_range_etag: AtomicBool::new(false),
+            alternate_body: RwLock::new(None),
+            alternate_etag: RwLock::new(None),
+            alternate_from: AtomicI64::new(-1),
+            matching_if_match_hits: AtomicUsize::new(0),
             hits: AtomicUsize::new(0),
             in_flight: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
@@ -102,6 +119,33 @@ impl RangeServer {
     }
     fn set_out_of_order(&self, on: bool) {
         self.out_of_order.store(on, Ordering::SeqCst);
+    }
+    fn replace_body_same_length(&self, body: Vec<u8>) {
+        let mut current = self.body.write().expect("body write lock");
+        assert_eq!(current.len(), body.len(), "test generation must keep total");
+        *current = body;
+    }
+    fn set_etag(&self, etag: &str) {
+        *self.etag.write().expect("etag write lock") = etag.to_string();
+    }
+    fn set_range_etag_override(&self, etag: Option<&str>) {
+        *self
+            .range_etag_override
+            .write()
+            .expect("range etag write lock") = etag.map(str::to_owned);
+    }
+    fn set_omit_range_etag(&self, omit: bool) {
+        self.omit_range_etag.store(omit, Ordering::SeqCst);
+    }
+    fn switch_generation_from(&self, offset: i64, body: Vec<u8>, etag: &str) {
+        let current_len = self.body.read().expect("body read lock").len();
+        assert_eq!(current_len, body.len(), "test generation must keep total");
+        *self.alternate_body.write().expect("alternate body lock") = Some(body);
+        *self.alternate_etag.write().expect("alternate etag lock") = Some(etag.to_owned());
+        self.alternate_from.store(offset, Ordering::SeqCst);
+    }
+    fn matching_if_match_hits(&self) -> usize {
+        self.matching_if_match_hits.load(Ordering::SeqCst)
     }
 }
 
@@ -142,23 +186,45 @@ async fn handle_conn(sock: &mut TcpStream, server: &RangeServer) {
         }
     }
     let req = String::from_utf8_lossy(&buf);
+    let method = req
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().next())
+        .unwrap_or_default();
 
     // Parse `Range: bytes=a-b` (case-insensitive header name).
     let range = req.lines().find_map(|l| {
         let l = l.trim();
         let low = l.to_ascii_lowercase();
-        low.strip_prefix("range:").map(|_| l["range:".len()..].trim().to_string())
+        low.strip_prefix("range:")
+            .map(|_| l["range:".len()..].trim().to_string())
     });
 
-    let total = server.body.len();
+    let mut body = server.body.read().expect("body read lock").clone();
+    let etag = server.etag.read().expect("etag read lock").clone();
+    let mut range_etag = server
+        .range_etag_override
+        .read()
+        .expect("range etag read lock")
+        .clone()
+        .unwrap_or_else(|| etag.clone());
+    let mut total = body.len();
+
+    if method == "HEAD" {
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nETag: {etag}\r\nConnection: close\r\n\r\n"
+        );
+        let _ = sock.write_all(head.as_bytes()).await;
+        let _ = sock.flush().await;
+        return;
+    }
 
     if server.force_200.load(Ordering::SeqCst) {
         // Server ignores Range and streams the whole object with a 200.
-        let head = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"
-        );
+        let head =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n");
         let _ = sock.write_all(head.as_bytes()).await;
-        let _ = sock.write_all(&server.body).await;
+        let _ = sock.write_all(&body).await;
         let _ = sock.flush().await;
         return;
     }
@@ -173,6 +239,16 @@ async fn handle_conn(sock: &mut TcpStream, server: &RangeServer) {
         return;
     };
 
+    let if_match = req.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("if-match")
+            .then(|| value.trim())
+    });
+    if if_match == Some(etag.as_str()) {
+        server.matching_if_match_hits.fetch_add(1, Ordering::SeqCst);
+    }
+
     server.hits.fetch_add(1, Ordering::SeqCst);
     let cur = server.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
     server.peak.fetch_max(cur, Ordering::SeqCst);
@@ -180,6 +256,26 @@ async fn handle_conn(sock: &mut TcpStream, server: &RangeServer) {
     let spec = r.trim_start_matches("bytes=");
     let (a_s, b_s) = spec.split_once('-').unwrap_or(("0", "0"));
     let a: usize = a_s.trim().parse().unwrap_or(0);
+    let alternate_from = server.alternate_from.load(Ordering::SeqCst);
+    if alternate_from >= 0 && a >= alternate_from as usize {
+        if let Some(alternate) = server
+            .alternate_body
+            .read()
+            .expect("alternate body lock")
+            .clone()
+        {
+            body = alternate;
+            total = body.len();
+        }
+        if let Some(alternate) = server
+            .alternate_etag
+            .read()
+            .expect("alternate etag lock")
+            .clone()
+        {
+            range_etag = alternate;
+        }
+    }
     let b_trim = b_s.trim();
     let b: usize = if b_trim.is_empty() {
         total.saturating_sub(1)
@@ -202,7 +298,7 @@ async fn handle_conn(sock: &mut TcpStream, server: &RangeServer) {
         }
     }
 
-    let slice = &server.body[a..=end];
+    let slice = &body[a..=end];
     let short = server.short_body_at.load(Ordering::SeqCst) == a as i64;
     // Full Content-Range (so the SDK's expected length is the FULL part) but a
     // body one byte shorter → the SDK detects "range body short" (InvalidRange).
@@ -212,8 +308,13 @@ async fn handle_conn(sock: &mut TcpStream, server: &RangeServer) {
         slice
     };
 
+    let etag_header = if server.omit_range_etag.load(Ordering::SeqCst) {
+        String::new()
+    } else {
+        format!("ETag: {range_etag}\r\n")
+    };
     let head = format!(
-        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {a}-{end}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {a}-{end}/{total}\r\nContent-Length: {}\r\n{etag_header}Connection: close\r\n\r\n",
         send.len()
     );
     let _ = sock.write_all(head.as_bytes()).await;
@@ -271,6 +372,27 @@ async fn run_download(
     chunk: u64,
     max_parts: usize,
 ) -> Result<TaskOutcome, MeowError> {
+    run_download_inner(url, target, total, chunk, max_parts, true).await
+}
+
+async fn run_download_resolving_head(
+    url: &str,
+    target: &Path,
+    total: u64,
+    chunk: u64,
+    max_parts: usize,
+) -> Result<TaskOutcome, MeowError> {
+    run_download_inner(url, target, total, chunk, max_parts, false).await
+}
+
+async fn run_download_inner(
+    url: &str,
+    target: &Path,
+    total: u64,
+    chunk: u64,
+    max_parts: usize,
+    use_total_hint: bool,
+) -> Result<TaskOutcome, MeowError> {
     let client = MeowClient::new(
         MeowConfig::builder()
             .max_download_concurrency(1)
@@ -284,10 +406,12 @@ async fn run_download(
         .unwrap_or("f.bin")
         .to_string();
 
-    let task = DownloadPounceBuilder::new(file_name, target, chunk, url.to_string())
-        .with_total_size(total)
-        .with_max_parts_in_flight(max_parts)
-        .build();
+    let mut builder = DownloadPounceBuilder::new(file_name, target, chunk, url.to_string())
+        .with_max_parts_in_flight(max_parts);
+    if use_total_hint {
+        builder = builder.with_total_size(total);
+    }
+    let task = builder.build();
 
     let result = client.enqueue_and_wait(task, |_record| {}).await;
     client.close().await.expect("close client");
@@ -404,7 +528,7 @@ async fn resume_refetches_only_missing_parts() {
 
     // --- Run 1: fault on the last part ---
     server.set_short_body_at(last_offset);
-    let run1 = run_download(&url, &target, total as u64, chunk, 4).await;
+    let run1 = run_download_resolving_head(&url, &target, total as u64, chunk, 4).await;
     assert!(
         run1.is_err(),
         "run 1 must fail because the last part is short"
@@ -416,12 +540,15 @@ async fn resume_refetches_only_missing_parts() {
     // The presized target survives at full length (positioned writes never shrink
     // it), which is what lets run 2 trust the persisted bits.
     let len_after_run1 = fs::metadata(&target).expect("stat target").len();
-    assert_eq!(len_after_run1, total as u64, "target stays pre-sized to total");
+    assert_eq!(
+        len_after_run1, total as u64,
+        "target stays pre-sized to total"
+    );
 
     // --- Run 2: all-correct; only the missing part should be fetched ---
     server.set_short_body_at(-1);
     server.reset_hits();
-    let run2 = run_download(&url, &target, total as u64, chunk, 4).await;
+    let run2 = run_download_resolving_head(&url, &target, total as u64, chunk, 4).await;
     assert!(run2.is_ok(), "run 2 failed: {:?}", run2.err());
 
     let run2_hits = server.hits();
@@ -439,6 +566,224 @@ async fn resume_refetches_only_missing_parts() {
         "the .rcdl must be deleted after the resumed download completes"
     );
 
+    cleanup(&target);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn same_url_same_total_without_validator_never_mixes_remote_generations() {
+    let total = 8_000usize;
+    let chunk = 1000u64;
+    let payload_a = make_body(total);
+    let payload_b: Vec<u8> = payload_a.iter().map(|byte| byte.wrapping_add(17)).collect();
+    let server = RangeServer::new(payload_a);
+    let url = spawn_range_server(server.clone()).await;
+    let target = temp_target("remote_generation_change");
+    cleanup(&target);
+
+    server.set_short_body_at(7_000);
+    let run1 = run_download(&url, &target, total as u64, chunk, 4).await;
+    assert!(run1.is_err());
+    assert!(rcdl_path(&target).exists());
+
+    server.replace_body_same_length(payload_b.clone());
+    server.set_short_body_at(-1);
+    server.reset_hits();
+    let run2 = run_download(&url, &target, total as u64, chunk, 4).await;
+    assert!(
+        run2.is_ok(),
+        "fresh generation download failed: {:?}",
+        run2.err()
+    );
+    assert_eq!(
+        server.hits(),
+        8,
+        "without a proven remote validator every part must be fetched again"
+    );
+    assert_byte_exact(&target, &payload_b);
+
+    cleanup(&target);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn presigned_query_change_with_same_strong_etag_resumes_safely() {
+    let total = 8_000usize;
+    let chunk = 1000u64;
+    let body = make_body(total);
+    let server = RangeServer::new(body.clone());
+    let base_url = spawn_range_server(server.clone()).await;
+    let target = temp_target("query_refresh_same_etag");
+    cleanup(&target);
+
+    server.set_short_body_at(7_000);
+    let first_url = format!("{base_url}?X-Amz-Signature=old");
+    let run1 = run_download_resolving_head(&first_url, &target, total as u64, chunk, 4).await;
+    assert!(run1.is_err());
+
+    server.set_short_body_at(-1);
+    server.reset_hits();
+    let refreshed_url = format!("{base_url}?X-Amz-Signature=new");
+    let run2 = run_download_resolving_head(&refreshed_url, &target, total as u64, chunk, 4).await;
+    assert!(
+        run2.is_ok(),
+        "query refresh resume failed: {:?}",
+        run2.err()
+    );
+    assert_eq!(server.hits(), 1);
+    assert!(server.matching_if_match_hits() >= 1);
+    assert_byte_exact(&target, &body);
+    cleanup(&target);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn changed_strong_etag_invalidates_every_old_part() {
+    let total = 8_000usize;
+    let chunk = 1000u64;
+    let payload_a = make_body(total);
+    let payload_b: Vec<u8> = payload_a.iter().map(|byte| byte.wrapping_add(31)).collect();
+    let server = RangeServer::new(payload_a);
+    let url = spawn_range_server(server.clone()).await;
+    let target = temp_target("strong_etag_change");
+    cleanup(&target);
+
+    server.set_short_body_at(7_000);
+    assert!(
+        run_download_resolving_head(&url, &target, total as u64, chunk, 4)
+            .await
+            .is_err()
+    );
+    server.replace_body_same_length(payload_b.clone());
+    server.set_etag("\"generation-b\"");
+    server.set_short_body_at(-1);
+    server.reset_hits();
+
+    let run2 = run_download_resolving_head(&url, &target, total as u64, chunk, 4).await;
+    assert!(run2.is_ok(), "new ETag download failed: {:?}", run2.err());
+    assert_eq!(server.hits(), 8);
+    assert_byte_exact(&target, &payload_b);
+    cleanup(&target);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn weak_etag_is_not_sufficient_for_cross_process_resume() {
+    let total = 8_000usize;
+    let chunk = 1000u64;
+    let body = make_body(total);
+    let server = RangeServer::new(body.clone());
+    server.set_etag("W/\"weak-generation\"");
+    let url = spawn_range_server(server.clone()).await;
+    let target = temp_target("weak_etag");
+    cleanup(&target);
+
+    server.set_short_body_at(7_000);
+    assert!(
+        run_download_resolving_head(&url, &target, total as u64, chunk, 4)
+            .await
+            .is_err()
+    );
+    server.set_short_body_at(-1);
+    server.reset_hits();
+    let error = run_download_resolving_head(&url, &target, total as u64, chunk, 4)
+        .await
+        .expect_err("weak range ETags cannot prove one immutable generation");
+    assert!(error.to_string().contains("strong ETag"));
+    cleanup(&target);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parallel_ranges_without_strong_etag_are_rejected() {
+    let total = 4_000usize;
+    let chunk = 1000u64;
+    let server = RangeServer::new(make_body(total));
+    server.set_omit_range_etag(true);
+    let url = spawn_range_server(server).await;
+    let target = temp_target("missing_range_etag");
+    cleanup(&target);
+
+    let error = run_download(&url, &target, total as u64, chunk, 4)
+        .await
+        .expect_err("parallel ranges without a validator must fail closed");
+    assert!(error.to_string().contains("strong ETag"));
+    cleanup(&target);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn generation_switch_between_parallel_ranges_never_produces_a_mixed_file() {
+    let total = 8_000usize;
+    let chunk = 1000u64;
+    let payload_a = make_body(total);
+    let payload_b: Vec<u8> = payload_a.iter().map(|byte| byte.wrapping_add(73)).collect();
+    let server = RangeServer::new(payload_a);
+    server.switch_generation_from(4_000, payload_b, "\"generation-b\"");
+    let url = spawn_range_server(server).await;
+    let target = temp_target("in_run_generation_switch");
+    cleanup(&target);
+
+    let error = run_download(&url, &target, total as u64, chunk, 4)
+        .await
+        .expect_err("one download must not accept ranges from two generations");
+    assert!(error.to_string().contains("generation mismatch"));
+    cleanup(&target);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn semantic_query_change_invalidates_resume_even_with_same_etag() {
+    let total = 8_000usize;
+    let chunk = 1000u64;
+    let body = make_body(total);
+    let server = RangeServer::new(body.clone());
+    let base_url = spawn_range_server(server.clone()).await;
+    let target = temp_target("semantic_query_change");
+    cleanup(&target);
+
+    server.set_short_body_at(7_000);
+    assert!(run_download_resolving_head(
+        &format!("{base_url}?versionId=v1"),
+        &target,
+        total as u64,
+        chunk,
+        4,
+    )
+    .await
+    .is_err());
+
+    server.set_short_body_at(-1);
+    server.reset_hits();
+    let outcome = run_download_resolving_head(
+        &format!("{base_url}?versionId=v2"),
+        &target,
+        total as u64,
+        chunk,
+        4,
+    )
+    .await;
+    assert!(
+        outcome.is_ok(),
+        "semantic URL refresh failed: {:?}",
+        outcome.err()
+    );
+    assert_eq!(
+        server.hits(),
+        8,
+        "a different object version must not reuse parts"
+    );
+    assert_byte_exact(&target, &body);
+    cleanup(&target);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn range_response_from_another_etag_is_rejected() {
+    let total = 4_000usize;
+    let chunk = 1000u64;
+    let server = RangeServer::new(make_body(total));
+    server.set_range_etag_override(Some("\"generation-b\""));
+    let url = spawn_range_server(server).await;
+    let target = temp_target("range_generation_mismatch");
+    cleanup(&target);
+
+    let err = run_download_resolving_head(&url, &target, total as u64, chunk, 4)
+        .await
+        .expect_err("GET ETag differing from HEAD must fail");
+    assert!(err.to_string().contains("generation mismatch"));
     cleanup(&target);
 }
 
@@ -488,7 +833,10 @@ async fn resume_integrity_deleted_target_refetches_all() {
         "a deleted target must discard the stale sidecar and re-fetch ALL parts"
     );
     assert_byte_exact(&target, &body);
-    assert!(!rcdl_path(&target).exists(), "the .rcdl is deleted on success");
+    assert!(
+        !rcdl_path(&target).exists(),
+        "the .rcdl is deleted on success"
+    );
 
     cleanup(&target);
 }
@@ -530,7 +878,10 @@ async fn resume_integrity_truncated_target_refetches_all() {
         "a truncated target must discard the stale sidecar and re-fetch ALL parts"
     );
     assert_byte_exact(&target, &body);
-    assert!(!rcdl_path(&target).exists(), "the .rcdl is deleted on success");
+    assert!(
+        !rcdl_path(&target).exists(),
+        "the .rcdl is deleted on success"
+    );
 
     cleanup(&target);
 }
@@ -579,15 +930,27 @@ async fn serial_download_byte_exact_no_sidecar() {
 
     // max_parts_in_flight == 1 forces the legacy serial path.
     let outcome = run_download(&url, &target, total as u64, chunk, 1).await;
-    assert!(outcome.is_ok(), "serial download failed: {:?}", outcome.err());
+    assert!(
+        outcome.is_ok(),
+        "serial download failed: {:?}",
+        outcome.err()
+    );
 
     assert_byte_exact(&target, &body);
     assert!(
         !rcdl_path(&target).exists(),
         "the serial path must never create a .rcdl sidecar"
     );
-    assert_eq!(server.hits(), n_parts, "serial fetches each part once, in order");
-    assert_eq!(server.peak(), 1, "the serial path must issue one request at a time");
+    assert_eq!(
+        server.hits(),
+        n_parts,
+        "serial fetches each part once, in order"
+    );
+    assert_eq!(
+        server.peak(),
+        1,
+        "the serial path must issue one request at a time"
+    );
 
     cleanup(&target);
 }

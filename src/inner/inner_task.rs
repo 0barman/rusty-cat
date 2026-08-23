@@ -1,18 +1,17 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use reqwest::header::HeaderMap;
-use reqwest::Method;
-use tokio::fs::File;
-
 use crate::direction::Direction;
 use crate::error::{InnerErrorCode, MeowError};
 use crate::http_breakpoint::{BreakpointDownload, BreakpointDownloadHttpConfig, BreakpointUpload};
 use crate::ids::TaskId;
-use crate::inner::sign::{calculate_sign, calculate_sign_bytes};
+use crate::inner::sign::calculate_sign_bytes;
 use crate::inner::UniqueId;
 use crate::pounce_task::PounceTask;
+use crate::upload_file::UploadFileSnapshot;
 use crate::upload_source::UploadSource;
+use reqwest::header::HeaderMap;
+use reqwest::Method;
 
 /// 调度与 [`crate::transfer_executor_trait::TransferTrait`] 视图的内部任务；不对外暴露构造。
 #[derive(Clone)]
@@ -22,6 +21,7 @@ pub(crate) struct InnerTask {
     file_name: Arc<str>,
     file_path: PathBuf,
     upload_source: Option<UploadSource>,
+    upload_file_snapshot: Option<UploadFileSnapshot>,
     direction: Direction,
     total_size: u64,
     chunk_size: u64,
@@ -78,15 +78,13 @@ impl InnerTask {
             }
         });
 
+        let mut upload_file_snapshot = None;
         let file_sign = match direction {
             Direction::Upload => {
                 let source = upload_source.as_ref().ok_or_else(|| {
                     crate::log::emit_lazy(|| {
-                        crate::log::Log::warn(
-                            "inner_task",
-                            "upload task missing upload source",
-                        )
-                        .with_task_id(task_id.to_string())
+                        crate::log::Log::warn("inner_task", "upload task missing upload source")
+                            .with_task_id(task_id.to_string())
                     });
                     MeowError::from_code_str(
                         InnerErrorCode::ParameterEmpty,
@@ -101,57 +99,30 @@ impl InnerTask {
                             task_id,
                             path.display()
                         );
-                        let file = File::open(path).await.map_err(|e| {
-                            if e.kind() == std::io::ErrorKind::NotFound {
+                        // Validate only one actual part allocation. Multiplying
+                        // by the requested scheduler window used to reject
+                        // otherwise valid serial fallbacks and imposed an
+                        // arbitrary 512 MiB policy unrelated to real in-flight
+                        // allocations.
+                        UploadFileSnapshot::validate_chunk_size(chunk_size)?;
+                        let snapshot = UploadFileSnapshot::open_and_hash(path.clone(), total_size)
+                            .await
+                            .inspect_err(|e| {
                                 crate::log::emit_lazy(|| {
                                     crate::log::Log::error(
                                         "inner_task",
                                         format!(
-                                            "upload source missing: path={} err={}",
+                                            "calculate_sign failed: path={} err={}",
                                             path.display(),
                                             crate::log::redact_secrets(&e.to_string())
                                         ),
                                     )
                                     .with_task_id(task_id.to_string())
                                 });
-                                MeowError::from_source(
-                                    InnerErrorCode::FileNotFound,
-                                    format!("upload source file not found: {}", path.display()),
-                                    e,
-                                )
-                            } else {
-                                crate::log::emit_lazy(|| {
-                                    crate::log::Log::error(
-                                        "inner_task",
-                                        format!(
-                                            "upload source open failed: path={} err={}",
-                                            path.display(),
-                                            crate::log::redact_secrets(&e.to_string())
-                                        ),
-                                    )
-                                    .with_task_id(task_id.to_string())
-                                });
-                                MeowError::from_source(
-                                    InnerErrorCode::IoError,
-                                    format!("open upload source failed: {}", path.display()),
-                                    e,
-                                )
-                            }
-                        })?;
-                        calculate_sign(&file).await.map_err(|e| {
-                            crate::log::emit_lazy(|| {
-                                crate::log::Log::error(
-                                    "inner_task",
-                                    format!(
-                                        "calculate_sign failed: path={} err={}",
-                                        path.display(),
-                                        crate::log::redact_secrets(&e.to_string())
-                                    ),
-                                )
-                                .with_task_id(task_id.to_string())
-                            });
-                            e
-                        })?
+                            })?;
+                        let sign = snapshot.sign().to_owned();
+                        upload_file_snapshot = Some(snapshot);
+                        sign
                     }
                     UploadSource::Bytes(bytes) => {
                         crate::meow_key_log!(
@@ -200,12 +171,9 @@ impl InnerTask {
         );
 
         crate::log::emit_lazy(|| {
-            crate::log::Log::key(
-                "inner_task",
-                format!("task created dir={:?}", direction),
-            )
-            .with_task_id(task_id.to_string())
-            .with_byte_len(total_size)
+            crate::log::Log::key("inner_task", format!("task created dir={:?}", direction))
+                .with_task_id(task_id.to_string())
+                .with_byte_len(total_size)
         });
 
         Ok(Self {
@@ -214,6 +182,7 @@ impl InnerTask {
             file_name: Arc::<str>::from(file_name),
             file_path,
             upload_source,
+            upload_file_snapshot,
             direction,
             total_size,
             chunk_size,
@@ -269,6 +238,10 @@ impl InnerTask {
 
     pub(crate) fn upload_source(&self) -> Option<&UploadSource> {
         self.upload_source.as_ref()
+    }
+
+    pub(crate) fn upload_file_snapshot(&self) -> Option<&UploadFileSnapshot> {
+        self.upload_file_snapshot.as_ref()
     }
 
     pub(crate) fn direction(&self) -> Direction {

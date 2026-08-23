@@ -266,12 +266,77 @@ async fn parallel_respects_max_parts_in_flight_window() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unsafe_effective_part_window_fails_before_dispatching_parts() {
+    let payload = vec![b'x'; 257];
+    let path = temp_upload_path("resource_limit");
+    fs::write(&path, &payload).expect("write upload fixture");
+    let rec = Arc::new(Mutex::new(Recorder::default()));
+    let client = MeowClient::new(MeowConfig::default());
+    let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
+    let statuses_cb = statuses.clone();
+    let task = UploadPounceBuilder::new("p.bin", &path, 1)
+        .with_url("https://placeholder/upload")
+        .with_breakpoint_upload(Arc::new(RecordingUpload {
+            rec: rec.clone(),
+            parallel: true,
+            total: payload.len() as u64,
+            chunk: 1,
+            scramble: false,
+            chunk_delay_ms: 0,
+            panic_at_offset: None,
+        }))
+        .with_max_parts_in_flight(257)
+        .build()
+        .expect("build upload task");
+    client
+        .try_enqueue(
+            task,
+            move |record| {
+                statuses_cb
+                    .lock()
+                    .expect("lock statuses")
+                    .push(record.status().clone());
+            },
+            |_, _| {},
+        )
+        .await
+        .expect("enqueue upload task");
+
+    let terminal = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(status) = statuses
+                .lock()
+                .expect("lock statuses")
+                .iter()
+                .find(|status| matches!(status, TransferStatus::Failed(_)))
+                .cloned()
+            {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("resource failure must not hang");
+
+    let TransferStatus::Failed(error) = terminal else {
+        unreachable!("filtered to Failed")
+    };
+    assert!(error.to_string().contains("part window exceeds task limit"));
+    let snapshot = rec.lock().expect("rec lock").clone();
+    assert!(snapshot.received.is_empty());
+    assert_eq!(snapshot.complete_calls, 0);
+    client.close().await.expect("close client");
+    let _ = fs::remove_file(path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn incapable_protocol_stays_serial_even_with_high_max_parts() {
     // Protocol advertises supports_parallel_parts() == false. Even with
-    // max_parts_in_flight=8 the executor MUST keep it strictly serial — a
+    // max_parts_in_flight=257 the executor MUST keep it strictly serial — a
     // refactor that accidentally enabled it would silently corrupt order.
     let payload: Vec<u8> = (0..6000u32).map(|i| (i % 251) as u8).collect();
-    let rec = run_upload("incapable", &payload, 1000, 8, false, false).await;
+    let rec = run_upload("incapable", &payload, 1000, 257, false, false).await;
 
     let (offsets, reassembled) = reassemble(&rec);
     assert_eq!(offsets, vec![0, 1000, 2000, 3000, 4000, 5000]);
