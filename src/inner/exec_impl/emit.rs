@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::file_transfer_record::FileTransferRecord;
 use crate::ids::TaskId;
 use crate::inner::group_state::RecordEntry;
@@ -46,12 +48,12 @@ pub(crate) fn invoke_complete_cb(
 
 /// 把一条进度记录广播到所有全局监听器。
 ///
-/// 在锁内只 clone 各监听器的 `Arc<dyn Fn>`，立刻释放读锁；后续每个监听器
-/// 各投递一次（`dto` 跨监听器 clone），因此监听器内部的注册/注销动作不会与
-/// 这里产生重入死锁。
+/// 在锁内只 clone 一个不可变 listener `Arc` 快照，立刻释放读锁；后续
+/// 每个监听器各投递一次（`dto` 跨监听器 clone），因此监听器内部的
+/// 注册/注销动作不会与这里产生重入死锁。
 pub(crate) fn emit_global_progress(state: &SchedulerState, dto: FileTransferRecord) {
-    let listeners: Vec<ProgressCb> = match state.global_progress_listener().read() {
-        Ok(g) => g.iter().map(|(_, cb)| cb.clone()).collect(),
+    let listeners = match state.global_progress_listener().read() {
+        Ok(g) => Arc::clone(&g),
         Err(_) => {
             crate::meow_warn_log!(
                 "emit_global_progress",
@@ -66,8 +68,8 @@ pub(crate) fn emit_global_progress(state: &SchedulerState, dto: FileTransferReco
         listeners.len(),
         dto.task_id()
     );
-    for cb in listeners {
-        invoke_progress_cb(state, &cb, dto.clone());
+    for (_, cb) in listeners.iter() {
+        invoke_progress_cb(state, cb, dto.clone());
     }
 }
 

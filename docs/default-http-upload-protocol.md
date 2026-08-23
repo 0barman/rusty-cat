@@ -89,8 +89,8 @@ For upload tasks the SDK computes `fileMd5` **automatically**; there is no
   file (read in 64 KiB blocks), computed when the task is enqueued.
 - **In-memory source** (`UploadPounceBuilder::from_bytes(...)`): the MD5 of the
   byte buffer.
-- An empty file/buffer yields the MD5 of zero bytes
-  (`d41d8cd98f00b204e9800998ecf8427e`).
+- Zero-byte uploads are rejected during enqueue with `ParameterEmpty`; the wire
+  protocol never receives an empty public upload task.
 
 This signature is also the task's **deduplication key** (re-enqueuing the same
 content while a task is live yields `DuplicateTaskError`). Because it is a
@@ -115,7 +115,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_breakpoint_upload(Arc::new(DefaultStyleUpload { category: "video".into() }))
         .build()?;
 
-    let _id = client.try_enqueue(task, |_r| {}, |_id, _p| {}).await?;
+    let outcome = client.enqueue_and_wait(task, |_record| {}).await?;
+    println!("upload {} complete", outcome.task_id);
     client.close().await?;
     Ok(())
 }
@@ -132,4 +133,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 4. Key your storage on `fileMd5` (+ `fileName`) so a resumed upload from a new
    process is recognized.
 5. Return a non-2xx status to signal failure; the SDK surfaces it as
-   `ResponseStatusError` and does not retry non-transient failures.
+   `ResponseStatusError`. Chunk requests retry 408, 429, and 5xx within the task
+   budget; other statuses fail immediately. Prepare response statuses are not
+   retried by the outer prepare retry loop.

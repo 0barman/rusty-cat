@@ -1,7 +1,7 @@
 use std::io;
 use std::time::Duration;
 
-use bytes::BytesMut;
+use bytes::Bytes;
 use reqwest::header::{HeaderValue, CONTENT_TYPE};
 use reqwest::redirect::Policy;
 use tokio_util::sync::CancellationToken;
@@ -12,6 +12,8 @@ use crate::error::{InnerErrorCode, MeowError};
 
 const CONNECT_TIMEOUT_CAP: Duration = Duration::from_secs(10);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const INITIAL_BODY_RESERVE_LIMIT: u64 = 1024 * 1024;
+const UNKNOWN_BODY_INITIAL_RESERVE: usize = 64 * 1024;
 
 pub(crate) fn build_client(
     timeout: Duration,
@@ -147,12 +149,11 @@ async fn download_once(
         return Err(AttemptFailure::Terminal(body_too_large(max_body_bytes)));
     }
     let content_type: Option<HeaderValue> = response.headers().get(CONTENT_TYPE).cloned();
-    let initial_capacity = response
-        .content_length()
-        .unwrap_or(0)
-        .min(max_body_bytes)
-        .min(64 * 1024) as usize;
-    let mut body = BytesMut::with_capacity(initial_capacity);
+    let initial_capacity = bounded_initial_capacity(response.content_length(), max_body_bytes)
+        .map_err(AttemptFailure::Terminal)?;
+    let mut body = Vec::new();
+    body.try_reserve_exact(initial_capacity)
+        .map_err(|error| AttemptFailure::Terminal(allocation_failed(error)))?;
     let mut total = 0u64;
 
     loop {
@@ -177,10 +178,41 @@ async fn download_once(
         if total > max_body_bytes {
             return Err(AttemptFailure::Terminal(body_too_large(max_body_bytes)));
         }
+        let required = usize::try_from(total)
+            .map_err(|_| AttemptFailure::Terminal(body_too_large(max_body_bytes)))?;
+        if required > body.capacity() {
+            let max_capacity = usize::try_from(max_body_bytes).unwrap_or(usize::MAX);
+            let doubled = body
+                .capacity()
+                .max(UNKNOWN_BODY_INITIAL_RESERVE)
+                .saturating_mul(2)
+                .min(max_capacity);
+            let target = required.max(doubled).min(max_capacity);
+            body.try_reserve_exact(target.saturating_sub(body.len()))
+                .map_err(|error| AttemptFailure::Terminal(allocation_failed(error)))?;
+        }
         body.extend_from_slice(&chunk);
     }
 
-    Ok(BinaryDownloadOutput::new(body.freeze(), content_type))
+    Ok(BinaryDownloadOutput::new(Bytes::from(body), content_type))
+}
+
+fn bounded_initial_capacity(
+    content_length: Option<u64>,
+    max_body_bytes: u64,
+) -> Result<usize, MeowError> {
+    let wanted = content_length
+        .unwrap_or(0)
+        .min(max_body_bytes)
+        .min(INITIAL_BODY_RESERVE_LIMIT);
+    usize::try_from(wanted).map_err(|_| body_too_large(max_body_bytes))
+}
+
+fn allocation_failed(error: std::collections::TryReserveError) -> MeowError {
+    MeowError::from_code(
+        InnerErrorCode::IoError,
+        format!("binary response buffer allocation failed: {error}"),
+    )
 }
 
 fn body_too_large(max_body_bytes: u64) -> MeowError {
@@ -245,6 +277,39 @@ mod tests {
         assert_eq!(
             reject_redirect(&[initial, first], &second, 1),
             Some("binary redirect limit exceeded")
+        );
+    }
+
+    #[test]
+    fn bounded_capacity_uses_known_medium_lengths_without_reserving_full_large_limit() {
+        assert_eq!(
+            bounded_initial_capacity(Some(0), 16 * 1024 * 1024).unwrap(),
+            0
+        );
+        assert_eq!(
+            bounded_initial_capacity(Some(63 * 1024), 16 * 1024 * 1024).unwrap(),
+            63 * 1024
+        );
+        assert_eq!(
+            bounded_initial_capacity(Some(65 * 1024), 16 * 1024 * 1024).unwrap(),
+            65 * 1024
+        );
+        assert_eq!(
+            bounded_initial_capacity(Some(16 * 1024 * 1024), 16 * 1024 * 1024).unwrap(),
+            1024 * 1024
+        );
+        assert_eq!(bounded_initial_capacity(None, 16 * 1024 * 1024).unwrap(), 0);
+    }
+
+    #[test]
+    fn u64_max_length_still_uses_architecture_safe_initial_reserve() {
+        // Conversion failure is intentionally unreachable: clamp to the 1 MiB
+        // initial reserve before converting to usize. This assertion exercises
+        // the actual 32-bit-safe contract instead of conditionally expecting an
+        // error from a value that can never reach `usize::try_from` unchanged.
+        assert_eq!(
+            bounded_initial_capacity(Some(u64::MAX), u64::MAX).unwrap(),
+            1024 * 1024
         );
     }
 }

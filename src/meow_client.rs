@@ -26,6 +26,18 @@ use crate::transfer_status::TransferStatus;
 /// fast and non-blocking to avoid delaying event processing.
 pub type GlobalProgressListener = ProgressCb;
 
+/// Outcome of a task that reached [`TransferStatus::Complete`].
+///
+/// Returned by [`MeowClient::enqueue_and_wait`].
+#[derive(Debug, Clone)]
+pub struct TaskOutcome {
+    /// Task identifier returned by the underlying scheduler.
+    pub task_id: TaskId,
+    /// Provider-defined payload returned by upload protocol's `complete_upload`.
+    /// Download tasks usually receive `None`.
+    pub payload: Option<String>,
+}
+
 /// Main entry point of the `rusty-cat` SDK.
 ///
 /// `MeowClient` owns runtime state and provides high-level operations:
@@ -36,7 +48,7 @@ pub type GlobalProgressListener = ProgressCb;
 /// 1. Create [`MeowConfig`].
 /// 2. Construct `MeowClient::new(config)`.
 /// 3. Build tasks with upload/download builders.
-/// 4. Call [`Self::enqueue`] and store returned [`TaskId`].
+/// 4. Call [`Self::try_enqueue`] or [`Self::enqueue_and_wait`].
 /// 5. Control task lifecycle with pause/resume/cancel.
 /// 6. Call [`Self::close`] during shutdown.
 ///
@@ -76,7 +88,7 @@ pub type GlobalProgressListener = ProgressCb;
 ///
 /// `MeowClient` **intentionally does not implement [`Clone`]**.
 ///
-/// The client owns a lazily-initialized [`Executor`] (a single background
+/// The client owns a lazily-initialized internal `Executor` (a single background
 /// worker loop plus its task table, scheduler state and shutdown flag). A
 /// naive field-by-field `Clone` would copy the `OnceLock<Executor>` *before*
 /// it was initialized, letting different clones each spin up their **own**
@@ -103,18 +115,6 @@ pub type GlobalProgressListener = ProgressCb;
 ///     let _ = client_for_task; // use the shared client here
 /// });
 /// ```
-/// Outcome of a task that reached [`TransferStatus::Complete`].
-///
-/// Returned by [`MeowClient::enqueue_and_wait`].
-#[derive(Debug, Clone)]
-pub struct TaskOutcome {
-    /// Task identifier returned by the underlying scheduler.
-    pub task_id: TaskId,
-    /// Provider-defined payload returned by upload protocol's `complete_upload`.
-    /// Download tasks usually receive `None`.
-    pub payload: Option<String>,
-}
-
 pub struct MeowClient {
     /// Lazily initialized task executor.
     ///
@@ -132,7 +132,7 @@ pub struct MeowClient {
     /// Immutable runtime configuration.
     config: MeowConfig,
     /// Global listeners receiving progress records for all tasks.
-    global_progress_listener: Arc<RwLock<Vec<(GlobalProgressListenerId, GlobalProgressListener)>>>,
+    global_progress_listener: crate::inner::scheduler_state::GlobalProgressStore,
     /// Global closed flag. Once set to `true`, task control APIs reject calls.
     closed: Arc<AtomicBool>,
 }
@@ -179,7 +179,7 @@ impl MeowClient {
             binary_lifecycle: Arc::new(StdMutex::new(BinaryLifecycle::Open)),
             close_notify: Arc::new(tokio::sync::Notify::new()),
             config,
-            global_progress_listener: Arc::new(RwLock::new(Vec::new())),
+            global_progress_listener: Arc::new(RwLock::new(Arc::from([]))),
             closed: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -369,7 +369,9 @@ impl MeowClient {
                 format!("register global listener lock poisoned: {}", e),
             )
         })?;
-        guard.push((id, Arc::new(listener)));
+        let mut next = guard.as_ref().to_vec();
+        next.push((id, Arc::new(listener)));
+        *guard = Arc::from(next);
         Ok(id)
     }
 
@@ -403,7 +405,9 @@ impl MeowClient {
             )
         })?;
         if let Some(pos) = g.iter().position(|(k, _)| *k == id) {
-            g.remove(pos);
+            let mut next = g.as_ref().to_vec();
+            next.remove(pos);
+            *g = Arc::from(next);
             crate::meow_key_log!(
                 "listener",
                 "unregister global listener success: id={:?}",
@@ -433,15 +437,12 @@ impl MeowClient {
     /// ```
     pub fn clear_global_listener(&self) -> Result<(), MeowError> {
         crate::meow_key_log!("listener", "clear all global listeners");
-        self.global_progress_listener
-            .write()
-            .map_err(|e| {
-                MeowError::from_code(
-                    InnerErrorCode::LockPoisoned,
-                    format!("clear global listeners lock poisoned: {}", e),
-                )
-            })?
-            .clear();
+        *self.global_progress_listener.write().map_err(|e| {
+            MeowError::from_code(
+                InnerErrorCode::LockPoisoned,
+                format!("clear global listeners lock poisoned: {}", e),
+            )
+        })? = Arc::from([]);
         Ok(())
     }
 
@@ -501,7 +502,7 @@ impl MeowClient {
     /// to the scheduler worker, **not** `send().await`. That means:
     ///
     /// - The `await` point in this function is used for task normalization
-    ///   (e.g. resolving upload breakpoints, building [`InnerTask`]), **not**
+    ///   (e.g. resolving upload breakpoints, building an internal `InnerTask`), **not**
     ///   for waiting on command-queue capacity.
     /// - If the command queue is momentarily full (bursty enqueue under
     ///   [`MeowConfig::command_queue_capacity`]), this method returns an
@@ -882,7 +883,8 @@ impl MeowClient {
     ///
     /// # Usage rules
     ///
-    /// Call this with a valid task ID returned by [`Self::enqueue`].
+    /// Call this with a valid task ID returned by [`Self::try_enqueue`] or
+    /// observed through [`Self::enqueue_and_wait`]'s progress callback.
     ///
     /// # Errors
     ///

@@ -241,9 +241,11 @@ impl DownloadPounceBuilder {
     /// size is known up front; otherwise the download stays serial. `0`
     /// normalizes to `1`.
     ///
-    /// Peak download memory for this file is `max_parts_in_flight * chunk_size`,
-    /// so keep it bounded. Concurrent downloads write parts out of order into a
-    /// pre-sized file and track progress in a `<file>.rcdl` sidecar for resume.
+    /// Before an actual parallel run, the executor caps the effective window by
+    /// the file's real part count and rejects windows above 256 part tasks or
+    /// 512 MiB of chunk data with a controlled I/O error. Concurrent downloads
+    /// write parts out of order into a pre-sized file and track progress in a
+    /// `<file>.rcdl` sidecar for resume.
     ///
     /// # Examples
     ///

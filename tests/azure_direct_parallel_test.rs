@@ -159,6 +159,21 @@ fn handle_conn(mut stream: std::net::TcpStream, state: Arc<Mutex<ServerState>>, 
     );
     let _ = stream.write_all(resp.as_bytes());
     let _ = stream.flush();
+    // A plain drop can emit TCP RST on some platforms when bytes are still in
+    // the receive queue, making reqwest intermittently report IncompleteMessage
+    // or ConnectionReset even though the complete response was written. Close
+    // the response side first so the client observes a deterministic EOF, then
+    // briefly drain until it closes its request side.
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .ok();
+    loop {
+        match stream.read(&mut tmp) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
 }
 
 fn content_length(header: &str) -> usize {

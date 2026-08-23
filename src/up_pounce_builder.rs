@@ -228,8 +228,9 @@ impl UploadPounceBuilder {
     /// A value `> 1` is only honored when the chosen upload protocol proves
     /// out-of-order safety (e.g. presigned multipart, Azure block blob); for any
     /// other protocol the upload stays serial regardless of this value. `0` is
-    /// normalized to `1`. Peak upload memory for a file source is
-    /// `max_parts_in_flight * chunk_size`, so keep it bounded.
+    /// normalized to `1`. Before an actual parallel run, the executor caps the
+    /// effective window by the file's real part count and rejects windows above
+    /// 256 part tasks or 512 MiB of chunk data with a controlled I/O error.
     ///
     /// # Examples
     ///

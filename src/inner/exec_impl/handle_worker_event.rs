@@ -72,7 +72,7 @@ pub(crate) async fn handle_worker_event(event: WorkerEvent, state: &mut Schedule
                 crate::inner::safe_key(&key),
                 total_size
             );
-            state.active_mut().remove(&key);
+            state.remove_active(&key);
             // 完成后无论此前是否 paused，都要清理 paused 标记。
             state.paused_set_mut().remove(&key);
             state.offsets_mut().insert(key.clone(), total_size);
@@ -107,7 +107,10 @@ pub(crate) async fn handle_worker_event(event: WorkerEvent, state: &mut Schedule
                 crate::log::emit_lazy(|| {
                     crate::log::Log::warn(
                         "worker_event",
-                        format!("Completed for unknown group; nothing to finalize total_size={}", total_size),
+                        format!(
+                            "Completed for unknown group; nothing to finalize total_size={}",
+                            total_size
+                        ),
                     )
                     .with_key(key.1.as_str())
                 });
@@ -120,7 +123,7 @@ pub(crate) async fn handle_worker_event(event: WorkerEvent, state: &mut Schedule
             error,
             total_size,
         } => {
-            state.active_mut().remove(&key);
+            state.remove_active(&key);
             // 失败终态会结束任务生命周期，因此同步清理 paused 标记。
             state.paused_set_mut().remove(&key);
             if let Some(group) = state.groups_mut().remove(&key) {
@@ -134,7 +137,10 @@ pub(crate) async fn handle_worker_event(event: WorkerEvent, state: &mut Schedule
                 crate::log::emit_lazy(|| {
                     let mut log = crate::log::Log::error(
                         "worker_event",
-                        format!("task failed: {}", crate::log::redact_secrets(&error.to_string())),
+                        format!(
+                            "task failed: {}",
+                            crate::log::redact_secrets(&error.to_string())
+                        ),
                     )
                     .with_key(key.1.as_str())
                     .with_offset(current)
@@ -162,7 +168,10 @@ pub(crate) async fn handle_worker_event(event: WorkerEvent, state: &mut Schedule
                 crate::log::emit_lazy(|| {
                     crate::log::Log::warn(
                         "worker_event",
-                        format!("Failed for unknown group; nothing to finalize error={}", crate::log::redact_secrets(&error.to_string())),
+                        format!(
+                            "Failed for unknown group; nothing to finalize error={}",
+                            crate::log::redact_secrets(&error.to_string())
+                        ),
                     )
                     .with_key(key.1.as_str())
                     .with_error_code(error.code())
@@ -172,8 +181,12 @@ pub(crate) async fn handle_worker_event(event: WorkerEvent, state: &mut Schedule
             state.known_totals_mut().remove(&key);
         }
         WorkerEvent::Canceled { key, total_size } => {
-            crate::meow_key_log!("worker_event", "canceled: key={}", crate::inner::safe_key(&key));
-            state.active_mut().remove(&key);
+            crate::meow_key_log!(
+                "worker_event",
+                "canceled: key={}",
+                crate::inner::safe_key(&key)
+            );
+            state.remove_active(&key);
             // 若 key 在 paused_set 中，表示该取消来自 pause 流程，仅收敛执行态，不销毁 group。
             if state.paused_set().contains(&key) {
                 crate::meow_key_log!(
@@ -274,7 +287,7 @@ mod tests {
         // alive — a deadlock). Forgetting it is safe: the dispatcher thread still
         // exits on its own when `state` drops and closes the channel.
         std::mem::forget(cb_join);
-        let mut state = SchedulerState::new(1, 1, Arc::new(RwLock::new(Vec::new())), cb_submit);
+        let mut state = SchedulerState::new(1, 1, Arc::new(RwLock::new(Arc::from([]))), cb_submit);
 
         state
             .task_id_to_dedupe_mut()
@@ -597,7 +610,11 @@ mod tests {
             matches!(r.status(), TransferStatus::Failed(_))
         })
         .await;
-        assert_eq!(failed.total_size(), 8192, "无 known_totals 时终态用事件携带的 total");
+        assert_eq!(
+            failed.total_size(),
+            8192,
+            "无 known_totals 时终态用事件携带的 total"
+        );
     }
 
     /// 方案 B 单独生效：调度器无记录（取消发生在首个 Progress 前），

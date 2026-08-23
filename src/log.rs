@@ -108,7 +108,8 @@ impl fmt::Display for LogLevel {
 /// structured context for triage — task id, object key, part index, byte
 /// offset/length, HTTP status, retry attempt and a sanitized URL. These are set
 /// through the `with_*` builder methods and are most valuable on
-/// [`LogLevel::Error`] and [`LogLevel::Key`] entries. [`Log::Display`] appends
+/// [`LogLevel::Error`] and [`LogLevel::Key`] entries. Its [`std::fmt::Display`]
+/// implementation appends
 /// every present field as ` key=value`, so a persisted log line is
 /// self-describing.
 #[derive(Debug, Clone)]
