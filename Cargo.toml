@@ -1,17 +1,21 @@
 [package]
 name = "rusty-cat"
-version = "0.3.5"
+version = "0.3.6"
 edition = "2021"
+rust-version = "1.89"
 description = "Async HTTP client for resumable file upload and download."
 license = "MIT"
 repository = "https://github.com/0barman/rusty-cat"
 readme = "README.md"
 keywords = ["async", "download", "http", "upload", "resume"]
 categories = ["asynchronous", "network-programming"]
-include = ["src/**", "docs/*.md", "examples/**", "Cargo.toml", "README.md", "LICENSE*"]
+include = ["src/**", "docs/*.md", "Cargo.toml", "README.md", "LICENSE*"]
 
 [package.metadata.docs.rs]
 all-features = true
+
+[lints.rust]
+unsafe_code = "forbid"
 
 [features]
 default = []
@@ -56,9 +60,6 @@ sha2 = { version = "0.10" }
 fs2 = "0.4"
 time = { version = "0.3", optional = true }
 
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
-
 [dev-dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 criterion = { version = "0.5.1", features = ["html_reports"] }
@@ -76,45 +77,3 @@ tokio = { version = "1.50.0", default-features = false, features = [
 [[bench]]
 name = "transfer_hotspots"
 harness = false
-
-[[example]]
-name = "http_local_chunk_transfer"
-path = "examples/http_local_chunk_transfer.rs"
-
-[[example]]
-name = "restore_import_paused"
-path = "examples/restore_import_paused.rs"
-
-[[example]]
-name = "resume_after_restart"
-path = "examples/resume_after_restart.rs"
-
-[[example]]
-name = "aliyun_oss_direct_chunk_transfer"
-path = "examples/aliyun_oss_direct_chunk_transfer.rs"
-required-features = ["aliyun-oss-direct"]
-
-[[example]]
-name = "aliyun_oss_direct_custom_chunk_transfer"
-path = "examples/aliyun_oss_direct_custom_chunk_transfer.rs"
-required-features = ["aliyun-oss-direct"]
-
-[[example]]
-name = "aliyun_oss_presigned_chunk_transfer"
-path = "examples/aliyun_oss_presigned_chunk_transfer.rs"
-required-features = ["aliyun-oss-presigned"]
-
-[[example]]
-name = "azure_blob_direct_chunk_transfer"
-path = "examples/azure_blob_direct_chunk_transfer.rs"
-required-features = ["azure-blob-direct"]
-
-[[example]]
-name = "azure_blob_direct_custom_chunk_transfer"
-path = "examples/azure_blob_direct_custom_chunk_transfer.rs"
-required-features = ["azure-blob-direct"]
-
-[[example]]
-name = "azure_blob_sas_chunk_transfer"
-path = "examples/azure_blob_sas_chunk_transfer.rs"
-required-features = ["azure-blob-sas"]

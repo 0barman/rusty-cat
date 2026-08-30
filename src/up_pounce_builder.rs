@@ -230,7 +230,9 @@ impl UploadPounceBuilder {
     /// other protocol the upload stays serial regardless of this value. `0` is
     /// normalized to `1`. Before an actual parallel run, the executor caps the
     /// effective window by the file's real part count and rejects windows above
-    /// 256 part tasks or 512 MiB of chunk data with a controlled I/O error.
+    /// 256 part tasks or the client-wide body-plus-verification budget with a
+    /// controlled I/O error. The budget is 512 MiB on 64-bit targets and
+    /// 64 MiB on 32-bit targets.
     ///
     /// # Examples
     ///

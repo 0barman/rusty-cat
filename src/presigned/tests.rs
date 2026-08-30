@@ -291,7 +291,10 @@ fn uploaded(part_number: u64, offset: u64, size: u64) -> PresignedUploadedPart {
 fn test_resumed_offset_covers_full_contiguous_prefix() {
     let up = PresignedMultipartUpload::new(plan_three_5b_parts());
     let resumed = up.resumed_offset_from(&[uploaded(1, 0, 5), uploaded(2, 5, 5)]);
-    assert_eq!(resumed, 10, "two contiguous 5-byte parts resume at offset 10");
+    assert_eq!(
+        resumed, 10,
+        "two contiguous 5-byte parts resume at offset 10"
+    );
 }
 
 #[test]
@@ -327,8 +330,11 @@ fn test_resumed_offset_empty_is_zero() {
 #[tokio::test]
 async fn test_with_resumed_parts_dedups_by_offset() {
     // Injecting two parts for the same offset keeps only one.
-    let up = PresignedMultipartUpload::new(plan_three_5b_parts())
-        .with_resumed_parts(vec![uploaded(1, 0, 5), uploaded(1, 0, 5), uploaded(2, 5, 5)]);
+    let up = PresignedMultipartUpload::new(plan_three_5b_parts()).with_resumed_parts(vec![
+        uploaded(1, 0, 5),
+        uploaded(1, 0, 5),
+        uploaded(2, 5, 5),
+    ]);
     let parts = up.uploaded_parts().await;
     assert_eq!(parts.len(), 2);
     let mut offsets: Vec<u64> = parts.iter().map(|p| p.offset).collect();

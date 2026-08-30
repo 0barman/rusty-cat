@@ -45,7 +45,9 @@ impl CountingServer {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         hits_t.fetch_add(1, Ordering::AcqRel);
-                        stream.set_read_timeout(Some(Duration::from_millis(200))).ok();
+                        stream
+                            .set_read_timeout(Some(Duration::from_millis(200)))
+                            .ok();
                         let mut tmp = [0u8; 1024];
                         let _ = stream.read(&mut tmp);
                         let _ = stream.write_all(

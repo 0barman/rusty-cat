@@ -4,7 +4,10 @@ This guide explains how to use `rusty-cat` with Aliyun OSS direct AccessKey sign
 
 Use direct mode only when the process running `rusty-cat` is trusted to hold cloud credentials, such as a backend service, an internal CLI, or a controlled server-side worker. For public desktop, mobile, or browser clients, prefer the presigned URL flow so long-lived AccessKey secrets never leave your backend.
 
-Example source: [../examples/aliyun_oss_direct_chunk_transfer.rs](../examples/aliyun_oss_direct_chunk_transfer.rs)
+The [`aliyun-direct`](../../test-app/README.md#provider-direct-场景) test-app
+scenario exercises the official SDK direct provider with dedicated live-test
+configuration and supports environment overrides. It is an internal test tool;
+production applications must load their own credentials securely.
 
 ## Security model
 
@@ -25,17 +28,29 @@ For untrusted desktop/mobile clients, prefer a backend-generated presigned URL f
 
 ```toml
 [dependencies]
-rusty-cat = { version = "0.2.4", features = ["aliyun-oss-direct"] }
+rusty-cat = { version = "0.3.6", features = ["aliyun-oss-direct"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-Run the official example with:
+For an isolated live-test configuration, set these environment overrides in the
+process that launches test-app:
+
+- `RC_ALIYUN_BUCKET`
+- `RC_ALIYUN_ACCESS_KEY_ID`
+- `RC_ALIYUN_ACCESS_KEY_SECRET`
+
+Optional variables are `RC_ALIYUN_REGION`, `RC_ALIYUN_OBJECT_PREFIX`,
+`RC_DIRECT_UPLOAD_SIZE`, `RC_DIRECT_PART_SIZE`, and `RC_OUT_DIR`. Then run from
+the repository root:
 
 ```text
-cargo run --example aliyun_oss_direct_chunk_transfer --features aliyun-oss-direct
+cargo run --manifest-path test-app/Cargo.toml -- aliyun-direct
 ```
 
-Before running it, fill the constants at the top of [../examples/aliyun_oss_direct_chunk_transfer.rs](../examples/aliyun_oss_direct_chunk_transfer.rs): `BUCKET_NAME`, `ACCESS_KEY_ID`, `ACCESS_KEY_SECRET`, and `REGION`.
+The scenario uses `AliOssDirectUpload` and `AliOssDirectDownload` from the SDK.
+The former hand-written OSS V4 signer was not migrated, so test-app has one
+direct implementation rather than two competing copies. Use a least-privilege
+test credential and an isolated object prefix.
 
 ## Upload flow
 
@@ -157,7 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 1. Persist your own record containing object URL, object key, local path, direction, chunk size, and current status.
 2. Persist credential references, not raw secrets, whenever possible.
-3. On restart, recreate the download protocol and rebuild the same logical download; it can recover from the partial file or a validated concurrent-download sidecar.
+3. On restart, recreate the download protocol and rebuild the same logical download. It reuses parts only from a generation-bound sidecar whose semantic URL, total, chunk grid, freshly observed strong ETag, and local part digests all validate; otherwise it downloads again from byte zero.
 4. Treat a direct upload differently: the current public API cannot inject a prior multipart session into a new protocol instance. Clean up the orphaned upload and start a new session.
 
 The direct upload protocol exposes the in-flight OSS multipart `UploadId` via `AliOssDirectUpload::current_upload_id()`. Persisting it lets you abort an orphaned multipart session out of band (so uncommitted parts stop accruing storage cost); it does not make that session injectable into a newly constructed SDK task. For the full restart/crash recovery matrix, see [Resume after a process restart](resume-after-restart.md).

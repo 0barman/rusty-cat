@@ -209,6 +209,9 @@ impl MeowConfigBuilder {
     ///
     /// - The provided client should be reusable and long-lived.
     /// - Keep timeout/connection settings aligned with your workload.
+    /// - Download checkpoints are not reused across processes because reqwest
+    ///   does not expose the client's effective default headers for identity
+    ///   binding. Current-run ETag validation remains enabled.
     ///
     /// # Examples
     ///

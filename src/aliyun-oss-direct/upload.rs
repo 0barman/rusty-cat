@@ -803,7 +803,7 @@ fn validate_remote_parts_for_resume(
         local_offset / task.chunk_size()
     };
     for part_number in 1..=expected_parts {
-        if !uploaded_parts.binary_search(&part_number).is_ok() {
+        if uploaded_parts.binary_search(&part_number).is_err() {
             return Err(MeowError::from_code(
                 InnerErrorCode::InvalidTaskState,
                 format!(

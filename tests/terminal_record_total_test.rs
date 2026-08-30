@@ -65,7 +65,7 @@ fn spawn_range_server(
         let req = String::from_utf8_lossy(&buf[..n]).to_string();
         if req.starts_with("HEAD ") {
             let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"terminal-total-v1\"\r\nConnection: close\r\n\r\n",
                 payload_for_thread.len()
             );
             let _ = stream.write_all(resp.as_bytes());
@@ -92,7 +92,7 @@ fn spawn_range_server(
         let bounded_end = end_idx.min(payload_for_thread.len() - 1);
         let body = &payload_for_thread[start_idx..=bounded_end];
         let resp = format!(
-            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nETag: \"terminal-total-v1\"\r\nConnection: close\r\n\r\n",
             start_idx,
             bounded_end,
             payload_for_thread.len(),

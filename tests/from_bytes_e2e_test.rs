@@ -16,13 +16,13 @@ use rusty_cat::transfer_status::TransferStatus;
 use rusty_cat::up_pounce_builder::UploadPounceBuilder;
 use rusty_cat::MeowClient;
 
+type HttpRequest = (String, Vec<(String, String)>, Vec<u8>);
+
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-fn read_http_request(
-    stream: &mut std::net::TcpStream,
-) -> std::io::Result<(String, Vec<(String, String)>, Vec<u8>)> {
+fn read_http_request(stream: &mut std::net::TcpStream) -> std::io::Result<HttpRequest> {
     let mut buf = Vec::new();
     let mut temp = [0u8; 4096];
     let mut idle_reads = 0u32;

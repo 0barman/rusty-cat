@@ -243,9 +243,11 @@ impl DownloadPounceBuilder {
     ///
     /// Before an actual parallel run, the executor caps the effective window by
     /// the file's real part count and rejects windows above 256 part tasks or
-    /// 512 MiB of chunk data with a controlled I/O error. Concurrent downloads
-    /// write parts out of order into a pre-sized file and track progress in a
-    /// `<file>.rcdl` sidecar for resume.
+    /// the client-wide buffered-part budget with a controlled I/O error. The
+    /// budget is 512 MiB on 64-bit targets and 64 MiB on 32-bit targets.
+    /// Concurrent downloads write parts out of order into a pre-sized file and
+    /// track progress in an adjacent `.rusty-cat/<path-hash>.rcdl` sidecar for
+    /// resume.
     ///
     /// # Examples
     ///

@@ -58,8 +58,10 @@
 //! - `worker_loop` 的 `Close` 路径会在回应 `respond_to` 前显式 drop 句柄并
 //!   `join` 线程，从而保证 `close().await` 返回时所有终态回调已执行完毕。
 
+use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crate::error::{InnerErrorCode, MeowError};
@@ -85,6 +87,51 @@ use crate::transfer_status::TransferStatus;
 ///
 /// 如确有必要调整，应在库内通过测试论证后修改本常量，而不是放给接入方。
 pub(crate) const CALLBACK_QUEUE_CAPACITY: usize = 2048;
+
+std::thread_local! {
+    /// Identifies the client that owns the current callback dispatcher. A
+    /// callback may close an independent client, but closing its own owner
+    /// would wait for this same thread to return and therefore self-deadlock.
+    static CALLBACK_DISPATCHER_OWNER: Cell<Option<*const CallbackDispatcherOwnerMarker>> =
+        const { Cell::new(None) };
+}
+
+#[derive(Clone)]
+pub(crate) struct CallbackDispatcherOwner(Arc<CallbackDispatcherOwnerMarker>);
+
+struct CallbackDispatcherOwnerMarker;
+
+impl CallbackDispatcherOwner {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(CallbackDispatcherOwnerMarker))
+    }
+}
+
+pub(crate) fn is_callback_dispatcher_thread_for(owner: &CallbackDispatcherOwner) -> bool {
+    let expected = Arc::as_ptr(&owner.0);
+    CALLBACK_DISPATCHER_OWNER.with(|current| current.get() == Some(expected))
+}
+
+struct CallbackDispatcherThreadMarker;
+
+impl CallbackDispatcherThreadMarker {
+    fn enter(owner: &CallbackDispatcherOwner) -> Self {
+        CALLBACK_DISPATCHER_OWNER.with(|current| {
+            debug_assert!(
+                current.get().is_none(),
+                "callback dispatcher marker entered twice"
+            );
+            current.set(Some(Arc::as_ptr(&owner.0)));
+        });
+        Self
+    }
+}
+
+impl Drop for CallbackDispatcherThreadMarker {
+    fn drop(&mut self) {
+        CALLBACK_DISPATCHER_OWNER.with(|current| current.set(None));
+    }
+}
 
 /// 投递给分发线程的回调任务。
 ///
@@ -210,11 +257,19 @@ impl Drop for CbDispatcherJoin {
 /// 队列容量固定为 [`CALLBACK_QUEUE_CAPACITY`]（库内常量），不接受外部参数。
 /// 这是有意为之：背压表现与"对外可观测语义"是一对耦合的契约，应该一起在
 /// 库内被锁定，避免接入方误调参后破坏隔离效果或语义预期。
+#[cfg(test)]
 pub(crate) fn start() -> Result<(CbSubmit, CbDispatcherJoin), MeowError> {
+    start_for(CallbackDispatcherOwner::new())
+}
+
+pub(crate) fn start_for(
+    owner: CallbackDispatcherOwner,
+) -> Result<(CbSubmit, CbDispatcherJoin), MeowError> {
     let (tx, rx) = sync_channel::<CbJob>(CALLBACK_QUEUE_CAPACITY);
     let handle = std::thread::Builder::new()
         .name("rusty-cat-cb".into())
         .spawn(move || {
+            let _thread_marker = CallbackDispatcherThreadMarker::enter(&owner);
             // 注意：这里有意不在线程入口/出口 emit `meow_flow_log!`。
             // 调度器主路径上的 emit 时机由 worker_loop 控制；分发线程的启
             // 动/退出由 OS 决定，时机相对其他 test 不可控。在并发的 debug

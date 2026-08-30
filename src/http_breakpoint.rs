@@ -184,18 +184,10 @@ fn map_reqwest(e: reqwest::Error) -> MeowError {
     MeowError::from_source(InnerErrorCode::HttpError, e.to_string(), e)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DefaultStyleUpload {
     /// Optional business category sent in multipart form.
     pub category: String,
-}
-
-impl Default for DefaultStyleUpload {
-    fn default() -> Self {
-        Self {
-            category: String::new(),
-        }
-    }
 }
 
 /// Multipart field key: file md5/signature.
@@ -315,6 +307,52 @@ pub(crate) fn insert_header(map: &mut HeaderMap, name: &str, value: &str) {
     }
 }
 
+/// Canonicalizes the invariant portion of effective range request headers for
+/// use as opaque resume-identity input. Per-part validators/ranges are supplied
+/// by the executor and therefore deliberately excluded.
+pub(crate) fn canonical_resume_headers(mut headers: HeaderMap) -> Vec<u8> {
+    use reqwest::header::{IF_MATCH, IF_RANGE, RANGE};
+    use std::collections::BTreeMap;
+
+    headers.remove(RANGE);
+    headers.remove(IF_MATCH);
+    headers.remove(IF_RANGE);
+
+    let mut grouped: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
+    for (name, value) in &headers {
+        grouped
+            .entry(name.as_str().to_ascii_lowercase())
+            .or_default()
+            .push(value.as_bytes().to_vec());
+    }
+
+    let mut output = Vec::new();
+    output.extend_from_slice(b"rusty-cat/range-headers/v1\0");
+    for (name, values) in grouped {
+        append_resume_identity_field(&mut output, name.as_bytes());
+        output.extend_from_slice(&(values.len() as u64).to_be_bytes());
+        for value in values {
+            append_resume_identity_field(&mut output, &value);
+        }
+    }
+    output
+}
+
+pub(crate) fn append_resume_identity_field(output: &mut Vec<u8>, value: &[u8]) {
+    output.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    output.extend_from_slice(value);
+}
+
+pub(crate) fn standard_range_resume_identity(task: &TransferTask) -> Vec<u8> {
+    let mut headers = task.headers().clone();
+    let accept = task
+        .breakpoint_download_http()
+        .map(|config| config.range_accept.as_str())
+        .unwrap_or(DEFAULT_RANGE_ACCEPT);
+    insert_header(&mut headers, "Accept", accept);
+    canonical_resume_headers(headers)
+}
+
 /// Default range download protocol.
 ///
 /// It sets `Range` and `Accept` headers and reads total size from
@@ -323,6 +361,10 @@ pub(crate) fn insert_header(map: &mut HeaderMap, name: &str, value: &str) {
 pub struct StandardRangeDownload;
 
 impl BreakpointDownload for StandardRangeDownload {
+    fn resume_identity(&self, task: &TransferTask) -> Result<Option<Vec<u8>>, MeowError> {
+        Ok(Some(standard_range_resume_identity(task)))
+    }
+
     fn supports_parallel_parts(&self) -> bool {
         true
     }
@@ -343,5 +385,59 @@ mod tests {
     fn standard_range_download_supports_parallel_parts() {
         use crate::download_trait::BreakpointDownload;
         assert!(StandardRangeDownload.supports_parallel_parts());
+    }
+
+    #[tokio::test]
+    async fn resume_identity_is_explicit_and_fail_closed_for_custom_protocols() {
+        use std::sync::Arc;
+
+        use crate::down_pounce_builder::DownloadPounceBuilder;
+        use crate::download_trait::BreakpointDownload;
+        use crate::inner::inner_task::InnerTask;
+        use crate::transfer_task::TransferTask;
+
+        struct CustomDownload;
+        impl BreakpointDownload for CustomDownload {}
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::ACCEPT_LANGUAGE,
+            reqwest::header::HeaderValue::from_static("en-US"),
+        );
+        let path = std::env::temp_dir().join(format!(
+            "rusty-cat-resume-context-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let pounce = DownloadPounceBuilder::new(
+            "resume-context.bin",
+            path,
+            1024,
+            "https://example.invalid/resume-context.bin",
+        )
+        .with_headers(headers)
+        .build();
+        let inner = InnerTask::from_pounce(
+            pounce,
+            super::BreakpointDownloadHttpConfig::default(),
+            None,
+            Arc::new(DefaultStyleUpload::default()),
+            Arc::new(StandardRangeDownload),
+        )
+        .await
+        .expect("download task fixture");
+        let task = TransferTask::from_inner(&inner);
+
+        assert!(StandardRangeDownload
+            .resume_identity(&task)
+            .expect("standard resume context")
+            .is_some());
+        assert!(CustomDownload
+            .resume_identity(&task)
+            .expect("custom default")
+            .is_none());
     }
 }

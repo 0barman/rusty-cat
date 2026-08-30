@@ -25,13 +25,81 @@ restart recovery.
 | Item | Value |
 |---|---|
 | Crate | `rusty-cat` |
-| Version | `0.2.4` |
+| Version | `0.3.6` |
 | Rust edition | 2021 |
+| MSRV | Rust 1.89 stable |
 | Runtime | Tokio-based async runtime hosted by an internal scheduler thread |
 | HTTP stack | `reqwest` with `rustls-tls` |
-| Platforms | Linux, macOS, and Windows targets supported by stable Rust, Tokio, and reqwest |
+| Platforms | Release targets are native Linux, macOS, and Windows; Android and iOS remain compile-gated and experimental at runtime. See the verification boundary below. |
 | License | MIT |
 | Repository | <https://github.com/0barman/rusty-cat> |
+
+See the [0.3.6 release notes](docs/release-0.3.6.md) for the Windows stable-Rust
+compatibility fix and the local-file consistency changes.
+
+### Platform support levels
+
+| Support level | Targets | Required release gate and boundary |
+|---|---|---|
+| Native release gate | GitHub-hosted Linux, macOS, and Windows x64 MSVC | Before publication, core library tests must run on Rust 1.89 and current stable, and applicable native file-locking, rename, hardlink, and process-exit cases must pass. |
+| Compile gate; runtime experimental | `aarch64-linux-android`, `aarch64-apple-ios` | Before publication, the library must cross-compile. Simulator/device filesystem behavior, including rename, sync, locking, and crash recovery, is not yet a release-tested guarantee. |
+| Best effort | Other Rust target triples, filesystems, and architectures | No release gate. Support depends on Rust, Tokio, reqwest, `fs2`, and the target filesystem; validate in the deployment environment before relying on resumability. |
+
+These rows define publication gates, not evidence that a particular checkout
+has already passed them. Native Windows and mobile-target results must be linked
+from the release CI before `0.3.6` is published; local cross-compilation is not a
+substitute for those results.
+
+`rust-version = "1.89"` is part of the package manifest. Consumers do not need
+nightly Rust on Windows.
+
+### Local-file identity, locking, and checkpoint boundaries
+
+`rusty-cat` treats byte content, not a platform-specific inode or Windows file
+ID, as the correctness identity of a transfer. If the platform and filesystem
+permit a path replacement while a transfer is active, identical replacement
+bytes can pass content validation; a same-length replacement or rewrite with
+different bytes is rejected before successful completion. File metadata can be
+used as a fast change signal, but is never sufficient proof that content is
+unchanged.
+
+Windows deliberately opens an active download target without delete sharing.
+Consequently, deleting, renaming, or replacing that target path is rejected by
+Windows while the transfer owns the handle, even when the proposed replacement
+has identical content. This is a safety constraint, not physical-file identity
+checking. Once the task reaches a terminal state and releases the handle, the
+path can be replaced normally. Other platforms may permit an active rename; the
+final visible-path digest checks still reject different content.
+
+For file-backed uploads, the protocol MD5 and SHA-256 content snapshot are
+computed in one initial scan. Actual part reads are checked against the
+snapshot's SHA-256 blocks, and the source is content-validated again before
+completion. For downloads, serial and parallel modes record SHA-256 part
+digests in an adjacent private `.rusty-cat/<sha256-of-file-name>.rcdl`
+namespace; completed ranges are revalidated through the visible path before
+`Complete` and before the sidecar is removed. The former `<target>.rcdl`
+location is never read, overwritten, migrated, or deleted because it may be an
+ordinary user file. A checkpoint is
+reusable across processes only when it is bound to the same semantic resource,
+total and chunk grid, and a freshly observed strong ETag, and its stored local
+part digests still match. Without that generation-bound sidecar proof, existing
+local bytes are not inferred to be valid from length and are downloaded again
+from byte zero.
+
+Downloads acquire both a normalized path lease and an exclusive lock on the
+actual target file. Every transfer write uses that same locked handle, so
+cooperating processes and hardlink aliases contend on the underlying file. The
+lock is advisory on platforms/filesystems with advisory locking: it is not a
+security boundary against software that ignores locks, and filesystems that do
+not implement the required locking semantics are not guaranteed.
+
+Checkpoint publication follows this order: sync target data, write and sync a
+new exclusively-created sidecar temporary file, close it, then rename it over
+the sidecar (with a parent-directory sync on Unix). Recovery trusts only a
+complete, valid old or new snapshot; an uncommitted part may be downloaded
+again. This is a logical integrity guarantee, not a promise equivalent to
+Windows write-through rename or universal power-loss durability across every
+filesystem, storage device, or network mount.
 
 ### Badge Markdown
 
@@ -73,12 +141,12 @@ The Crates.io, Docs.rs, and License badge Markdown is shown below. These badges 
 | Chunk failure retry | Yes | `with_max_chunk_retries(...)` on upload and download builders controls additional retries after the first failed chunk transfer. |
 | Upload prepare retry | Yes | `UploadPounceBuilder::with_max_upload_prepare_retries(...)` controls additional retries after the first failed upload preparation attempt. |
 | Intra-file parallel parts | Opt-in | `UploadPounceBuilder::with_max_parts_in_flight(n)` uploads up to `n` chunks of one file concurrently. Default `1` (serial). Honored only for out-of-order-safe upload protocols — all four provider protocols (Aliyun OSS direct & presigned multipart, Azure Blob direct & SAS block blob); the built-in default HTTP upload stays serial. Progress, resume, pause, and cancel still observe a single contiguous prefix. See [Concurrent chunked transfer](docs/concurrent-chunk-transfer.md). |
-| Intra-file parallel download | Opt-in | `DownloadPounceBuilder::with_max_parts_in_flight(n)` fetches range chunks concurrently and writes at absolute offsets. The effective window is limited to 256 parts and 512 MiB. Cross-process `.rcdl` reuse requires a fresh strong ETag from HEAD; `with_total_size` skips HEAD and therefore cannot reuse old sidecar bits. See [Concurrent chunk transfer](docs/concurrent-chunk-transfer.md). |
+| Intra-file parallel download | Opt-in | `DownloadPounceBuilder::with_max_parts_in_flight(n)` fetches range chunks concurrently and writes at absolute offsets. The effective window is limited to 256 parts and a client-wide 512 MiB budget on 64-bit targets (64 MiB on 32-bit). Cross-process `.rcdl` reuse requires a fresh strong ETag from HEAD; `with_total_size` skips HEAD and therefore cannot reuse old sidecar bits. See [Concurrent chunk transfer](docs/concurrent-chunk-transfer.md). |
 | Transport-aware retry & backoff | Yes | Chunk retry covers transport failures plus HTTP 408, 429, and 5xx. Prepare outer retry covers connection-layer errors only. |
-| Disk-full & local-file-removed detection | Yes | Local I/O failures are classified into dedicated error codes `DiskFull` and `LocalFileRemoved`, so callers can react specifically instead of treating every I/O error the same. |
+| Disk-full & local-content-change detection | Yes | Local I/O and identity failures are classified as `DiskFull`, `LocalFileRemoved`, or `ChecksumMismatch`, so callers can distinguish capacity, path, and byte-content failures. |
 | Pause/resume/cancel | Yes | Use `pause(...)`, `resume(...)`, and `cancel(...)` with the returned `TaskId`. |
 | Paused import / selective restore | Yes | `try_enqueue_paused(...)` imports a task in the paused state with no network/file I/O; resume only the user-selected subset on restart. |
-| Resume after process restart / crash | Protocol-dependent | Serial downloads use file length, validated concurrent downloads use `.rcdl`, default uploads use server `nextByte`, and presigned uploads use reconciled re-injected parts. Direct OSS/Azure upload sessions cannot currently be injected into a new task. See [Resume after restart](docs/resume-after-restart.md). |
+| Resume after process restart / crash | Protocol-dependent | Serial and concurrent downloads use digest-backed `.rcdl` state; an untrusted legacy partial file without a matching sidecar restarts at byte zero. Cross-process part reuse requires a freshly observed strong ETag. Default uploads use server `nextByte`, and presigned uploads use reconciled re-injected parts. Direct OSS/Azure upload sessions cannot currently be injected into a new task. See [Resume after restart](docs/resume-after-restart.md). |
 | Presigned multipart resume across restart | Yes | `PresignedMultipartUpload::with_resumed_parts(...)` re-injects parts persisted by a previous run; `prepare` resumes past the longest verified contiguous prefix and re-sends the rest. |
 | Provider multipart session id surfacing | Yes | `UploadResumeInfo::provider_upload_id` and `AliOssDirectUpload::current_upload_id()` expose the provider `UploadId` (not a secret) so orphaned multipart sessions can be aborted out of band. |
 | Upload abort on cancel | Protocol-dependent | Cancel invokes `abort_upload`, but its effect varies: some protocols clean remote state, Azure direct deletes the target blob, and presigned plans without `abort_request` are a no-op. |
@@ -107,7 +175,7 @@ Add the crate:
 
 ```toml
 [dependencies]
-rusty-cat = "0.2.4"
+rusty-cat = "0.3.6"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -115,7 +183,7 @@ For OSS providers, enable only what you need. Keeping the feature list small red
 
 ```toml
 [dependencies]
-rusty-cat = { version = "0.2.4", features = ["aliyun-oss-direct"] }
+rusty-cat = { version = "0.3.6", features = ["aliyun-oss-direct"] }
 ```
 
 | Feature | Purpose |
@@ -128,7 +196,7 @@ rusty-cat = { version = "0.2.4", features = ["aliyun-oss-direct"] }
 | `aliyun-oss` | Convenience umbrella that currently enables `aliyun-oss-presigned` only. It does **not** pull in `aliyun-oss-direct`. |
 | `azure-blob` | Convenience umbrella that currently enables `azure-blob-sas` only. It does **not** pull in `azure-blob-direct`. |
 | `oss-providers` | Both umbrellas together: `aliyun-oss` + `azure-blob` (Aliyun OSS presigned + Azure Blob SAS). It does not enable the direct/AccessKey/Shared Key features. |
-| `all` | Enables all four provider features (`aliyun-oss-direct`, `aliyun-oss-presigned`, `azure-blob-direct`, `azure-blob-sas`). Use it for examples, not minimal production builds. |
+| `all` | Enables all four provider features (`aliyun-oss-direct`, `aliyun-oss-presigned`, `azure-blob-direct`, `azure-blob-sas`). Use it for broad integration testing, not minimal production builds. |
 
 The `aliyun-oss`, `azure-blob`, and `oss-providers` umbrellas intentionally select the **presigned/SAS** flows, because those are the recommended model for untrusted clients (your backend holds the credentials). When you need the direct AccessKey/Shared Key flows, enable `aliyun-oss-direct` and/or `azure-blob-direct` explicitly.
 
@@ -224,7 +292,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 | `resume(task_id).await` | Continue a paused task. | Keeps the same `TaskId` and asks the scheduler to continue from available local/remote progress. |
 | `cancel(task_id).await` | Stop a task. | Cancellation is best-effort and may run provider cleanup such as aborting a multipart session. Treat canceled tasks as terminal unless your application deliberately creates a new task. |
 | `snapshot().await` | Inspect queued and active groups. | Useful for dashboards, health checks, and debugging scheduler behavior under concurrency. |
-| `close().await` | Shut down. | Mandatory for clean shutdown: cancels in-flight work, flushes `Paused` events, drains callbacks, and joins the scheduler thread. Await intended work first; see [Task lifecycle](docs/task-lifecycle.md). |
+| `close().await` | Shut down. | Mandatory for clean shutdown: cancels in-flight work, flushes `Paused` events, drains callbacks, and joins the scheduler thread. Calling it synchronously from a transfer callback fails with `InvalidTaskState`; return and schedule close elsewhere. Await intended work first; see [Task lifecycle](docs/task-lifecycle.md). |
 | `is_closed()` | Check whether the client is closed. | A successfully closed client cannot be reopened; create a new `MeowClient` if you need to submit more work. |
 
 There is no public `enqueue(...)` method in the current API. Use `try_enqueue(...)`; the name is intentional because enqueue uses fail-fast backpressure. If your application submits many tasks at once, increase `command_queue_capacity` or retry `CommandSendFailed` with your own backoff policy.
@@ -275,7 +343,7 @@ Start with `MeowConfig::default()` for a safe baseline or use `MeowConfig::build
 | `with_breakpoint_upload(upload)` | Optional | Sets a per-task custom `BreakpointUpload`, such as Aliyun/Azure direct or presigned upload. See [Custom protocols](docs/custom-protocols.md). |
 | `with_max_chunk_retries(retries)` | Optional | Sets additional retries after the first failed chunk attempt. `0` disables chunk retry. Default is `3`. |
 | `with_max_upload_prepare_retries(retries)` | Optional | Sets additional retries after the first failed upload prepare attempt. Default is `3`. |
-| `with_max_parts_in_flight(n)` | Optional | Maximum chunks of this file uploaded concurrently. Default `1`; `0` normalizes to `1`. The protocol must opt into out-of-order safety. Effective runs are limited to 256 part tasks and a 512 MiB window. See [Concurrent chunk transfer](docs/concurrent-chunk-transfer.md). |
+| `with_max_parts_in_flight(n)` | Optional | Maximum chunks of this file uploaded concurrently. Default `1`; `0` normalizes to `1`. The protocol must opt into out-of-order safety. Effective runs are limited to 256 part tasks and the shared 512 MiB/64 MiB (64-bit/32-bit) client budget, including upload verification scratch. See [Concurrent chunk transfer](docs/concurrent-chunk-transfer.md). |
 | `build()` | Yes | Reads file metadata for file-backed uploads and returns `PounceTask`; may return `std::io::Error`. |
 
 Beginner tips:
@@ -298,7 +366,7 @@ When you do not attach a provider plugin, uploads use the built-in default proto
 | `with_breakpoint_download(download)` | Optional | Sets a per-task custom `BreakpointDownload`, such as Aliyun/Azure direct or presigned range download. See [Custom protocols](docs/custom-protocols.md). |
 | `with_breakpoint_download_http(config)` | Optional | Overrides per-task range download HTTP behavior. |
 | `with_max_chunk_retries(retries)` | Optional | Sets additional retries after the first failed range chunk attempt. `0` disables chunk retry. Default is `3`. |
-| `with_max_parts_in_flight(n)` | Optional | Maximum range chunks fetched concurrently. Default `1`; `0` normalizes to `1`. The protocol must be range-safe and total size must resolve. Effective runs are limited to 256 part tasks and a 512 MiB window. |
+| `with_max_parts_in_flight(n)` | Optional | Maximum range chunks fetched concurrently. Default `1`; `0` normalizes to `1`. The protocol must be range-safe and total size must resolve. Effective runs are limited to 256 part tasks and the shared 512 MiB/64 MiB (64-bit/32-bit) client budget. |
 | `with_total_size(size)` | Optional | Supplies a known total and skips HEAD. Useful for GET-only URLs, but an old concurrent-download `.rcdl` cannot be authenticated/reused without a fresh strong ETag from HEAD. |
 | `build()` | Yes | Returns `PounceTask`. Validation happens during enqueue/runtime. |
 
@@ -313,19 +381,43 @@ all presigned formats behave alike. The range `Accept` header is overridable per
 task; provider headers can be added through task base headers, which apply to
 HEAD and GET. Do not edit or log the signed query string.
 
-#### Concurrent-download resume semantics (`<file>.rcdl`)
+#### Download resume and content checkpoints (`.rusty-cat/<hash>.rcdl`)
 
-A concurrent download (`with_max_parts_in_flight(n)` with `n > 1`) writes a
-`<file>.rcdl` sidecar next to the pre-sized target. It records durable part bits
-and SHA-256 digests. It survives interruption and is deleted on successful
-completion.
+Serial and concurrent downloads write a losslessly path-derived, SHA-256-named
+sidecar under an adjacent `.rusty-cat` directory. It records durable part bits
+and SHA-256 digests, survives an
+interruption, and is deleted only after successful final content validation.
+Concurrent mode pre-sizes its positioned-write target; serial mode keeps the
+visible length equal to the verified contiguous prefix. A legacy partial file
+without a matching sidecar has no remote-generation proof and is restarted at
+byte zero.
 
-Reuse requires the same target length, total, chunk grid, semantic resource URL,
-and a freshly observed strong ETag; completed parts are re-hashed from disk.
-Authentication-only signed query parameters are ignored in identity, while
-semantic query parameters remain. Changing `max_parts_in_flight` does not
-invalidate compatible parts. `with_total_size` skips HEAD, so it cannot reuse
-an old sidecar across processes.
+Cross-process reuse in either mode requires matching total, chunk grid,
+semantic resource URL, stable effective range-request context, a freshly
+observed strong ETag, and matching local part digests. Authentication-only
+signed query parameters are ignored while semantic selectors remain; all
+binding material is persisted only as one domain-separated SHA-256 digest, not
+as raw URL/header/credential text. Changing `max_parts_in_flight` does not
+invalidate compatible parts. `with_total_size` skips HEAD, so old sidecar bits
+are deliberately not reused; the first 206 may latch a strong ETag for the
+current run but cannot authenticate a checkpoint from an earlier process.
+
+The `.rusty-cat` directory is a reserved SDK checkpoint namespace and contains
+an ownership marker. A file/symlink at that path, or a non-empty unmarked
+directory, fails closed and is left untouched. An empty directory may be
+initialized. Legacy `<file>.rcdl` files are deliberately ignored and left
+unchanged; 0.3.6 starts fresh instead of trying to infer whether such a file is
+old SDK state or user data. Every `.rusty-cat` path component is reserved even
+before an ownership marker exists; a visible target inside it, including
+through a symlink alias, is rejected before it can race a namespace claim or
+overwrite a final/temporary checkpoint.
+
+The same validator rule applies to serial and parallel downloads. If HEAD
+prepared a strong ETag, every 206 must return that same strong ETag. Without a
+prepared validator, a download that needs multiple ranges requires the first
+206 to provide a strong ETag and every later response to match it; missing,
+weak, or changing validators fail closed. A one-range download may complete
+without an ETag because no bytes from different responses can be combined.
 
 For a step-by-step, beginner-friendly walkthrough of concurrent chunked upload **and** download — the two concurrency knobs, the parallel-safe protocol matrix, per-provider recipes, memory sizing, and `.rcdl` resume — see [Concurrent chunked transfer (single-file parallel parts)](docs/concurrent-chunk-transfer.md).
 
@@ -337,6 +429,12 @@ request is independent and the server meets the 206, content-range, identity
 encoding, and strong-ETag contract in the
 [custom protocol](docs/custom-protocols.md) and
 [concurrency](docs/concurrent-chunk-transfer.md) guides.
+
+`resume_identity()` independently defaults to `None`. This is fail-closed:
+custom protocols still validate the current run, but cannot reuse an earlier
+process's sidecar until they return complete, stable representation/principal
+context. Externally injected HTTP clients likewise disable cross-process reuse
+because their hidden default headers cannot be canonicalized.
 
 ## Error handling and retries
 
@@ -351,10 +449,11 @@ The codes you will most often branch on:
 | `107` | `ClientClosed` | The client was closed; create a new `MeowClient` to submit more work. |
 | `108` | `TaskNotFound` | `pause`/`resume`/`cancel` referenced an unknown or already-terminal `TaskId`. |
 | `111` | `CommandSendFailed` | The command queue is full (fail-fast back-pressure). Retry with backoff or raise `command_queue_capacity`. |
+| `116` | `ChecksumMismatch` | Local bytes no longer match the upload content snapshot or a committed download-part digest. |
 | `117` | `InvalidTaskState` | The operation is invalid in the task's current state (for example resuming a task that is not paused). |
 | `120` | `TaskCanceled` | The task was canceled before reaching `Complete`. |
 | `121` | `DiskFull` | The local disk ran out of space while writing a download. |
-| `122` | `LocalFileRemoved` | The local source/target file was removed or replaced mid-transfer. |
+| `122` | `LocalFileRemoved` | The local path disappeared or changed length/type while required by the transfer. A same-length byte-content mismatch is reported as `ChecksumMismatch`; an identical-content replacement can pass where the OS permits it, while Windows rejects active download-target replacement through its sharing mode. |
 | `123` | `BinaryTaskQueueFull` | The bounded binary executor has 1024 accepted tasks. |
 | `124` | `BinaryBodyTooLarge` | A binary response exceeded its configured in-memory limit. |
 
@@ -432,12 +531,35 @@ OSS and Blob workflows are provider-specific, so detailed beginner guides live i
 
 If you are deciding which provider feature to enable first, start with [Provider feature flags: direct vs presigned/SAS](docs/provider-feature-flags.md).
 
-| Guide | Feature flag | Example source |
+| Guide | Feature flag | Runnable test-app coverage |
 |---|---|---|
-| [Aliyun OSS direct upload/download](docs/aliyun-oss-direct.md) | `aliyun-oss-direct` | [examples/aliyun_oss_direct_chunk_transfer.rs](examples/aliyun_oss_direct_chunk_transfer.rs) |
-| [Aliyun OSS presigned upload/download](docs/aliyun-oss-presigned.md) | `aliyun-oss-presigned` | [examples/aliyun_oss_presigned_chunk_transfer.rs](examples/aliyun_oss_presigned_chunk_transfer.rs) |
-| [Azure Blob direct upload/download](docs/azure-blob-direct.md) | `azure-blob-direct` | [examples/azure_blob_direct_chunk_transfer.rs](examples/azure_blob_direct_chunk_transfer.rs) |
-| [Azure Blob SAS upload/download](docs/azure-blob-sas.md) | `azure-blob-sas` | [examples/azure_blob_sas_chunk_transfer.rs](examples/azure_blob_sas_chunk_transfer.rs) |
+| [Aliyun OSS direct upload/download](docs/aliyun-oss-direct.md) | `aliyun-oss-direct` | [`aliyun-direct`](../test-app/README.md#provider-direct-场景) uses the official SDK provider with dedicated live-test configuration. |
+| [Aliyun OSS presigned upload/download](docs/aliyun-oss-presigned.md) | `aliyun-oss-presigned` | [`aliyun-presigned`](../test-app/src/download/aliyun_presigned.rs) currently covers signed range download. |
+| [Azure Blob direct upload/download](docs/azure-blob-direct.md) | `azure-blob-direct` | [`azure-direct`](../test-app/README.md#provider-direct-场景) uses the official SDK provider with dedicated live-test configuration. |
+| [Azure Blob SAS upload/download](docs/azure-blob-sas.md) | `azure-blob-sas` | [`loonadm`](../test-app/src/main.rs) exercises backend-issued presigned/SAS upload and download paths. |
+
+To override the dedicated Aliyun live-test configuration, set `RC_ALIYUN_BUCKET`,
+`RC_ALIYUN_ACCESS_KEY_ID`, and `RC_ALIYUN_ACCESS_KEY_SECRET`. Optional settings
+are `RC_ALIYUN_REGION`, `RC_ALIYUN_OBJECT_PREFIX`, `RC_DIRECT_UPLOAD_SIZE`,
+`RC_DIRECT_PART_SIZE`, and `RC_OUT_DIR`:
+
+```text
+cargo run --manifest-path test-app/Cargo.toml -- aliyun-direct
+```
+
+To override the dedicated Azure live-test configuration, set `RC_AZURE_ACCOUNT_NAME`,
+`RC_AZURE_ACCOUNT_KEY`, and `RC_AZURE_CONTAINER`. Optional settings are
+`RC_AZURE_BLOB_PREFIX`, `RC_DIRECT_UPLOAD_SIZE`, `RC_DIRECT_PART_SIZE`, and
+`RC_OUT_DIR`:
+
+```text
+cargo run --manifest-path test-app/Cargo.toml -- azure-direct
+```
+
+Both scenarios use the official SDK provider implementations and support
+environment overrides for isolated live-test configuration. The former
+hand-written signers were not migrated into test-app. Do not reuse test-app
+configuration or artifacts in a production client.
 
 ## Persistence and custom database integration
 
@@ -468,8 +590,8 @@ This is the entry point for "restore on restart, then let the user choose what t
 2. Import each one with `try_enqueue_paused(...)` and keep the returned `TaskId`.
 3. Render your task list from your own persisted progress. The `Paused` record reports `0.0` progress because no `prepare` has run yet, so the SDK does not know the real offset until the task is resumed.
 4. When the user selects transfers, call `resume(task_id)`; the rest stay paused.
-   The real checkpoint is protocol-specific (serial file length, validated
-   `.rcdl`, server `nextByte`, or reconciled presigned parts).
+   The real checkpoint is protocol-specific (digest-validated download `.rcdl`,
+   server `nextByte`, or reconciled presigned parts).
 
 ```rust,no_run
 use rusty_cat::api::{DownloadPounceBuilder, MeowClient, MeowConfig};
@@ -495,21 +617,40 @@ async fn restore_and_start(client: &MeowClient) -> Result<(), rusty_cat::api::Me
 }
 ```
 
-See [examples/restore_import_paused.rs](examples/restore_import_paused.rs) for a complete, runnable demonstration that imports several tasks paused and resumes only a selected subset.
+Run the [`restore-paused`](../test-app/src/scenarios/local.rs) test-app scenario for a complete demonstration that imports several tasks paused and resumes only a selected subset:
 
-## Examples
+```text
+cargo run --manifest-path test-app/Cargo.toml -- restore-paused
+```
 
-| Example | What it demonstrates |
+## Runnable test-app scenarios
+
+All runnable transfer demonstrations live in [`test-app`](../test-app/README.md). Run these commands from the repository root.
+
+For the complete evidence-based inventory and dated results, see the [test scenario and verification matrix](docs/test-scenarios.md) ([简体中文](docs/test-scenarios.zh-CN.md)).
+
+| Scenario | What it demonstrates |
 |---|---|
-| [examples/http_local_chunk_transfer.rs](examples/http_local_chunk_transfer.rs) | Local plain HTTP range download and custom binary upload protocol. |
-| [examples/restore_import_paused.rs](examples/restore_import_paused.rs) | Paused import + selective resume (restart/restore) against a local range server. |
-| [examples/resume_after_restart.rs](examples/resume_after_restart.rs) | Resume a download from a partial file left by a previous (killed) run. |
-| [examples/aliyun_oss_direct_chunk_transfer.rs](examples/aliyun_oss_direct_chunk_transfer.rs) | Aliyun OSS direct upload/download with AccessKey signing. |
-| [examples/aliyun_oss_direct_custom_chunk_transfer.rs](examples/aliyun_oss_direct_custom_chunk_transfer.rs) | Aliyun OSS direct custom chunk transfer. |
-| [examples/aliyun_oss_presigned_chunk_transfer.rs](examples/aliyun_oss_presigned_chunk_transfer.rs) | Aliyun OSS presigned multipart upload and range download. |
-| [examples/azure_blob_direct_chunk_transfer.rs](examples/azure_blob_direct_chunk_transfer.rs) | Azure Blob direct upload/download with Shared Key. |
-| [examples/azure_blob_direct_custom_chunk_transfer.rs](examples/azure_blob_direct_custom_chunk_transfer.rs) | Azure Blob direct custom chunk transfer. |
-| [examples/azure_blob_sas_chunk_transfer.rs](examples/azure_blob_sas_chunk_transfer.rs) | Azure Blob upload/download with SAS URLs. |
+| [`loonadm`](../test-app/src/main.rs) | Backend login, multipart upload/complete, provider downloads, metrics, and consistency checks. |
+| [`direct-download`](../test-app/src/download/direct.rs) | Range-download a supplied URL with configurable concurrency and optional size/MD5 checks. |
+| [`otacdn-x86-64`](../test-app/src/scenarios/otacdn_x86_64.rs) | Live CDN pause/resume with fixed size and release-digest verification. |
+| [`azure-download`](../test-app/src/download/oss_azure.rs) | Read-authorized Azure Range download with four in-flight parts and size verification. |
+| [`azure-sas-roundtrip`](../test-app/src/scenarios/azure_sas.rs) | Put Block/Block List upload followed by parallel Range readback and SHA-256 verification. |
+| [`aliyun-presigned`](../test-app/src/download/aliyun_presigned.rs) | Aliyun OSS V4 presigned range download with expiry and size validation. |
+| [`aliyun-direct`](../test-app/README.md#provider-direct-场景) | Official Aliyun OSS direct-provider upload/download using dedicated live-test configuration. |
+| [`aliyun-prepare-files`](../test-app/src/scenarios/aliyun_upload_matrix.rs) | Generate deterministic zero-byte and chunk-boundary fixtures without accessing a cloud service. |
+| [`aliyun-upload-matrix`](../test-app/src/scenarios/aliyun_upload_matrix.rs) | Run direct and presigned upload/readback across boundary-sized fixtures. |
+| [`azure-direct`](../test-app/README.md#provider-direct-场景) | Official Azure Blob direct-provider upload/download using dedicated live-test configuration. |
+| [`local-http`](../test-app/src/scenarios/local.rs) | Local HTTP upload/download pause-resume and byte-exact verification. |
+| [`resume-restart`](../test-app/src/scenarios/local.rs) | Restart after an injected range failure, reuse the validated checkpoint, and fetch only the missing part. |
+| [`restore-paused`](../test-app/src/scenarios/local.rs) | Paused import with zero initial I/O and selective resume. |
+| [`local-all`](../test-app/src/scenarios/local.rs) | Run all three deterministic local scenarios in sequence. |
+
+For example:
+
+```text
+cargo run --manifest-path test-app/Cargo.toml -- local-all
+```
 
 ## Shutdown checklist
 

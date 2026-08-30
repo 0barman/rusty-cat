@@ -18,7 +18,6 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
 const MAX_PARALLEL_PART_TASKS: u128 = 256;
-const MAX_PARALLEL_WINDOW_BYTES: u128 = 512 * 1024 * 1024;
 
 /// Releases the lazily opened upload descriptor on every run-group exit path
 /// (success, failure, cancel and pause). Part tasks are drained before the
@@ -41,6 +40,9 @@ fn validate_parallel_part_window(
     max_parts_in_flight: usize,
     chunk_size: u64,
     remaining_bytes: u64,
+    body_buffer_copies: u64,
+    verification_scratch_bytes: u64,
+    memory_limit_bytes: u64,
 ) -> Result<(), MeowError> {
     if remaining_bytes == 0 {
         return Ok(());
@@ -64,22 +66,68 @@ fn validate_parallel_part_window(
             ),
         ));
     }
-    let max_part_bytes = remaining_bytes.min(chunk_size) as u128;
-    let budget = effective_parts.checked_mul(max_part_bytes).ok_or_else(|| {
+    let body_budget = effective_parts
+        .checked_mul(chunk_size as u128)
+        .map(|bytes| bytes.min(remaining_bytes as u128))
+        .ok_or_else(|| {
+            MeowError::from_code_str(
+                InnerErrorCode::IoError,
+                "parallel part body budget overflow",
+            )
+        })?;
+    let body_budget = body_budget
+        .checked_mul(body_buffer_copies.max(1) as u128)
+        .ok_or_else(|| {
+            MeowError::from_code_str(
+                InnerErrorCode::IoError,
+                "parallel part body-buffer budget overflow",
+            )
+        })?;
+    let scratch_budget = effective_parts
+        .checked_mul(verification_scratch_bytes as u128)
+        .ok_or_else(|| {
+            MeowError::from_code_str(
+                InnerErrorCode::IoError,
+                "parallel verification scratch budget overflow",
+            )
+        })?;
+    let budget = body_budget.checked_add(scratch_budget).ok_or_else(|| {
         MeowError::from_code_str(
             InnerErrorCode::IoError,
             "parallel part window size overflow",
         )
     })?;
-    if budget > MAX_PARALLEL_WINDOW_BYTES {
+    if budget > memory_limit_bytes as u128 {
         return Err(MeowError::from_code(
             InnerErrorCode::IoError,
             format!(
-                "parallel part window exceeds memory limit: requested={budget} limit={MAX_PARALLEL_WINDOW_BYTES}"
+                "parallel part window exceeds memory limit: requested={budget} limit={memory_limit_bytes}"
             ),
         ));
     }
     Ok(())
+}
+
+fn checked_parallel_part_memory_bytes(
+    body_bytes: u64,
+    body_buffer_copies: u64,
+    verification_scratch_bytes: u64,
+) -> Result<u64, MeowError> {
+    body_bytes
+        .checked_mul(body_buffer_copies.max(1))
+        .ok_or_else(|| {
+            MeowError::from_code_str(
+                InnerErrorCode::IoError,
+                "parallel part body-buffer size overflow",
+            )
+        })?
+        .checked_add(verification_scratch_bytes)
+        .ok_or_else(|| {
+            MeowError::from_code_str(
+                InnerErrorCode::IoError,
+                "parallel part body plus verification scratch overflow",
+            )
+        })
 }
 
 pub(crate) async fn try_start_next(
@@ -175,6 +223,7 @@ pub(crate) async fn try_start_next(
 
             let worker_tx_clone = worker_tx.clone();
             let executor = executor.clone();
+            let parallel_memory_budget = state.parallel_memory_budget().clone();
             let start_offset = state.offsets().get(&key).copied().unwrap_or(0);
             crate::meow_key_log!(
                 "scheduler",
@@ -184,13 +233,42 @@ pub(crate) async fn try_start_next(
                 inner.chunk_size()
             );
             tokio::spawn(async move {
+                let panic_task = TransferTask::from_inner(&inner);
+                let panic_executor = Arc::clone(&executor);
                 let panic_key = key.clone();
                 let panic_tx = worker_tx_clone.clone();
                 let panic_total = inner.total_size();
                 let worker = tokio::spawn(async move {
-                    run_group(key, inner, cancel, worker_tx_clone, executor, start_offset).await;
+                    run_group(
+                        key,
+                        inner,
+                        cancel,
+                        worker_tx_clone,
+                        executor,
+                        start_offset,
+                        parallel_memory_budget,
+                    )
+                    .await;
                 });
                 if let Err(join_err) = worker.await {
+                    // The joined task has fully unwound, so every request and
+                    // child guard is quiescent. Perform the same terminal
+                    // cleanup as ordinary failures before exposing Failed to
+                    // the scheduler or user callbacks.
+                    if panic_task.direction() == Direction::Download {
+                        if let Err(cleanup_error) = settle_failed_download_target(&panic_task).await
+                        {
+                            crate::meow_warn_log!(
+                                "run_group",
+                                "download cleanup after run_group panic failed: {}",
+                                crate::log::redact_secrets(&cleanup_error.to_string())
+                            );
+                        }
+                    } else {
+                        panic_task.require_upload_abort();
+                        settle_required_upload_abort(&panic_task, &panic_executor, &panic_key)
+                            .await;
+                    }
                     let err = MeowError::from_code(
                         InnerErrorCode::Unknown,
                         format!("run_group task panicked: {}", join_err),
@@ -250,6 +328,7 @@ async fn run_group(
     worker_tx: mpsc::Sender<WorkerEvent>,
     executor: Arc<dyn TransferTrait>,
     start_offset: u64,
+    parallel_memory_budget: crate::inner::exec_impl::memory_budget::ParallelMemoryBudget,
 ) {
     crate::meow_key_log!(
         "run_group",
@@ -260,10 +339,11 @@ async fn run_group(
     );
     let task = TransferTask::from_inner(&inner);
     let _upload_file_handle_release = UploadFileHandleRelease(task.upload_file_snapshot().cloned());
-    // 上传 `prepare` 已在 `DefaultHttpTransfer::upload_prepare` 内按 `max_upload_prepare_retries` 重试；
-    // 此处仅对下载 `prepare`（HEAD 等）做外层连接级重试，避免与上传语义叠加或改写错误码。
+    // All prepare retries live here so their backoff can observe the worker's
+    // pause/cancel/close token. Upload keeps its public retry budget and HTTP
+    // status policy; download keeps the narrower connection-only policy.
     let max_prep_retries = match inner.direction() {
-        Direction::Upload => 0,
+        Direction::Upload => task.max_upload_prepare_retries(),
         Direction::Download => inner.max_chunk_retries(),
     };
     let mut prep_attempt: u32 = 0;
@@ -272,28 +352,47 @@ async fn run_group(
         total_size: prep_total,
     } = loop {
         if cancel.is_cancelled() {
-            let _ = worker_tx
-                .send(WorkerEvent::Canceled {
-                    key: key.clone(),
-                    total_size: inner.total_size(),
-                })
-                .await;
+            emit_canceled_after_quiescent_cleanup(
+                &task,
+                &worker_tx,
+                key.clone(),
+                inner.total_size(),
+            )
+            .await;
             return;
         }
         match executor.prepare(&task, start_offset).await {
             Ok(v) => break v,
             Err(e) => {
-                if cancel.is_cancelled() {
-                    let _ = worker_tx
-                        .send(WorkerEvent::Canceled {
-                            key: key.clone(),
-                            total_size: inner.total_size(),
-                        })
-                        .await;
+                // An interrupted request may naturally return HttpError or
+                // TaskCanceled; only those errors may be translated into the
+                // control-plane Canceled outcome. A local integrity failure
+                // must remain Failed even when pause/cancel races it, otherwise
+                // its required provider abort can be lost and a later resume
+                // may upload a different source generation.
+                let cancellation_related =
+                    crate::inner::exec_impl::retry::cancellation_can_mask(&e);
+                if cancel.is_cancelled() && cancellation_related && !task.upload_abort_required() {
+                    emit_canceled_after_quiescent_cleanup(
+                        &task,
+                        &worker_tx,
+                        key.clone(),
+                        inner.total_size(),
+                    )
+                    .await;
                     return;
                 }
-                let retryable = matches!(inner.direction(), Direction::Download)
-                    && crate::inner::exec_impl::retry::is_connection_layer_retryable(&e);
+                let force_failure = task.upload_abort_required()
+                    || (cancel.is_cancelled() && !cancellation_related);
+                let retryable = !force_failure
+                    && match inner.direction() {
+                        Direction::Upload => {
+                            crate::inner::exec_impl::retry::is_transport_retryable(&e)
+                        }
+                        Direction::Download => {
+                            crate::inner::exec_impl::retry::is_connection_layer_retryable(&e)
+                        }
+                    };
                 let reached_limit = prep_attempt >= max_prep_retries;
                 if !retryable || reached_limit {
                     crate::log::emit_lazy(|| {
@@ -315,6 +414,17 @@ async fn run_group(
                         }
                         log
                     });
+                    if task.direction() == Direction::Download {
+                        if let Err(cleanup_error) = settle_failed_download_target(&task).await {
+                            crate::meow_warn_log!(
+                                "run_group",
+                                "download cleanup after prepare failure also failed: {}",
+                                crate::log::redact_secrets(&cleanup_error.to_string())
+                            );
+                        }
+                    } else {
+                        settle_required_upload_abort(&task, &executor, &key).await;
+                    }
                     let _ = worker_tx
                         .send(WorkerEvent::Failed {
                             key,
@@ -337,12 +447,13 @@ async fn run_group(
                 );
                 tokio::select! {
                     _ = cancel.cancelled() => {
-                        let _ = worker_tx
-                            .send(WorkerEvent::Canceled {
-                                key: key.clone(),
-                                total_size: inner.total_size(),
-                            })
-                            .await;
+                        emit_canceled_after_quiescent_cleanup(
+                            &task,
+                            &worker_tx,
+                            key.clone(),
+                            inner.total_size(),
+                        )
+                        .await;
                         return;
                     }
                     _ = sleep(Duration::from_millis(delay_ms)) => {}
@@ -373,11 +484,42 @@ async fn run_group(
     // the file; when the size is unknown (0), fall back to the serial loop.
     if inner.max_parts_in_flight() > 1 && known_total > 0 && executor.supports_parallel_parts(&task)
     {
+        let verification_scratch_bytes = task
+            .upload_file_snapshot()
+            .map(UploadFileSnapshot::verification_scratch_bytes)
+            .unwrap_or(0);
+        // `resp.chunk()` owns a Bytes frame while the concurrent download path
+        // copies that frame into its preallocated full-part Vec. Charge both
+        // explicit buffers. Uploads own one body plus their verification
+        // scratch buffer.
+        let body_buffer_copies = if task.direction() == Direction::Download {
+            2
+        } else {
+            1
+        };
         if let Err(error) = validate_parallel_part_window(
             inner.max_parts_in_flight(),
             inner.chunk_size(),
             known_total.saturating_sub(offset),
+            body_buffer_copies,
+            verification_scratch_bytes,
+            parallel_memory_budget.limit_bytes(),
         ) {
+            if task.direction() == Direction::Download {
+                if let Err(cleanup_error) = settle_failed_download_target(&task).await {
+                    crate::meow_warn_log!(
+                        "run_group",
+                        "download cleanup after invalid part window also failed: {}",
+                        crate::log::redact_secrets(&cleanup_error.to_string())
+                    );
+                }
+            } else {
+                // Upload prepare may already have created a multipart session.
+                // A local parallel-window rejection must tear it down even
+                // though no part task was spawned.
+                task.require_upload_abort();
+                settle_required_upload_abort(&task, &executor, &key).await;
+            }
             let _ = worker_tx
                 .send(WorkerEvent::Failed {
                     key,
@@ -396,10 +538,12 @@ async fn run_group(
             &executor,
             offset,
             known_total,
+            &parallel_memory_budget,
         )
         .await;
         return;
     }
+    let mut terminal_claimed = false;
     loop {
         if cancel.is_cancelled() {
             crate::meow_key_log!(
@@ -409,13 +553,25 @@ async fn run_group(
                 inner.task_id(),
                 offset
             );
-            let _ = worker_tx
-                .send(WorkerEvent::Canceled {
-                    key,
-                    total_size: known_total,
-                })
-                .await;
+            emit_canceled_after_quiescent_cleanup(&task, &worker_tx, key, known_total).await;
             return;
+        }
+        // A serial protocol may finalize the upload or validate/delete the
+        // download sidecar inside its last chunk request. Claim the terminal
+        // boundary before starting that request so scheduler pause/cancel has a
+        // deterministic winner and can never be reported as accepted too late.
+        let is_terminal_chunk = (known_total > 0
+            && offset
+                .checked_add(inner.chunk_size())
+                .map(|end| end >= known_total)
+                .unwrap_or(true))
+            || (task.direction() == Direction::Upload && inner.total_size() == 0);
+        if is_terminal_chunk && !terminal_claimed {
+            if !task.begin_terminal_completion() {
+                emit_canceled_after_quiescent_cleanup(&task, &worker_tx, key, known_total).await;
+                return;
+            }
+            terminal_claimed = true;
         }
         // 分片传输通过独立 retry 模块执行：
         // - 将重试判定、退避计算、取消协作都封装在模块内；
@@ -442,15 +598,20 @@ async fn run_group(
                     inner.task_id(),
                     offset
                 );
-                let _ = worker_tx
-                    .send(WorkerEvent::Canceled {
-                        key,
-                        total_size: known_total,
-                    })
-                    .await;
+                emit_canceled_after_quiescent_cleanup(&task, &worker_tx, key, known_total).await;
                 return;
             }
             crate::inner::exec_impl::retry::ChunkRetryResult::Failed(e) => {
+                if task.direction() == Direction::Download {
+                    if let Err(cleanup_error) = settle_failed_download_target(&task).await {
+                        crate::meow_warn_log!(
+                            "run_group",
+                            "checkpoint/release while settling failed serial download also failed: {}",
+                            crate::log::redact_secrets(&cleanup_error.to_string())
+                        );
+                    }
+                }
+                settle_required_upload_abort(&task, &executor, &key).await;
                 crate::log::emit_lazy(|| {
                     let mut log = crate::log::Log::error(
                         "run_group",
@@ -492,6 +653,12 @@ async fn run_group(
             })
             .await;
         if outcome.done {
+            // Custom serial executors may legitimately report an early remote
+            // completion (for example server-side deduplication). Preserve that
+            // public contract. A terminal provider acknowledgement is stronger
+            // than a pause/cancel racing this already in-flight request: report
+            // Complete and never abort an object the provider says is complete.
+            task.acknowledge_terminal_completion();
             crate::meow_key_log!(
                 "run_group",
                 "run_group completed: key={} task_id={:?} final_offset={} total={}",
@@ -500,6 +667,18 @@ async fn run_group(
                 offset,
                 known_total
             );
+            if task.direction() == Direction::Download {
+                if let Err(error) = release_terminal_download_target(&task).await {
+                    let _ = worker_tx
+                        .send(WorkerEvent::Failed {
+                            key,
+                            error,
+                            total_size: known_total,
+                        })
+                        .await;
+                    return;
+                }
+            }
             let _ = worker_tx
                 .send(WorkerEvent::Completed {
                     key,
@@ -509,22 +688,17 @@ async fn run_group(
                 .await;
             return;
         }
-    }
-}
-
-#[cfg(test)]
-mod resource_budget_tests {
-    use super::validate_parallel_part_window;
-
-    #[test]
-    fn parallel_window_uses_real_grid_and_rejects_task_or_memory_exhaustion() {
-        validate_parallel_part_window(usize::MAX, 1024 * 1024, 2 * 1024 * 1024)
-            .expect("a huge configured maximum is harmless for a two-part file");
-        assert!(validate_parallel_part_window(257, 1, 257).is_err());
-        assert!(
-            validate_parallel_part_window(3, 256 * 1024 * 1024, 3 * 256 * 1024 * 1024,).is_err()
-        );
-        assert!(validate_parallel_part_window(2, 0, 1).is_err());
+        if terminal_claimed {
+            // A protocol that did not actually finish the predicted last
+            // request must reopen the lifecycle before the next request. A
+            // pause/cancel accepted while the request was in flight is now
+            // applied instead of being lost.
+            if task.finish_incomplete_completion().is_some() {
+                emit_canceled_after_quiescent_cleanup(&task, &worker_tx, key, known_total).await;
+                return;
+            }
+            terminal_claimed = false;
+        }
     }
 }
 
@@ -544,12 +718,69 @@ fn spawn_part(
     chunk_size: u64,
     known_total: u64,
     max_chunk_retries: u32,
+    parallel_memory_budget: &crate::inner::exec_impl::memory_budget::ParallelMemoryBudget,
 ) {
     let executor = executor.clone();
     let task = task.clone();
     let key = key.clone();
     let cancel = cancel.clone();
+    let parallel_memory_budget = parallel_memory_budget.clone();
     set.spawn(async move {
+        let body_bytes = match known_total.checked_sub(offset) {
+            Some(remaining) => remaining.min(chunk_size),
+            None => {
+                let error = MeowError::from_code(
+                    InnerErrorCode::InvalidRange,
+                    format!(
+                        "parallel part offset exceeds total: offset={offset} total={known_total}"
+                    ),
+                );
+                return (
+                    offset,
+                    crate::inner::exec_impl::retry::ChunkRetryResult::Failed(error),
+                );
+            }
+        };
+        let verification_scratch_bytes = task
+            .upload_file_snapshot()
+            .map(UploadFileSnapshot::verification_scratch_bytes)
+            .unwrap_or(0);
+        let body_buffer_copies = if task.direction() == Direction::Download {
+            2
+        } else {
+            1
+        };
+        let required_bytes = match checked_parallel_part_memory_bytes(
+            body_bytes,
+            body_buffer_copies,
+            verification_scratch_bytes,
+        ) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return (
+                    offset,
+                    crate::inner::exec_impl::retry::ChunkRetryResult::Failed(error),
+                );
+            }
+        };
+        let _memory_permit = match parallel_memory_budget
+            .acquire(required_bytes, &cancel)
+            .await
+        {
+            Ok(Some(permit)) => permit,
+            Ok(None) => {
+                return (
+                    offset,
+                    crate::inner::exec_impl::retry::ChunkRetryResult::Cancelled,
+                );
+            }
+            Err(error) => {
+                return (
+                    offset,
+                    crate::inner::exec_impl::retry::ChunkRetryResult::Failed(error),
+                );
+            }
+        };
         let result = crate::inner::exec_impl::retry::transfer_chunk_with_retry(
             &executor,
             &task,
@@ -564,6 +795,64 @@ fn spawn_part(
         .await;
         (offset, result)
     });
+}
+
+async fn release_terminal_download_target(task: &TransferTask) -> Result<(), MeowError> {
+    let file_release = task.release_download_target_file_lock().await;
+    let lease_release = task.release_download_target_lease();
+    file_release.and(lease_release)
+}
+
+async fn settle_failed_download_target(task: &TransferTask) -> Result<(), MeowError> {
+    let checkpoint = task.force_download_checkpoint().await;
+    // Always release the actual-file lock even when the sidecar commit failed;
+    // pending bits remain unpublished and will be fetched again safely.
+    let release = release_terminal_download_target(task).await;
+    checkpoint.and(release)
+}
+
+async fn emit_canceled_after_quiescent_cleanup(
+    task: &TransferTask,
+    worker_tx: &mpsc::Sender<WorkerEvent>,
+    key: UniqueId,
+    total_size: u64,
+) {
+    if task.direction() == Direction::Download {
+        if let Err(error) = settle_failed_download_target(task).await {
+            let _ = worker_tx
+                .send(WorkerEvent::Failed {
+                    key,
+                    error,
+                    total_size,
+                })
+                .await;
+            return;
+        }
+    }
+    let _ = worker_tx
+        .send(WorkerEvent::Canceled { key, total_size })
+        .await;
+}
+
+async fn settle_required_upload_abort(
+    task: &TransferTask,
+    executor: &Arc<dyn TransferTrait>,
+    key: &UniqueId,
+) {
+    if !task.upload_abort_required() {
+        return;
+    }
+    // This helper is called only after the serial request returned or the
+    // parallel JoinSet drained. Provider abort therefore cannot race a sibling
+    // upload_chunk or the final complete call.
+    if let Err(error) = executor.cancel(task).await {
+        crate::meow_warn_log!(
+            "upload_source",
+            "deferred provider abort failed after worker quiesced: key={} err={}",
+            crate::inner::safe_key(key),
+            crate::log::redact_secrets(&error.to_string())
+        );
+    }
 }
 
 /// Windowed concurrent driver for one file's parts (optimization ④, opt-in).
@@ -584,6 +873,7 @@ async fn run_group_parallel(
     executor: &Arc<dyn TransferTrait>,
     start_offset: u64,
     known_total: u64,
+    parallel_memory_budget: &crate::inner::exec_impl::memory_budget::ParallelMemoryBudget,
 ) {
     use crate::inner::exec_impl::part_window::PartWindow;
     use crate::inner::exec_impl::retry::ChunkRetryResult;
@@ -612,17 +902,32 @@ async fn run_group_parallel(
     // emit Completed WITHOUT re-finalizing, preserving the "already-complete
     // upload resume emits Completed without re-running complete" semantics.
     if start_offset >= known_total {
+        if !task.begin_terminal_completion() {
+            emit_canceled_after_quiescent_cleanup(task, worker_tx, key, known_total).await;
+            return;
+        }
         if task.direction() == Direction::Download {
             match executor.complete(task).await {
-                Ok(payload) => {
-                    let _ = worker_tx
-                        .send(WorkerEvent::Completed {
-                            key,
-                            total_size: known_total,
-                            completion_payload: payload,
-                        })
-                        .await;
-                }
+                Ok(payload) => match release_terminal_download_target(task).await {
+                    Ok(()) => {
+                        let _ = worker_tx
+                            .send(WorkerEvent::Completed {
+                                key,
+                                total_size: known_total,
+                                completion_payload: payload,
+                            })
+                            .await;
+                    }
+                    Err(error) => {
+                        let _ = worker_tx
+                            .send(WorkerEvent::Failed {
+                                key,
+                                error,
+                                total_size: known_total,
+                            })
+                            .await;
+                    }
+                },
                 Err(e) => {
                     crate::log::emit_lazy(|| {
                         let mut log = crate::log::Log::error(
@@ -640,6 +945,13 @@ async fn run_group_parallel(
                         }
                         log
                     });
+                    if let Err(cleanup_error) = settle_failed_download_target(task).await {
+                        crate::meow_warn_log!(
+                            "run_group_parallel",
+                            "download cleanup after finalize failure also failed: {}",
+                            crate::log::redact_secrets(&cleanup_error.to_string())
+                        );
+                    }
                     let _ = worker_tx
                         .send(WorkerEvent::Failed {
                             key,
@@ -650,6 +962,20 @@ async fn run_group_parallel(
                 }
             }
         } else {
+            if let Some(snapshot) = task.upload_file_snapshot() {
+                if let Err(error) = snapshot.validate_generation(true).await {
+                    task.require_upload_abort();
+                    settle_required_upload_abort(task, executor, &key).await;
+                    let _ = worker_tx
+                        .send(WorkerEvent::Failed {
+                            key,
+                            error,
+                            total_size: known_total,
+                        })
+                        .await;
+                    return;
+                }
+            }
             let _ = worker_tx
                 .send(WorkerEvent::Completed {
                     key,
@@ -685,6 +1011,7 @@ async fn run_group_parallel(
             chunk,
             known_total,
             max_retries,
+            parallel_memory_budget,
         );
     }
 
@@ -699,9 +1026,21 @@ async fn run_group_parallel(
                 // in `try_start_next` does not cover JoinSet children.)
                 cancel.cancel();
                 while set.join_next().await.is_some() {}
+                if task.direction() == Direction::Download {
+                    if let Err(cleanup_error) = settle_failed_download_target(task).await {
+                        crate::meow_warn_log!(
+                            "run_group_parallel",
+                            "download cleanup after part panic failed: {}",
+                            crate::log::redact_secrets(&cleanup_error.to_string())
+                        );
+                    }
+                } else {
+                    task.require_upload_abort();
+                    settle_required_upload_abort(task, executor, &key).await;
+                }
                 let err = MeowError::from_code(
                     InnerErrorCode::Unknown,
-                    format!("upload part task panicked: {join_err}"),
+                    format!("transfer part task panicked: {join_err}"),
                 );
                 crate::log::emit_lazy(|| {
                     crate::log::Log::error(
@@ -774,6 +1113,7 @@ async fn run_group_parallel(
                             chunk,
                             known_total,
                             max_retries,
+                            parallel_memory_budget,
                         );
                     }
                 }
@@ -783,7 +1123,20 @@ async fn run_group_parallel(
                 window.on_settled_without_progress();
                 // Stop dispatching; keep draining the rest to quiescence.
             }
-            Ok((_off, ChunkRetryResult::Failed(e))) => {
+            Ok((off, ChunkRetryResult::Failed(e))) => {
+                crate::log::emit_lazy(|| {
+                    crate::log::Log::debug(
+                        "run_group_parallel_part",
+                        format!(
+                            "part failed; draining in-flight siblings before terminal cleanup: key={} err={}",
+                            crate::inner::safe_key(&key),
+                            crate::log::redact_secrets(&e.to_string())
+                        ),
+                    )
+                    .with_task_id(inner.task_id().to_string())
+                    .with_offset(off)
+                    .with_error_code(e.code())
+                });
                 if failed.is_none() {
                     failed = Some(e);
                 }
@@ -800,14 +1153,15 @@ async fn run_group_parallel(
     // user-cancel in-flight errors to Cancelled, so `failed` means a real error).
     if let Some(e) = failed {
         if task.direction() == Direction::Download {
-            if let Err(checkpoint_error) = task.force_download_checkpoint().await {
+            if let Err(checkpoint_error) = settle_failed_download_target(task).await {
                 crate::meow_warn_log!(
                     "run_group_parallel",
-                    "checkpoint while settling failed download also failed: {}",
+                    "checkpoint/release while settling failed download also failed: {}",
                     crate::log::redact_secrets(&checkpoint_error.to_string())
                 );
             }
         }
+        settle_required_upload_abort(task, executor, &key).await;
         crate::log::emit_lazy(|| {
             let mut log = crate::log::Log::error(
                 "run_group_parallel",
@@ -832,18 +1186,6 @@ async fn run_group_parallel(
             })
             .await;
     } else if cancelled || cancel.is_cancelled() {
-        if task.direction() == Direction::Download {
-            if let Err(error) = task.force_download_checkpoint().await {
-                let _ = worker_tx
-                    .send(WorkerEvent::Failed {
-                        key,
-                        error,
-                        total_size: known_total,
-                    })
-                    .await;
-                return;
-            }
-        }
         // FLAW-1: re-check cancel right before finalizing so `complete` can never
         // race the `abort_upload` that `cancel_group` issues; treat a late cancel
         // as Canceled even if every part already finished.
@@ -854,12 +1196,7 @@ async fn run_group_parallel(
             inner.task_id(),
             window.watermark()
         );
-        let _ = worker_tx
-            .send(WorkerEvent::Canceled {
-                key,
-                total_size: known_total,
-            })
-            .await;
+        emit_canceled_after_quiescent_cleanup(task, worker_tx, key, known_total).await;
     } else {
         if !window.is_complete() {
             // Internal invariant: the success path must finalize only a fully
@@ -874,6 +1211,15 @@ async fn run_group_parallel(
                     known_total
                 ),
             );
+            if task.direction() == Direction::Download {
+                if let Err(cleanup_error) = settle_failed_download_target(task).await {
+                    crate::meow_warn_log!(
+                        "run_group_parallel",
+                        "download cleanup after window invariant failed: {}",
+                        crate::log::redact_secrets(&cleanup_error.to_string())
+                    );
+                }
+            }
             crate::log::emit_lazy(|| {
                 let mut log = crate::log::Log::error(
                     "run_group_parallel",
@@ -899,6 +1245,12 @@ async fn run_group_parallel(
                 .await;
             return;
         }
+        // Final completion and pause/cancel are atomically arbitrated by the
+        // task lifecycle shared with the scheduler's InnerTask view.
+        if !task.begin_terminal_completion() {
+            emit_canceled_after_quiescent_cleanup(task, worker_tx, key, known_total).await;
+            return;
+        }
         match executor.complete(task).await {
             Ok(completion_payload) => {
                 crate::meow_key_log!(
@@ -908,6 +1260,18 @@ async fn run_group_parallel(
                     inner.task_id(),
                     known_total
                 );
+                if task.direction() == Direction::Download {
+                    if let Err(error) = release_terminal_download_target(task).await {
+                        let _ = worker_tx
+                            .send(WorkerEvent::Failed {
+                                key,
+                                error,
+                                total_size: known_total,
+                            })
+                            .await;
+                        return;
+                    }
+                }
                 let _ = worker_tx
                     .send(WorkerEvent::Completed {
                         key,
@@ -933,6 +1297,15 @@ async fn run_group_parallel(
                     }
                     log
                 });
+                if task.direction() == Direction::Download {
+                    if let Err(cleanup_error) = settle_failed_download_target(task).await {
+                        crate::meow_warn_log!(
+                            "run_group_parallel",
+                            "download cleanup after complete failure also failed: {}",
+                            crate::log::redact_secrets(&cleanup_error.to_string())
+                        );
+                    }
+                }
                 let _ = worker_tx
                     .send(WorkerEvent::Failed {
                         key,
@@ -942,5 +1315,186 @@ async fn run_group_parallel(
                     .await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod resource_budget_tests {
+    use super::{checked_parallel_part_memory_bytes, validate_parallel_part_window};
+
+    #[test]
+    fn parallel_window_counts_each_body_and_verification_scratch() {
+        const MIB: u64 = 1024 * 1024;
+        const LIMIT: u64 = 512 * MIB;
+
+        validate_parallel_part_window(4, 127 * MIB, 4 * 127 * MIB, 1, MIB, LIMIT)
+            .expect("four bodies plus four scratch buffers exactly fit the limit");
+        assert!(
+            validate_parallel_part_window(4, 128 * MIB, 4 * 128 * MIB, 1, MIB, LIMIT).is_err(),
+            "body-only accounting would incorrectly accept 512 MiB plus scratch"
+        );
+    }
+
+    #[test]
+    fn parallel_window_uses_real_grid_and_checked_arithmetic() {
+        let limit = 512 * 1024 * 1024;
+        validate_parallel_part_window(usize::MAX, 1024 * 1024, 2 * 1024 * 1024, 1, 0, limit)
+            .expect("a huge configured maximum is harmless for a two-part file");
+        assert!(validate_parallel_part_window(257, 1, 257, 1, 0, limit).is_err());
+        assert!(validate_parallel_part_window(2, 0, 1, 1, 0, limit).is_err());
+        assert!(checked_parallel_part_memory_bytes(u64::MAX, 2, 0).is_err());
+        assert!(checked_parallel_part_memory_bytes(u64::MAX, 1, 1).is_err());
+    }
+
+    #[test]
+    fn short_last_part_is_charged_its_real_body_but_its_own_scratch() {
+        validate_parallel_part_window(2, 10, 11, 1, 2, 15)
+            .expect("body bytes 10+1 and scratch bytes 2+2 total 15");
+        assert!(validate_parallel_part_window(2, 10, 11, 1, 2, 14).is_err());
+    }
+
+    #[test]
+    fn download_window_accounts_for_response_frame_and_destination_buffer() {
+        const MIB: u64 = 1024 * 1024;
+
+        assert!(
+            validate_parallel_part_window(1, 40 * MIB, 40 * MIB, 2, 0, 64 * MIB).is_err(),
+            "a 40 MiB download part peaks near 80 MiB while its response frame is copied"
+        );
+        assert_eq!(
+            checked_parallel_part_memory_bytes(40 * MIB, 2, 0).expect("download part charge"),
+            80 * MIB
+        );
+    }
+}
+
+#[cfg(test)]
+mod failure_race_tests {
+    use super::run_group;
+    use crate::chunk_outcome::ChunkOutcome;
+    use crate::dflt::default_http_transfer::default_breakpoint_arcs;
+    use crate::error::{InnerErrorCode, MeowError};
+    use crate::http_breakpoint::BreakpointDownloadHttpConfig;
+    use crate::inner::inner_task::InnerTask;
+    use crate::inner::worker_event::WorkerEvent;
+    use crate::prepare_outcome::PrepareOutcome;
+    use crate::transfer_executor_trait::TransferTrait;
+    use crate::transfer_task::TransferTask;
+    use crate::up_pounce_builder::UploadPounceBuilder;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    struct IntegrityFailurePrepare {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        abort_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl TransferTrait for IntegrityFailurePrepare {
+        async fn prepare(
+            &self,
+            task: &TransferTask,
+            _local_offset: u64,
+        ) -> Result<PrepareOutcome, MeowError> {
+            task.require_upload_abort();
+            self.started.notify_one();
+            self.release.notified().await;
+            Err(MeowError::from_code_str(
+                InnerErrorCode::ChecksumMismatch,
+                "injected source generation failure",
+            ))
+        }
+
+        async fn transfer_chunk(
+            &self,
+            _task: &TransferTask,
+            _offset: u64,
+            _chunk_size: u64,
+            _remote_total_size: u64,
+        ) -> Result<ChunkOutcome, MeowError> {
+            panic!("transfer_chunk must not run after prepare integrity failure")
+        }
+
+        async fn cancel(&self, _task: &TransferTask) -> Result<(), MeowError> {
+            self.abort_calls.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+    }
+
+    fn temp_upload_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "rusty_cat_prepare_failure_pause_race_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
+    }
+
+    #[tokio::test]
+    async fn pause_token_cannot_mask_prepare_integrity_failure_or_required_abort() {
+        let path = temp_upload_path();
+        std::fs::write(&path, vec![b'A'; 1024]).expect("fixture");
+        let pounce = UploadPounceBuilder::new("prepare-race.bin", &path, 1024)
+            .with_url("https://placeholder/prepare-race")
+            .build()
+            .expect("pounce");
+        let (default_upload, default_download) = default_breakpoint_arcs();
+        let inner = InnerTask::from_pounce(
+            pounce,
+            BreakpointDownloadHttpConfig::default(),
+            None,
+            default_upload,
+            default_download,
+        )
+        .await
+        .expect("inner task");
+        let key = inner.dedupe_key();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let abort_calls = Arc::new(AtomicUsize::new(0));
+        let executor: Arc<dyn TransferTrait> = Arc::new(IntegrityFailurePrepare {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+            abort_calls: Arc::clone(&abort_calls),
+        });
+        let cancel = CancellationToken::new();
+        let (worker_tx, mut worker_rx) = tokio::sync::mpsc::channel(4);
+        let worker = tokio::spawn(run_group(
+            key,
+            inner,
+            cancel.clone(),
+            worker_tx,
+            executor,
+            0,
+            crate::inner::exec_impl::memory_budget::ParallelMemoryBudget::for_current_target(),
+        ));
+
+        started.notified().await;
+        cancel.cancel();
+        release.notify_one();
+        worker.await.expect("run_group join");
+
+        let event = worker_rx.recv().await.expect("terminal worker event");
+        match event {
+            WorkerEvent::Failed { error, .. } => {
+                assert_eq!(error.code(), InnerErrorCode::ChecksumMismatch as i32)
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(
+            abort_calls.load(Ordering::Acquire),
+            1,
+            "required provider abort must run exactly once after prepare returns"
+        );
+        assert!(
+            worker_rx.try_recv().is_err(),
+            "terminal event must be unique"
+        );
+        let _ = std::fs::remove_file(path);
     }
 }

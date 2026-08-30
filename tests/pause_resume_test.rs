@@ -77,7 +77,7 @@ fn spawn_range_server(
             // HEAD 请求返回总长度，供 prepare 阶段探测远端大小。
             if req.starts_with("HEAD ") {
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"pause-resume-v1\"\r\nConnection: close\r\n\r\n",
                     payload_for_thread.len()
                 );
                 let _ = stream.write_all(resp.as_bytes());
@@ -112,7 +112,7 @@ fn spawn_range_server(
             let body = &payload_for_thread[start_idx..=bounded_end];
             // 生成标准 206 + Content-Range 响应。
             let resp = format!(
-                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nETag: \"pause-resume-v1\"\r\nConnection: close\r\n\r\n",
                 start_idx,
                 bounded_end,
                 payload_for_thread.len(),

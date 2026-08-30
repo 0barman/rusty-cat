@@ -4,21 +4,25 @@
 information needed to rebuild a logical transfer, then construct and enqueue a
 new task after restart. `TaskId` is process-local and is not a durable identity.
 
-The SDK does write one internal checkpoint: concurrent downloads use a
-`<target>.rcdl` sidecar. That file is part of download correctness and must stay
-next to the partial target.
+The SDK does write one internal checkpoint: serial and concurrent downloads use
+a losslessly path-derived `.rusty-cat/<sha256-of-file-name>.rcdl` sidecar in a
+private namespace adjacent to the target. That file is part of download
+correctness and must stay with the partial target. A checkpoint is reusable across processes only
+when its semantic resource, total, chunk grid, freshly observed strong ETag,
+and stored local part digests all validate. It is a generation-bound checkpoint,
+not proof supplied by path or file length alone.
 
 ## Capability matrix
 
 | Transfer mode | In-process pause/resume | Cross-process resume source | Restart guarantee |
 |---|---:|---|---|
-| Serial download | Yes | Partial file length | Supported when remote total/representation is still compatible |
+| Serial download | Yes | `.rcdl` bitmap/digests plus fresh strong ETag from HEAD | Supported with validator requirements below |
 | Concurrent download | Yes | `.rcdl` bitmap/digests plus fresh strong ETag from HEAD | Supported with validator requirements below |
 | Default HTTP upload | Yes | Server-reported `nextByte` during prepare | Supported if the server persists and authenticates the cursor |
 | Presigned multipart upload | Yes | Backend session plus persisted/reconciled completed parts | Supported when the plan/helper is rebuilt with valid session state and fresh URLs |
 | Aliyun OSS direct upload | Yes | Current protocol instance | No public checkpoint injection after restart; abort orphan and start a new session |
 | Azure Blob direct upload | Yes | Current protocol instance | No public checkpoint injection after restart; reconcile/clean remote blocks and restart |
-| Direct/provider download | Yes | Serial file length or concurrent `.rcdl`, depending on parts setting | Same download rules as above |
+| Direct/provider download | Yes | Digest-backed `.rcdl`, subject to the protocol's validator support | Same download rules as above |
 | Binary download | Cancel only | None | Not resumable |
 
 Do not describe all upload modes as restart-resumable. The protocol must be able
@@ -45,7 +49,7 @@ provider upload IDs according to your threat model.
 
 Write persistence from a bounded application queue rather than blocking an SDK
 callback. A progress fraction is not a trusted byte checkpoint; recovery derives
-its real offset from the local file, sidecar, or remote protocol.
+its real offset from a validated sidecar or remote protocol.
 
 ## Restore workflow
 
@@ -90,34 +94,68 @@ record.
 
 ## Serial download
 
-Prepare reads the current target length and resumes from that byte. It obtains
-the remote total from a protocol hint, `with_total_size`, or HEAD.
+Prepare obtains the remote total from a protocol hint, `with_total_size`, or
+HEAD, then resumes only the longest contiguous prefix whose generation-bound
+sidecar identity and SHA-256 part digests validate. A legacy local file, missing
+sidecar, or sidecar that cannot be bound to the freshly observed generation is
+not trusted by length, even if its length equals the remote total; it is
+truncated to zero and fetched safely. A local length greater than the remote
+total fails with `InvalidRange`.
 
-- Local length less than total: resume from local length.
-- Local length equal to total: report complete without another range body.
-- Local length greater than total: fail with `InvalidRange`; do not truncate or
-  silently report success.
-
-The server must honor Range consistently. If the remote object can change under
-the same URL, use versioned URLs or application validation; serial length alone
-does not prove that the partial prefix and current remote object are one
-generation.
+Cross-process resume requires a fresh strong ETag from HEAD. If HEAD is skipped
+or has no strong validator, the old sidecar is deliberately not reused. If HEAD
+did provide one, every 206 must return the same value. Otherwise the first 206
+can latch a strong ETag for the current run, and every later range must match it.
+A serial run that needs multiple ranges fails closed on a missing, weak, or
+changing ETag; a one-range run may complete without one because it cannot join
+bytes from different responses.
 
 ## Concurrent download
 
 The target is pre-sized, so length is not progress. The `.rcdl` sidecar stores
 durable completed parts and their SHA-256 digests. Cross-process reuse requires a
 fresh HEAD response with a strong ETag and the same semantic resource identity,
-total size, and chunk size. Completed part digests are rechecked from disk.
+stable range-request context, total size, and chunk size. The binding material
+is persisted only as a SHA-256 digest, and completed part digests are rechecked
+from disk. Custom download protocols that keep the default
+`resume_identity() -> None`, and tasks using an externally injected HTTP client,
+validate the current run but do not reuse an earlier process's bits.
 
 Do not set `with_total_size` when cross-process reuse is required: that skips
 HEAD, so an old sidecar cannot be authenticated. The first 206 can latch an ETag
 for one new run but cannot retroactively prove an earlier process's checkpoint.
-Every 206 must carry the same strong ETag. Read the complete
+Every 206 in a multi-range run must carry the same strong ETag. A parallel
+configuration whose entire object is one range may complete without an ETag;
+there is no cross-response generation-mixing risk. Read the complete
 [concurrent download contract](concurrent-chunk-transfer.md).
 
 Changing `max_parts_in_flight` is allowed. Changing chunk size starts a new part
-grid. Do not delete or move `.rcdl` independently of its partial target.
+grid. Do not edit the `.rusty-cat` namespace independently of its partial
+targets. The SDK leaves its zero-length ownership marker in that directory
+after completed sidecars are removed.
+
+Every `.rusty-cat` path component is reserved even before an ownership marker
+exists. A path inside it cannot itself be used as a visible download target,
+including through a symlink alias. The task fails before target creation so it
+cannot race namespace ownership or overwrite checkpoint/atomic temp files.
+
+The pre-0.3.6 `<target>.rcdl` location is not migrated automatically. It may be
+an ordinary file (including the real target of a separate transfer), so 0.3.6
+never reads, overwrites, or deletes it and starts with fresh checkpoint state.
+A file/symlink at the reserved `.rusty-cat` path, or a non-empty directory there
+without the SDK ownership marker, fails closed and remains unchanged. An empty
+directory may be initialized as the checkpoint namespace.
+
+## Active download target path
+
+The SDK holds a normalized path lease and one locked target handle throughout an
+active download. On Windows that handle deliberately does not grant delete
+sharing, so Windows rejects deleting, renaming, or replacing the target path
+until the task reaches a terminal state and releases the handle. This includes
+an identical-content replacement and is a safety boundary, not a claim that the
+physical file is part of checkpoint identity. After terminal release, the path
+can be replaced normally. On platforms that permit an active rename, final
+content validation still rejects a different-content replacement.
 
 ## Default HTTP upload
 
@@ -165,5 +203,18 @@ shutdown, call `close().await`; unfinished file tasks emit `Paused`, but close i
 still terminal for that client. Construct a new client when the application
 continues later.
 
-The runnable download example is
-[`../examples/resume_after_restart.rs`](../examples/resume_after_restart.rs).
+The deterministic restart scenarios live in
+[`test-app/src/scenarios/local.rs`](../../test-app/src/scenarios/local.rs). Run
+the checkpoint-backed recovery scenario from the repository root. Its first
+client leaves a validated checkpoint after an injected range failure; a new
+client then fetches only the missing part:
+
+```text
+cargo run --manifest-path test-app/Cargo.toml -- resume-restart
+```
+
+For paused import followed by selective resume, run:
+
+```text
+cargo run --manifest-path test-app/Cargo.toml -- restore-paused
+```

@@ -42,6 +42,8 @@ struct Recorder {
     peak_in_flight: usize,
     /// Number of `complete_upload` invocations (must be exactly 1).
     complete_calls: usize,
+    /// Number of provider-side upload aborts.
+    abort_calls: usize,
 }
 
 /// Mock upload protocol that records what the executor sends it. Optionally
@@ -112,6 +114,15 @@ impl BreakpointUpload for RecordingUpload {
     ) -> Result<Option<String>, MeowError> {
         self.rec.lock().expect("rec lock").complete_calls += 1;
         Ok(Some("done".to_string()))
+    }
+
+    async fn abort_upload(
+        &self,
+        _client: &reqwest::Client,
+        _task: &rusty_cat::TransferTask,
+    ) -> Result<(), MeowError> {
+        self.rec.lock().expect("rec lock").abort_calls += 1;
+        Ok(())
     }
 
     fn supports_parallel_parts(&self) -> bool {
@@ -538,5 +549,9 @@ async fn panicked_part_fails_upload_without_completing() {
     assert_eq!(
         snapshot.complete_calls, 0,
         "complete must NOT be called when a part panicked"
+    );
+    assert_eq!(
+        snapshot.abort_calls, 1,
+        "a provider session created before a part panic must be aborted exactly once"
     );
 }

@@ -44,6 +44,7 @@ struct Recorder {
     peak_in_flight: usize,
     /// Number of `complete_upload` invocations (attempts, success or not).
     complete_calls: usize,
+    abort_calls: usize,
 }
 
 /// Injectable failure config for the mock upload protocol.
@@ -180,6 +181,15 @@ impl BreakpointUpload for InjectableUpload {
         Ok(Some("done".to_string()))
     }
 
+    async fn abort_upload(
+        &self,
+        _client: &reqwest::Client,
+        _task: &rusty_cat::TransferTask,
+    ) -> Result<(), MeowError> {
+        self.rec.lock().expect("rec lock").abort_calls += 1;
+        Ok(())
+    }
+
     fn supports_parallel_parts(&self) -> bool {
         true
     }
@@ -297,6 +307,24 @@ async fn part_error_fails_upload_without_completing() {
     assert!(
         !out.rec.received.contains_key(&2000),
         "the failing part's offset must not be recorded as uploaded"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn post_prepare_parallel_window_rejection_aborts_created_session() {
+    let plan = base_plan(257, 1);
+    let out = run("window_reject_abort", plan, 257, 0).await;
+
+    assert!(matches!(out.terminal, Some(TransferStatus::Failed(_))));
+    assert_eq!(
+        out.rec.received.len(),
+        0,
+        "no part may start after rejection"
+    );
+    assert_eq!(out.rec.complete_calls, 0);
+    assert_eq!(
+        out.rec.abort_calls, 1,
+        "prepare-created provider session must be aborted exactly once"
     );
 }
 
@@ -501,7 +529,11 @@ async fn short_last_part_out_of_order_with_retry_completes_correctly() {
         "the short last part must carry exactly 500 bytes"
     );
     assert!(
-        out.rec.received.iter().filter(|(&o, _)| o != 6000).all(|(_, &l)| l == 1000),
+        out.rec
+            .received
+            .iter()
+            .filter(|(&o, _)| o != 6000)
+            .all(|(_, &l)| l == 1000),
         "every non-final part must carry a full 1000-byte chunk"
     );
     assert_eq!(out.rec.complete_calls, 1, "finalize fires exactly once");

@@ -92,12 +92,43 @@ impl BreakpointDownload for MyDownload {
 
 Override `head_url`, `range_url`, header merge hooks, and
 `total_size_from_head` as required. `total_size_hint` skips HEAD, which can be
-necessary for GET-only signed URLs, but it also prevents the built-in concurrent
-download path from learning a strong validator during prepare; see
+necessary for GET-only signed URLs, but it also prevents the built-in serial and
+concurrent download paths from authenticating a prior checkpoint during
+prepare; see
 [Concurrent chunk transfer](concurrent-chunk-transfer.md).
+
+`resume_identity()` is a separate fail-closed contract and defaults to `None`.
+That default still validates all responses in the current run, but never trusts
+an earlier process's sidecar. Override it only when you can return complete,
+stable bytes for the final range-request representation: include invariant
+effective headers, tenant/principal identity, transforms, locale/media
+selection, and any other byte-changing input; exclude `Range`, `If-Match`,
+short-lived dates, and signature material. The SDK combines this context with
+the canonical URL and strong ETag and persists only a domain-separated SHA-256
+digest, never your raw context.
+
+If authentication rotates, prefer a stable non-secret principal or tenant id
+over the token/signature itself. Use length-prefixed fields or another
+unambiguous encoding. If you cannot prove the context is complete—for example,
+an external HTTP client may inject hidden default headers—keep `None` and accept
+a safe restart from byte zero.
 
 `supports_parallel_parts()` also defaults to `false` for downloads. Opt in only
 when range requests are independent and safe to complete out of order.
+
+Both built-in serial and parallel range execution use the same generation
+validator rule. A strong ETag obtained during HEAD binds any reusable `.rcdl`
+checkpoint, and every 206 must return that exact ETag. If `total_size_hint` or
+`with_total_size` skips HEAD, or HEAD has no strong validator, the SDK does not
+reuse an earlier process's sidecar bits. A transfer requiring multiple range
+responses must then latch a strong ETag from its first 206 and receive that same
+value on all later responses; missing, weak, or changing validators fail closed.
+A transfer that fits in one range may complete without an ETag when no validator
+was prepared, because it cannot combine bytes from different responses.
+
+Consequently, a size hint enables GET-only operation but is not a generation
+proof. Local bytes without a matching generation-bound sidecar are fetched from
+byte zero rather than trusted by length.
 
 ## Lower-level extension point
 

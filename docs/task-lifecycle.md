@@ -110,3 +110,9 @@ Call `close().await` once no more tasks will be submitted and after awaited work
 has reached a terminal state. It cancels unfinished work, drains submitted
 callbacks, joins executor threads, and permanently closes the client. A second
 close returns `ClientClosed`; create a new client for later work.
+
+Do not synchronously wait for `close()` inside a transfer progress, completion,
+or global-listener callback. Shutdown must drain and join that callback
+dispatcher, so the SDK fails this reentrant call immediately with
+`InvalidTaskState` before changing client state. Return from the callback and
+schedule/await `close()` from another task or ordinary thread.

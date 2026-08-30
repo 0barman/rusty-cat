@@ -72,7 +72,45 @@ These two features follow the same security idea: credentials stay on your backe
 | Public client uploads/downloads OSS objects through backend-issued temporary URLs. | `aliyun-oss-presigned` |
 | Public client uploads/downloads Azure blobs through backend-issued SAS URLs. | `azure-blob-sas` |
 | You want the safer default for user-facing applications. | `aliyun-oss-presigned` or `azure-blob-sas` |
-| You are running examples or broad integration tests and want every provider API available. | `all` |
+| You are running test-app scenarios or broad integration tests and want every provider API available. | `all` |
+
+## Runnable test-app coverage
+
+The repository's runnable transfer checks live in
+[`test-app`](../../test-app/README.md). Aliyun presigned range download has a
+dedicated scenario:
+
+```text
+cargo run --manifest-path test-app/Cargo.toml -- aliyun-presigned
+```
+
+Backend-issued OSS/Azure upload URLs and Azure SAS download coverage run through
+the `loonadm` scenario:
+
+```text
+cargo run --manifest-path test-app/Cargo.toml -- loonadm
+```
+
+The direct scenarios use only the official SDK provider implementations; the
+former hand-written signers were not migrated. Credentials are read only from
+the launching process's environment.
+
+For Aliyun OSS, set `RC_ALIYUN_BUCKET`, `RC_ALIYUN_ACCESS_KEY_ID`, and
+`RC_ALIYUN_ACCESS_KEY_SECRET`. Optional settings are `RC_ALIYUN_REGION`,
+`RC_ALIYUN_OBJECT_PREFIX`, `RC_DIRECT_UPLOAD_SIZE`, `RC_DIRECT_PART_SIZE`, and
+`RC_OUT_DIR`:
+
+```text
+cargo run --manifest-path test-app/Cargo.toml -- aliyun-direct
+```
+
+For Azure Blob, set `RC_AZURE_ACCOUNT_NAME`, `RC_AZURE_ACCOUNT_KEY`, and
+`RC_AZURE_CONTAINER`. Optional settings are `RC_AZURE_BLOB_PREFIX`,
+`RC_DIRECT_UPLOAD_SIZE`, `RC_DIRECT_PART_SIZE`, and `RC_OUT_DIR`:
+
+```text
+cargo run --manifest-path test-app/Cargo.toml -- azure-direct
+```
 
 ## Related features and aliases
 

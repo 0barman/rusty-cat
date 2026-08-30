@@ -252,4 +252,44 @@ mod tests {
         assert!(headers.contains_key(HEADER_MS_DATE));
         assert!(headers.contains_key(HEADER_MS_VERSION));
     }
+
+    #[test]
+    fn shared_key_signature_covers_exact_if_match_and_range_values() {
+        let key = b"01234567890123456789012345678901";
+        let url = Url::parse("https://acct.blob.core.windows.net/container/blob.txt")
+            .expect("fixed Azure URL");
+        let mut headers = HeaderMap::new();
+        insert_header(
+            &mut headers,
+            HEADER_MS_DATE,
+            "Wed, 15 Apr 2026 03:37:04 GMT",
+        )
+        .expect("fixed x-ms-date");
+        insert_header(&mut headers, HEADER_MS_VERSION, "2023-11-03").expect("fixed x-ms-version");
+        insert_header(&mut headers, "range", "bytes=0-1023").expect("fixed range");
+        insert_header(&mut headers, "if-match", "\"etag-v1\"").expect("quoted ETag");
+
+        let quoted = build_authorization_with_key("GET", &url, &headers, "acct", key)
+            .expect("sign quoted ETag");
+        assert_eq!(
+            quoted,
+            "SharedKey acct:BlehLU8/z4ns/qMi8lu3KVST+dC1gGZvGrYZSawxPlA="
+        );
+
+        insert_header(&mut headers, "if-match", "etag-v1").expect("unquoted ETag");
+        let unquoted = build_authorization_with_key("GET", &url, &headers, "acct", key)
+            .expect("sign unquoted ETag");
+        assert_eq!(
+            unquoted,
+            "SharedKey acct:8y+PntV8tK/AmkXzYxYCYPFz3IlKyzzDYfq+T5HRvhI="
+        );
+
+        headers.remove("if-match");
+        let absent = build_authorization_with_key("GET", &url, &headers, "acct", key)
+            .expect("sign request without If-Match");
+        assert_eq!(
+            absent,
+            "SharedKey acct:kh4f3hQXbBOrb/SXhp+dB0PlsxEAdFun1aeXSmjkv50="
+        );
+    }
 }

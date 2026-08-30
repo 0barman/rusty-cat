@@ -3,7 +3,7 @@ use crate::file_transfer_record::FileTransferRecord;
 use crate::ids::TaskId;
 use crate::inner::cb_dispatcher;
 use crate::inner::group_state::{GroupState, RecordEntry};
-use crate::inner::inner_task::InnerTask;
+use crate::inner::inner_task::{InnerTask, StopRequestDisposition};
 use crate::inner::scheduler_state::SchedulerState;
 use crate::inner::task_callbacks::TaskCallbacks;
 use crate::inner::worker_event::WorkerEvent;
@@ -54,6 +54,58 @@ pub(crate) enum TransferCmd {
         /// 控制命令应答通道：仅在 worker 完成清理后返回。
         respond_to: tokio::sync::oneshot::Sender<Result<(), MeowError>>,
     },
+}
+
+/// Handles a worker event after enforcing protocol cleanup that must happen at
+/// the worker-quiescence boundary. Active cancel never calls provider abort in
+/// the command path: doing so could race an in-flight final completion request.
+async fn handle_quiescent_worker_event(
+    event: WorkerEvent,
+    state: &mut SchedulerState,
+    executor: &Arc<dyn TransferTrait>,
+) {
+    let terminal_key = match &event {
+        WorkerEvent::Progress { .. } => None,
+        WorkerEvent::Completed { key, .. }
+        | WorkerEvent::Failed { key, .. }
+        | WorkerEvent::Canceled { key, .. } => Some(key.clone()),
+    };
+    // WorkerEvent is the part-drain acknowledgement. Explicitly close the
+    // shared upload descriptor before protocol cleanup or any user callback;
+    // the run_group RAII guard may not have dropped yet because channel send
+    // and scheduler receive can overlap.
+    if let Some(key) = terminal_key.as_ref() {
+        if let Some(snapshot) = state
+            .groups()
+            .get(key)
+            .and_then(|group| group.leader_inner().upload_file_snapshot())
+        {
+            snapshot.release_handle();
+        }
+    }
+    let abort_key = match &event {
+        WorkerEvent::Canceled { key, .. } | WorkerEvent::Failed { key, .. }
+            if key.0 == crate::direction::Direction::Upload
+                && state.canceling_set().contains(key) =>
+        {
+            Some(key.clone())
+        }
+        _ => None,
+    };
+    if let Some(key) = abort_key {
+        if let Some(group) = state.groups().get(&key) {
+            let task = TransferTask::from_inner(group.leader_inner());
+            if let Err(err) = executor.cancel(&task).await {
+                crate::meow_warn_log!(
+                    "cancel_group",
+                    "protocol abort failed after worker quiesced: key={} err={}",
+                    crate::inner::safe_key(&key),
+                    crate::log::redact_secrets(&err.to_string())
+                );
+            }
+        }
+    }
+    crate::inner::exec_impl::handle_worker_event::handle_worker_event(event, state).await;
 }
 
 fn worker_loop(
@@ -272,14 +324,16 @@ fn worker_loop(
                                         );
                                         if let Some(key) = state.task_id_to_dedupe().get(&task_id).cloned()
                                         {
-                                            pause_group(&mut state, &key).await;
-                                            let _ = respond_to.send(Ok(()));
-                                            crate::meow_key_log!(
-                                                "cmd_pause",
-                                                "pause accepted: task_id={:?} key={}",
-                                                task_id,
-                                                crate::inner::safe_key(&key)
-                                            );
+                                            let pause_ret = pause_group(&mut state, &key).await;
+                                            if pause_ret.is_ok() {
+                                                crate::meow_key_log!(
+                                                    "cmd_pause",
+                                                    "pause accepted: task_id={:?} key={}",
+                                                    task_id,
+                                                    crate::inner::safe_key(&key)
+                                                );
+                                            }
+                                            let _ = respond_to.send(pause_ret);
                                         } else {
                                             crate::meow_warn_log!(
                                                 "cmd_pause",
@@ -344,14 +398,17 @@ fn worker_loop(
                                         );
                                         if let Some(key) = state.task_id_to_dedupe().get(&task_id).cloned()
                                         {
-                                            cancel_group(&mut state, &key, &executor).await;
-                                            let _ = respond_to.send(Ok(()));
-                                            crate::meow_key_log!(
-                                                "cmd_cancel",
-                                                "cancel accepted: task_id={:?} key={}",
-                                                task_id,
-                                                crate::inner::safe_key(&key)
-                                            );
+                                            let cancel_ret =
+                                                cancel_group(&mut state, &key, &executor).await;
+                                            if cancel_ret.is_ok() {
+                                                crate::meow_key_log!(
+                                                    "cmd_cancel",
+                                                    "cancel accepted: task_id={:?} key={}",
+                                                    task_id,
+                                                    crate::inner::safe_key(&key)
+                                                );
+                                            }
+                                            let _ = respond_to.send(cancel_ret);
                                         } else {
                                             crate::meow_warn_log!(
                                                 "cmd_cancel",
@@ -390,32 +447,92 @@ fn worker_loop(
                                             state.queued().len(),
                                             state.paused_set().len()
                                         );
-                                        for (_, active) in state.active().iter() {
-                                            active.cancel().cancel();
+                                        let active_keys: Vec<_> =
+                                            state.active().keys().cloned().collect();
+                                        // Close is a resumable stop, not an upload abort. Claim the
+                                        // pause boundary before canceling each worker. A task that
+                                        // already claimed Completing is allowed to finish accurately.
+                                        for key in &active_keys {
+                                            if state.canceling_set().contains(key) {
+                                                if let Some(active) = state.active().get(key) {
+                                                    active.cancel().cancel();
+                                                }
+                                                continue;
+                                            }
+                                            let disposition = state
+                                                .groups()
+                                                .get(key)
+                                                .map(|group| {
+                                                    group.leader_inner().begin_terminal_pause()
+                                                })
+                                                .unwrap_or(
+                                                    StopRequestDisposition::InterruptNow,
+                                                );
+                                            state.paused_set_mut().insert(key.clone());
+                                            if disposition
+                                                == StopRequestDisposition::InterruptNow
+                                            {
+                                                if let Some(active) = state.active().get(key) {
+                                                    active.cancel().cancel();
+                                                }
+                                            }
                                         }
-                                        // emit Paused 时仍走 dispatcher（终态必送），保证回调线程把这些
-                                        // 终态收进队列；下一步关闭 channel 后线程会先 drain 再退出。
-                                        for (key, group) in state.groups().iter() {
-                                            let current = state.offsets().get(key).copied().unwrap_or(0);
-                                            let total = crate::inner::exec_impl::emit::effective_total(
-                                                &state,
-                                                key,
-                                                group.entry().inner(),
-                                            );
-                                            crate::inner::exec_impl::emit::emit_status(
-                                                &state,
-                                                group.entry(),
-                                                TransferStatus::Paused,
-                                                current,
-                                                total,
-                                            );
+
+                                        // Groups with no worker own no live target handle, so their
+                                        // Paused event is immediately safe. Active groups emit only
+                                        // from their quiescent Canceled acknowledgement below.
+                                        let inactive_keys: Vec<_> = state
+                                            .groups()
+                                            .keys()
+                                            .filter(|key| !state.active().contains_key(*key))
+                                            .cloned()
+                                            .collect();
+                                        for key in inactive_keys {
+                                            if let Some(group) = state.groups().get(&key) {
+                                                let current =
+                                                    state.offsets().get(&key).copied().unwrap_or(0);
+                                                let total = crate::inner::exec_impl::emit::effective_total(
+                                                    &state,
+                                                    &key,
+                                                    group.entry().inner(),
+                                                );
+                                                crate::inner::exec_impl::emit::emit_status(
+                                                    &state,
+                                                    group.entry(),
+                                                    TransferStatus::Paused,
+                                                    current,
+                                                    total,
+                                                );
+                                            }
                                         }
+
+                                        // Keep consuming the bounded worker channel while closing;
+                                        // otherwise workers could block trying to acknowledge cleanup
+                                        // and close would deadlock. No new scheduler work is started.
+                                        while !state.active().is_empty() {
+                                            let Some(event) = worker_rx.recv().await else {
+                                                crate::meow_error_log!(
+                                                    "cmd_close",
+                                                    "worker event channel closed with {} active groups",
+                                                    state.active().len()
+                                                );
+                                                break;
+                                            };
+                                            handle_quiescent_worker_event(
+                                                event,
+                                                &mut state,
+                                                &executor,
+                                            )
+                                            .await;
+                                        }
+
                                         state.clear_active();
                                         state.groups_mut().clear();
                                         state.task_id_to_dedupe_mut().clear();
                                         state.queued_mut().clear();
                                         state.queued_set_mut().clear();
                                         state.paused_set_mut().clear();
+                                        state.canceling_set_mut().clear();
                                         state.offsets_mut().clear();
                                         state.known_totals_mut().clear();
                                         // 关闭回调 channel：drop 唯一持有的 sender。
@@ -433,11 +550,7 @@ fn worker_loop(
                                 crate::meow_trace_log!("worker_loop", "worker event received");
                                 let should_try_start_next =
                                     event.may_change_scheduler_readiness();
-                                crate::inner::exec_impl::handle_worker_event::handle_worker_event(
-                                    event,
-                                    &mut state,
-                                )
-                                .await;
+                                handle_quiescent_worker_event(event, &mut state, &executor).await;
                                 if should_try_start_next {
                                     let _ = crate::inner::exec_impl::exec::try_start_next(
                                         &worker_tx,
@@ -468,7 +581,7 @@ fn worker_loop(
     })??;
     Ok(handle)
 }
-async fn pause_group(state: &mut SchedulerState, key: &UniqueId) {
+async fn pause_group(state: &mut SchedulerState, key: &UniqueId) -> Result<(), MeowError> {
     crate::meow_flow_log!(
         "pause_group",
         "pause begin: key={} active={} queued={} paused={}",
@@ -478,10 +591,22 @@ async fn pause_group(state: &mut SchedulerState, key: &UniqueId) {
         state.paused_set().contains(key)
     );
     // 暂停语义要求“可恢复”，因此先从可运行集合移除，避免继续调度/执行。
-    if let Some(active) = state.active().get(key) {
-        // 对正在执行的组发出取消信号，让 worker 退出循环并回到可恢复状态。
-        // 注意：这里不立刻从 active 移除，避免 resume 与 Canceled 事件发生竞态。
-        active.cancel().cancel();
+    let was_active = state.active().contains_key(key);
+    let pause_disposition = if was_active {
+        state
+            .groups()
+            .get(key)
+            .map(|group| group.leader_inner().begin_terminal_pause())
+            .unwrap_or(StopRequestDisposition::InterruptNow)
+    } else {
+        StopRequestDisposition::InterruptNow
+    };
+    if pause_disposition == StopRequestDisposition::InterruptNow {
+        if let Some(active) = state.active().get(key) {
+            // 对正在执行的组发出取消信号，让 worker 退出循环并回到可恢复状态。
+            // 注意：这里不立刻从 active 移除，避免 resume 与 Canceled 事件发生竞态。
+            active.cancel().cancel();
+        }
     }
     // 若任务尚在等待队列中，暂停后应立刻从队列剔除。
     state.queued_mut().retain(|k| k != key);
@@ -490,26 +615,29 @@ async fn pause_group(state: &mut SchedulerState, key: &UniqueId) {
     // 关键：标记为 paused，而不是删除 group/mapping，这样 resume 才能找到原任务。
     state.paused_set_mut().insert(key.clone());
 
-    if let Some(group) = state.groups().get(key) {
-        // 发送 Paused 事件给回调层，告诉调用方任务已进入可恢复暂停态。
-        let entry = group.entry();
-        // 使用当前 offset 作为暂停进度，保持对外可观测进度连续。
-        let current = state.offsets().get(key).copied().unwrap_or(0);
-        let total = crate::inner::exec_impl::emit::effective_total(state, key, entry.inner());
-        crate::inner::exec_impl::emit::emit_status(
-            state,
-            entry,
-            TransferStatus::Paused,
-            current,
-            total,
-        );
-        crate::meow_flow_log!(
-            "pause_group",
-            "pause status emitted: key={} offset={}",
-            crate::inner::safe_key(key),
-            current
-        );
+    if !was_active {
+        if let Some(group) = state.groups().get(key) {
+            // 发送 Paused 事件给回调层，告诉调用方任务已进入可恢复暂停态。
+            let entry = group.entry();
+            // 使用当前 offset 作为暂停进度，保持对外可观测进度连续。
+            let current = state.offsets().get(key).copied().unwrap_or(0);
+            let total = crate::inner::exec_impl::emit::effective_total(state, key, entry.inner());
+            crate::inner::exec_impl::emit::emit_status(
+                state,
+                entry,
+                TransferStatus::Paused,
+                current,
+                total,
+            );
+            crate::meow_flow_log!(
+                "pause_group",
+                "pause status emitted: key={} offset={}",
+                crate::inner::safe_key(key),
+                current
+            );
+        }
     }
+    Ok(())
 }
 
 async fn resume_group(state: &mut SchedulerState, key: &UniqueId) -> Result<(), MeowError> {
@@ -592,7 +720,7 @@ async fn cancel_group(
     state: &mut SchedulerState,
     key: &UniqueId,
     executor: &Arc<dyn TransferTrait>,
-) {
+) -> Result<(), MeowError> {
     crate::meow_flow_log!(
         "cancel_group",
         "cancel begin: key={} active={} queued={} paused={}",
@@ -601,16 +729,48 @@ async fn cancel_group(
         state.queued_set().contains(key),
         state.paused_set().contains(key)
     );
-    // 取消优先终止执行态。
-    if let Some(active) = state.remove_active(key) {
-        active.cancel().cancel();
+    let was_active = state.active().contains_key(key);
+    if was_active {
+        // Upload completion and cancel have one atomic linearization point. If
+        // completion already claimed the task, reject this late cancel instead
+        // of reporting it accepted and then silently completing/aborting.
+        let cancel_disposition = state
+            .groups()
+            .get(key)
+            .map(|group| group.leader_inner().begin_terminal_cancel())
+            .unwrap_or(StopRequestDisposition::InterruptNow);
+        if cancel_disposition == StopRequestDisposition::InterruptNow {
+            if let Some(active) = state.active().get(key) {
+                active.cancel().cancel();
+            }
+        }
+    } else {
+        // No worker exists, so the cancel transition can be completed
+        // synchronously below.
     }
+    // Active state stays registered until the worker's quiescence event. This
+    // makes the user-visible terminal callback happen strictly after download
+    // checkpoint/file-lock/path-lease cleanup and after all part tasks drain.
     // 取消后不应继续排队。
     state.queued_mut().retain(|k| k != key);
     state.queued_set_mut().remove(key);
     // 取消语义会彻底结束任务，因此需要清掉 paused 标记。
     state.paused_set_mut().remove(key);
+    if was_active {
+        state.canceling_set_mut().insert(key.clone());
+        if let Some(task_id) = state
+            .groups()
+            .get(key)
+            .map(|group| group.leader_inner().task_id())
+        {
+            // Invalidate further controls immediately while retaining the group
+            // itself for worker-event cleanup and terminal callback delivery.
+            state.task_id_to_dedupe_mut().remove(&task_id);
+        }
+        return Ok(());
+    }
     if let Some(group) = state.groups_mut().remove(key) {
+        let _ = group.leader_inner().begin_terminal_cancel();
         // 对上传协议触发可选的远端取消语义（例如 OSS AbortMultipartUpload）。
         let task_view = TransferTask::from_inner(group.leader_inner());
         if let Err(err) = executor.cancel(&task_view).await {
@@ -623,7 +783,7 @@ async fn cancel_group(
                 "cancel_group",
                 "protocol abort failed but continue cleanup: key={} err={}",
                 crate::inner::safe_key(key),
-                err
+                crate::log::redact_secrets(&err.to_string())
             );
         }
         // 取消后删除 task_id 映射，防止继续通过旧 id 控制。
@@ -653,6 +813,8 @@ async fn cancel_group(
         state.offsets_mut().remove(key);
         state.known_totals_mut().remove(key);
     }
+    state.canceling_set_mut().remove(key);
+    Ok(())
 }
 
 fn task_not_found_error(task_id: TaskId) -> MeowError {
@@ -698,6 +860,7 @@ impl Executor {
         config: MeowConfig,
         executor: Arc<dyn TransferTrait>,
         global_progress_listener: crate::inner::scheduler_state::GlobalProgressStore,
+        callback_dispatcher_owner: cb_dispatcher::CallbackDispatcherOwner,
     ) -> Result<Self, MeowError> {
         crate::meow_key_log!(
             "executor",
@@ -712,7 +875,7 @@ impl Executor {
         // 在调度循环启动前就把回调分发线程拉起来，并把 sender 注入 SchedulerState。
         // 这样 worker_loop 一开始就处于"回调物理隔离"的状态，第一条进度也走分发线程。
         // 队列容量在 cb_dispatcher 内部锁定（CALLBACK_QUEUE_CAPACITY），不对外暴露。
-        let (cb_submit, cb_join) = cb_dispatcher::start()?;
+        let (cb_submit, cb_join) = cb_dispatcher::start_for(callback_dispatcher_owner)?;
         let worker_join = worker_loop(
             cmd_rx,
             worker_rx,
@@ -1110,7 +1273,7 @@ mod tests {
 
     use async_trait::async_trait;
 
-    use super::{cancel_group, pause_group, resume_group};
+    use super::{cancel_group, handle_quiescent_worker_event, pause_group, resume_group};
     use crate::chunk_outcome::ChunkOutcome;
     use crate::error::MeowError;
     use crate::inner::test_support::{attach_capture, live_download_state, wait_for_record};
@@ -1161,7 +1324,7 @@ mod tests {
         state.offsets_mut().insert(key.clone(), 512);
         state.known_totals_mut().insert(key.clone(), 4096);
 
-        pause_group(&mut state, &key).await;
+        pause_group(&mut state, &key).await.expect("pause");
 
         let paused =
             wait_for_record(&records, |r| matches!(r.status(), TransferStatus::Paused)).await;
@@ -1177,7 +1340,7 @@ mod tests {
         let records = attach_capture(&state);
         state.offsets_mut().insert(key.clone(), 512);
         state.known_totals_mut().insert(key.clone(), 4096);
-        pause_group(&mut state, &key).await;
+        pause_group(&mut state, &key).await.expect("pause");
 
         resume_group(&mut state, &key).await.expect("resume");
 
@@ -1195,7 +1358,9 @@ mod tests {
         state.known_totals_mut().insert(key.clone(), 4096);
         let executor: Arc<dyn TransferTrait> = Arc::new(NoopTransfer);
 
-        cancel_group(&mut state, &key, &executor).await;
+        cancel_group(&mut state, &key, &executor)
+            .await
+            .expect("cancel");
 
         let canceled =
             wait_for_record(&records, |r| matches!(r.status(), TransferStatus::Canceled)).await;
@@ -1212,6 +1377,151 @@ mod tests {
             state.known_totals().get(&key).is_none(),
             "cancel_group 必须清理 known_totals"
         );
+    }
+
+    /// Active cancel is acknowledged by the API immediately, but its terminal
+    /// callback and group teardown wait for the worker's quiescence event.
+    #[tokio::test]
+    async fn active_cancel_defers_terminal_until_worker_quiesces() {
+        use crate::inner::active_state::ActiveState;
+        use crate::inner::worker_event::WorkerEvent;
+        use tokio_util::sync::CancellationToken;
+
+        let (mut state, key) = live_download_state("active_cancel_quiescence").await;
+        let records = attach_capture(&state);
+        state.offsets_mut().insert(key.clone(), 512);
+        state.known_totals_mut().insert(key.clone(), 4096);
+        let token = CancellationToken::new();
+        state.insert_active(key.clone(), ActiveState::new(token.clone()));
+        let executor: Arc<dyn TransferTrait> = Arc::new(NoopTransfer);
+
+        cancel_group(&mut state, &key, &executor)
+            .await
+            .expect("active cancel accepted");
+
+        assert!(token.is_cancelled());
+        assert!(state.active().contains_key(&key));
+        assert!(state.groups().contains_key(&key));
+        assert!(state.canceling_set().contains(&key));
+        assert!(
+            !records
+                .lock()
+                .expect("records")
+                .iter()
+                .any(|record| matches!(record.status(), TransferStatus::Canceled)),
+            "Canceled must not be visible before the worker cleanup ack"
+        );
+
+        handle_quiescent_worker_event(
+            WorkerEvent::Canceled {
+                key: key.clone(),
+                total_size: 4096,
+            },
+            &mut state,
+            &executor,
+        )
+        .await;
+
+        let canceled =
+            wait_for_record(&records, |r| matches!(r.status(), TransferStatus::Canceled)).await;
+        assert_eq!(canceled.total_size(), 4096);
+        assert!(!state.active().contains_key(&key));
+        assert!(!state.groups().contains_key(&key));
+        assert!(!state.canceling_set().contains(&key));
+    }
+
+    #[tokio::test]
+    async fn active_pause_defers_paused_until_worker_quiesces_then_can_resume() {
+        use crate::inner::active_state::ActiveState;
+        use crate::inner::worker_event::WorkerEvent;
+        use tokio_util::sync::CancellationToken;
+
+        let (mut state, key) = live_download_state("active_pause_quiescence").await;
+        let records = attach_capture(&state);
+        state.offsets_mut().insert(key.clone(), 512);
+        state.known_totals_mut().insert(key.clone(), 4096);
+        let token = CancellationToken::new();
+        state.insert_active(key.clone(), ActiveState::new(token.clone()));
+
+        pause_group(&mut state, &key)
+            .await
+            .expect("active pause accepted");
+        assert!(token.is_cancelled());
+        assert!(state.active().contains_key(&key));
+        assert!(state.paused_set().contains(&key));
+        assert!(
+            !records
+                .lock()
+                .expect("records")
+                .iter()
+                .any(|record| matches!(record.status(), TransferStatus::Paused)),
+            "Paused must not be visible before the worker cleanup ack"
+        );
+
+        crate::inner::exec_impl::handle_worker_event::handle_worker_event(
+            WorkerEvent::Canceled {
+                key: key.clone(),
+                total_size: 4096,
+            },
+            &mut state,
+        )
+        .await;
+        let paused =
+            wait_for_record(&records, |r| matches!(r.status(), TransferStatus::Paused)).await;
+        assert_eq!(paused.total_size(), 4096);
+        assert!(!state.active().contains_key(&key));
+        assert!(state.groups().contains_key(&key));
+
+        resume_group(&mut state, &key)
+            .await
+            .expect("resume after quiescent pause");
+        assert!(!state.paused_set().contains(&key));
+        assert!(state.queued_set().contains(&key));
+    }
+
+    /// Once completion owns the lifecycle gate, a late cancel preserves the
+    /// historical Ok response but cannot preempt the linearized Complete.
+    #[tokio::test]
+    async fn completion_claim_wins_late_cancel_without_canceling_worker() {
+        use crate::inner::active_state::ActiveState;
+        use crate::inner::worker_event::WorkerEvent;
+        use tokio_util::sync::CancellationToken;
+
+        let (mut state, key) = live_download_state("completion_wins").await;
+        let records = attach_capture(&state);
+        assert!(state
+            .groups()
+            .get(&key)
+            .expect("group")
+            .leader_inner()
+            .transfer_lifecycle()
+            .begin_completion());
+        let token = CancellationToken::new();
+        state.insert_active(key.clone(), ActiveState::new(token.clone()));
+        let executor: Arc<dyn TransferTrait> = Arc::new(NoopTransfer);
+
+        cancel_group(&mut state, &key, &executor)
+            .await
+            .expect("live task cancel keeps its established Ok response");
+        assert!(!token.is_cancelled());
+        assert!(state.canceling_set().contains(&key));
+        assert!(state.active().contains_key(&key));
+
+        handle_quiescent_worker_event(
+            WorkerEvent::Completed {
+                key: key.clone(),
+                total_size: 1,
+                completion_payload: None,
+            },
+            &mut state,
+            &executor,
+        )
+        .await;
+        let complete =
+            wait_for_record(&records, |r| matches!(r.status(), TransferStatus::Complete)).await;
+        assert_eq!(complete.total_size(), 1);
+        assert!(!state.canceling_set().contains(&key));
+        assert!(!state.active().contains_key(&key));
     }
 
     /// finding #8: resume 后 try_start_next 重启下载时，启动 Transmission 必须用
