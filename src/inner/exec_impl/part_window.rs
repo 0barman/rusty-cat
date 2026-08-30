@@ -158,7 +158,7 @@ mod tests {
         w.take_dispatch(); // 0
         w.take_dispatch(); // 10
         w.take_dispatch(); // 20
-        // Highest part lands first: watermark must NOT move (hole at 0..20).
+                           // Highest part lands first: watermark must NOT move (hole at 0..20).
         assert_eq!(w.on_done(20).unwrap(), None);
         assert_eq!(w.watermark(), 0);
         assert!(!w.is_complete());
@@ -203,7 +203,7 @@ mod tests {
         let mut w = PartWindow::new(0, 10, 20, 8);
         w.take_dispatch(); // 0
         w.take_dispatch(); // 10
-        // First completes, watermark=10, but a part is still in flight.
+                           // First completes, watermark=10, but a part is still in flight.
         w.on_done(0).unwrap();
         assert!(!w.is_complete());
         // Second completes, watermark=20 and in_flight back to 0.
@@ -216,8 +216,8 @@ mod tests {
         let mut w = PartWindow::new(0, 10, 30, 1);
         assert_eq!(w.take_dispatch(), Some(0));
         assert_eq!(w.take_dispatch(), None); // window full (max 1)
-        // A failed/cancelled part settles: the slot is freed (so the next offset
-        // becomes dispatchable) and the watermark does NOT advance.
+                                             // A failed/cancelled part settles: the slot is freed (so the next offset
+                                             // becomes dispatchable) and the watermark does NOT advance.
         w.on_settled_without_progress();
         assert_eq!(w.watermark(), 0);
         assert_eq!(w.take_dispatch(), Some(10));

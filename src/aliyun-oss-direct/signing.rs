@@ -113,7 +113,10 @@ pub(crate) fn signed_headers_with_key(
         "OSS4-HMAC-SHA256\n{iso8601}\n{scope}\n{}",
         hex_encode(Sha256::digest(canonical_request.as_bytes()).as_slice())
     );
-    let signature = hex_encode(&hmac_sha256(signing_key.as_slice(), string_to_sign.as_bytes())?);
+    let signature = hex_encode(&hmac_sha256(
+        signing_key.as_slice(),
+        string_to_sign.as_bytes(),
+    )?);
     let mut headers = HeaderMap::new();
     headers.insert("x-oss-date", header_value(&iso8601)?);
     headers.insert("x-oss-content-sha256", header_value(OSS_UNSIGNED_PAYLOAD)?);
@@ -239,8 +242,8 @@ mod tests {
 
     #[test]
     fn signed_headers_with_key_is_deterministic_for_fixed_now() {
-        let now = time::OffsetDateTime::from_unix_timestamp(1_782_500_000)
-            .expect("valid timestamp");
+        let now =
+            time::OffsetDateTime::from_unix_timestamp(1_782_500_000).expect("valid timestamp");
         let date = super::oss_date(now);
         let key = derive_signing_key("secret", &date, "cn-hangzhou").expect("derive key");
         let make = || {

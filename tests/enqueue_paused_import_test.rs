@@ -83,7 +83,10 @@ fn count_status(statuses: &Arc<Mutex<Vec<TransferStatus>>>, want: &TransferStatu
         .count()
 }
 
-async fn wait_terminal(statuses: &Arc<Mutex<Vec<TransferStatus>>>, timeout_ms: u64) -> Option<TransferStatus> {
+async fn wait_terminal(
+    statuses: &Arc<Mutex<Vec<TransferStatus>>>,
+    timeout_ms: u64,
+) -> Option<TransferStatus> {
     let mut waited = 0u64;
     while waited < timeout_ms {
         let found = statuses
@@ -348,7 +351,10 @@ async fn import_many_paused_then_resume_only_one() {
             !has_status(&status_vecs[i], &TransferStatus::Complete),
             "unselected task {i} must not complete"
         );
-        assert!(!paths[i].exists(), "unselected task {i} must not write a file");
+        assert!(
+            !paths[i].exists(),
+            "unselected task {i} must not write a file"
+        );
     }
 
     let bytes = fs::read(&paths[1]).expect("read resumed file");
@@ -409,7 +415,10 @@ async fn resume_paused_import_continues_from_existing_partial_file() {
     );
     let bytes = fs::read(&path).expect("read final file");
     let _ = fs::remove_file(&path);
-    assert_eq!(bytes, payload, "resume must continue from on-disk partial and finish correctly");
+    assert_eq!(
+        bytes, payload,
+        "resume must continue from on-disk partial and finish correctly"
+    );
 }
 
 // ===================== exceptions / improper usage =====================
@@ -514,7 +523,10 @@ async fn duplicate_paused_import_reports_duplicate_in_callback() {
         })
     })
     .await;
-    assert!(saw_dup, "duplicate paused import must report DuplicateTaskError");
+    assert!(
+        saw_dup,
+        "duplicate paused import must report DuplicateTaskError"
+    );
 
     client.close().await.expect("close");
     server.shutdown();
@@ -556,7 +568,10 @@ async fn paused_import_then_active_enqueue_same_url_reports_duplicate() {
         })
     })
     .await;
-    assert!(saw_dup, "active enqueue over an existing paused import must be a duplicate");
+    assert!(
+        saw_dup,
+        "active enqueue over an existing paused import must be a duplicate"
+    );
 
     client.close().await.expect("close");
     server.shutdown();
@@ -598,7 +613,10 @@ async fn active_enqueue_then_paused_import_same_url_reports_duplicate() {
         })
     })
     .await;
-    assert!(saw_dup, "paused import over an existing active task must be a duplicate");
+    assert!(
+        saw_dup,
+        "paused import over an existing active task must be a duplicate"
+    );
 
     client.close().await.expect("close");
     server.shutdown();
@@ -647,7 +665,10 @@ async fn cancel_paused_import_then_resume_returns_task_not_found() {
         .expect_err("resume after cancel must fail");
     assert_eq!(err.code(), InnerErrorCode::TaskNotFound as i32);
 
-    assert!(!path.exists(), "canceled-before-start task must not write a file");
+    assert!(
+        !path.exists(),
+        "canceled-before-start task must not write a file"
+    );
     client.close().await.expect("close");
     server.shutdown();
     let _ = fs::remove_file(&path);
@@ -686,7 +707,10 @@ async fn double_resume_on_paused_import_is_rejected() {
 
     assert!(wait_until(2000, || has_status(&statuses, &TransferStatus::Paused)).await);
 
-    client.resume(task_id).await.expect("first resume should succeed");
+    client
+        .resume(task_id)
+        .await
+        .expect("first resume should succeed");
     let err = client
         .resume(task_id)
         .await
@@ -758,7 +782,10 @@ async fn pause_on_paused_import_is_idempotent_and_resume_still_works() {
     let terminal = wait_terminal(&statuses, 8000).await;
     client.close().await.expect("close");
     server.shutdown();
-    assert!(matches!(terminal, Some(TransferStatus::Complete)), "got {terminal:?}");
+    assert!(
+        matches!(terminal, Some(TransferStatus::Complete)),
+        "got {terminal:?}"
+    );
     let bytes = fs::read(&path).expect("read file");
     let _ = fs::remove_file(&path);
     assert_eq!(bytes, payload);
@@ -846,7 +873,10 @@ async fn close_with_unresumed_paused_imports_is_clean() {
     assert!(wait_until(2000, || has_status(&statuses, &TransferStatus::Paused)).await);
 
     // Key point: closing with unresumed paused imports must not hang.
-    client.close().await.expect("close should be clean even with paused imports");
+    client
+        .close()
+        .await
+        .expect("close should be clean even with paused imports");
     assert!(client.is_closed());
     server.shutdown();
 }

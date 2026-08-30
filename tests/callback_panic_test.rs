@@ -38,19 +38,23 @@ async fn wait_terminal_status(statuses: Arc<Mutex<Vec<TransferStatus>>>) -> Tran
     panic!("did not receive terminal status in time");
 }
 
-fn valid_range_get_response() -> String {
-    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 4-7/8\r\nContent-Length: 4\r\nConnection: close\r\n\r\nwxyz".to_string()
+fn valid_range_get_response(start: u64, end: u64, body: &str) -> String {
+    format!(
+        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/8\r\nContent-Length: {}\r\nETag: \"callback-fixture\"\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
 }
 
 fn head_response() -> String {
-    "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n".to_string()
+    "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nETag: \"callback-fixture\"\r\nConnection: close\r\n\r\n".to_string()
 }
 
 #[tokio::test]
 async fn task_callback_panic_does_not_break_scheduler() {
     let server = dev_server::ScriptedServer::spawn_download(vec![
         head_response(),
-        valid_range_get_response(),
+        valid_range_get_response(0, 3, "abcd"),
+        valid_range_get_response(4, 7, "wxyz"),
     ]);
     let path = temp_download_path("task_cb");
     fs::write(&path, b"abcd").expect("write local prefix");
@@ -112,7 +116,8 @@ async fn task_callback_panic_does_not_break_scheduler() {
 async fn global_callback_panic_does_not_break_scheduler() {
     let server = dev_server::ScriptedServer::spawn_download(vec![
         head_response(),
-        valid_range_get_response(),
+        valid_range_get_response(0, 3, "abcd"),
+        valid_range_get_response(4, 7, "wxyz"),
     ]);
     let path = temp_download_path("global_cb");
     fs::write(&path, b"abcd").expect("write local prefix");
@@ -174,7 +179,8 @@ async fn global_callback_panic_does_not_break_scheduler() {
 async fn complete_callback_panic_does_not_break_scheduler() {
     let server = dev_server::ScriptedServer::spawn_download(vec![
         head_response(),
-        valid_range_get_response(),
+        valid_range_get_response(0, 3, "abcd"),
+        valid_range_get_response(4, 7, "wxyz"),
     ]);
     let path = temp_download_path("complete_cb");
     fs::write(&path, b"abcd").expect("write local prefix");

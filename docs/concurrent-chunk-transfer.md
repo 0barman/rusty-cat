@@ -46,7 +46,14 @@ Before a parallel run, the executor caps the effective window by the remaining
 part grid and rejects either of these conditions with a controlled I/O error:
 
 - more than 256 effective in-flight part tasks;
-- more than 512 MiB in the effective chunk window.
+- more than the client-wide buffered-part budget (512 MiB on 64-bit targets,
+  64 MiB on 32-bit targets).
+
+The byte budget is shared by every active parallel file in one client. Uploads
+are charged for the body plus verification scratch; downloads are charged for
+both the response `Bytes` frame and the destination part buffer that coexist
+during the copy. Waiting for a permit is cancellation-aware, and permits are
+released on success, failure, cancel, or panic.
 
 The approximate upload buffer budget is `effective_parts * chunk_size`, bounded
 by the bytes remaining. Downloads stream response bodies into positioned file
@@ -77,53 +84,96 @@ create a universal cleanup guarantee.
 
 ## Concurrent download server contract
 
-Every range request must return all of the following:
+Every range request must return all of the following protocol structure:
 
 - `206 Partial Content`, never `200 OK`;
 - a valid `Content-Range` matching the requested start, end, and total;
 - a body with exactly the declared range length;
-- identity or absent `Content-Encoding`;
-- a strong ETag, not a weak `W/` validator.
+- identity or absent `Content-Encoding`.
 
-All part responses must carry the same strong ETag. When HEAD supplied an ETag,
-the SDK sends it as `If-Match` and compares every response. If HEAD was skipped,
-the first 206 latches its strong ETag for the current run and every other part
-must match it. A missing, weak, or changing ETag fails closed with
+Validator requirements depend on the number of responses. When HEAD supplied a
+strong ETag, the SDK sends it as `If-Match`, and every 206 must return that same
+strong ETag. If HEAD was skipped or returned no strong validator, an old
+checkpoint is not reused. A run needing multiple ranges must then obtain a
+strong, non-`W/` ETag from the first 206 and require that same value on every
+other part. A missing, weak, or changing validator fails closed with
 `InvalidRange` so ranges from different object generations are never assembled.
+A one-range download with no prepared validator may complete without an ETag
+because it cannot combine bytes from different responses.
 
 If a server ignores Range and returns 200, retry the logical download in serial
 mode only after removing the parallel checkpoint and partial target. Do not
 silently reinterpret a full response as a part.
 
-## The `.rcdl` sidecar
+## The private `.rusty-cat/<hash>.rcdl` sidecar
 
 Concurrent downloads pre-size the target and write parts at absolute offsets.
 File length therefore cannot represent progress. The SDK writes
-`<target>.rcdl`, containing a part bitmap and SHA-256 digest for each durable
-completed part.
+`.rusty-cat/<sha256-of-lossless-file-name>.rcdl` in a private directory adjacent
+to the target, containing a part bitmap and SHA-256 digest for each durable
+completed part. The former `<target>.rcdl` path is ignored and left untouched;
+it may be an ordinary file or the target of another transfer.
 
-On restart, a sidecar is reused only when all relevant invariants match:
+The adjacent `.rusty-cat` directory carries an SDK ownership marker. A
+file/symlink at the namespace path, or a non-empty unmarked directory, fails
+closed without modifying existing entries. An empty directory may be
+initialized. This dedicated namespace plus the strong path hash prevents names
+such as `foo` and `foo.rcdl` from sharing a target/sidecar path. The target lease
+also covers the generated sidecar path, so a task that explicitly targets that
+hashed path cannot run concurrently with its owner.
+
+The `.rusty-cat` component is reserved for visible download targets even before
+the marker is created. Lexical and resolved/symlink paths through that component
+fail closed, removing the marker-claim race in which a visible file could
+otherwise be mistaken for a stale checkpoint temp file.
+
+On restart, a sidecar is treated as generation-bound and reused only when all
+relevant invariants match:
 
 - target length equals the remote total;
 - total size and chunk size match;
-- the semantic resource URL plus newly observed strong ETag match;
+- the semantic resource URL, stable effective range-request context, and newly
+  observed strong ETag match;
 - each remembered completed part still hashes to its stored digest.
 
 Changing `max_parts_in_flight` does not invalidate compatible durable parts.
 Changing chunk size does, because it changes the part grid. Corrupt or
-mismatched sidecars start with an all-missing bitmap rather than trusting stale
-bits. Successful completion validates the full grid and removes the sidecar.
+mismatched sidecars, or local bytes without a matching sidecar, have no
+generation proof and start with an all-missing bitmap rather than trusting stale
+bytes or inferring progress from target length. In effect, the object is fetched
+again from byte zero. Successful completion validates the full grid and removes
+the sidecar.
 
-The sidecar supports at most 1,000,000 parts. Choose a chunk size that keeps the
-part count below that limit.
+The sidecar supports at most 1,000,000 parts on 64-bit targets. On 32-bit
+targets the limit is 407,779 parts so the resident digest table, checkpoint
+clone, encoded snapshot, bitmaps, and pending entries remain within the 64 MiB
+checkpoint-memory policy. Choose a chunk size that keeps the part count below
+the target architecture's limit; an oversized grid returns a controlled I/O
+error before allocation.
 
-## Signed URL identity
+## Signed URL and request identity
 
-The persisted identity removes recognized authentication-only query parameters
-from AWS, Google, OSS, legacy presigned, and Azure SAS signatures, while
-preserving semantic parameters such as object version, snapshot, or response
-representation selectors. Therefore a refreshed signed URL can reuse a sidecar
-when it names the same semantic resource and HEAD observes the same strong ETag.
+The SDK removes recognized authentication-only query parameters from AWS,
+Google, OSS, legacy presigned, and Azure SAS signatures while preserving
+semantic parameters such as object version, snapshot, or response
+representation selectors. URL userinfo is reduced to stable principal context.
+The canonical URL, ETag, effective invariant headers, and protocol context are
+then domain-separated and SHA-256 hashed; the sidecar stores only that fixed-size
+digest. Raw URLs, ETags, headers, credentials, and unknown query values are never
+persisted in checkpoint identity.
+
+`StandardRangeDownload` and bundled direct-download protocols provide stable
+resume context. A custom `BreakpointDownload` must implement
+`resume_identity()` completely; its safe default is `None`, which disables old
+sidecar reuse while retaining current-run ETag validation. Exclude per-part
+`Range`/validator values and short-lived signature timestamps, but include every
+tenant, principal, transform, locale, media type, and other selector that can
+change returned bytes.
+
+An externally injected `reqwest::Client` may contain default headers that
+reqwest cannot expose for canonicalization. Such tasks conservatively disable
+cross-process sidecar reuse; make representation headers explicit on the task
+and use the built-in client when restart reuse is required.
 
 Use one coherent URL/plan for the requests in a single run. Never persist or log
 signed query strings as credentials or task identities.
@@ -134,7 +184,9 @@ signed query strings as credentials or task identities.
 parallel downloads from a GET-only URL, but prepare then has no remote validator
 with which to authenticate an old sidecar. Existing cross-process part bits are
 deliberately not reused; the first 206 only establishes consistency for the
-current run.
+current run. If the object needs multiple ranges, that first 206 must contain a
+strong ETag; if the object fits in one range, no cross-response validator is
+required.
 
 For cross-process concurrent resume with the current public API:
 
@@ -154,11 +206,19 @@ Resume schedules missing parts again. Cancel is terminal but a partial file or
 sidecar can still exist on disk; remove them according to your product's data
 retention policy.
 
-Do not switch a target containing `.rcdl` to serial mode. Serial prepare rejects
-that situation because the pre-sized target length would otherwise look
-complete. To abandon the parallel transfer, delete both the sidecar and partial
-file before starting serially. Ensure no other process is using the target; the
-SDK also acquires a target lease to prevent concurrent writers.
+Switching a compatible target from parallel to serial mode is safe: serial
+prepare validates the stored digests, keeps only the longest contiguous prefix,
+truncates the pre-sized target to that prefix, and atomically discards higher
+sidecar bits. An incompatible or unauthenticated sidecar starts from zero.
+Ensure no other process is using the target; the SDK also acquires a path lease
+and an actual-target file lock to prevent cooperating concurrent writers.
+
+On Windows, the active target handle intentionally omits delete sharing. The OS
+therefore rejects deleting, renaming, or replacing the target path while the
+download is active, including replacement with identical content. This is the
+safer platform boundary: after a terminal result releases the handle, the path
+may be replaced normally. Platforms that permit an active rename still rely on
+the final visible-content validation to reject different bytes.
 
 ## Retry behavior
 

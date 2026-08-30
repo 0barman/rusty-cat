@@ -39,13 +39,17 @@ pub(crate) async fn handle_worker_event(event: WorkerEvent, state: &mut Schedule
                         &key,
                         group.entry().inner(),
                     ));
-                    crate::inner::exec_impl::emit::emit_status(
-                        state,
-                        group.entry(),
-                        TransferStatus::Transmission,
-                        next_offset,
-                        total,
-                    );
+                    // cancel() 已返回后不再对外发射中间 Transmission；
+                    // 但仍记录 offset/total，供 worker 收敛后的精确终态使用。
+                    if !state.canceling_set().contains(&key) {
+                        crate::inner::exec_impl::emit::emit_status(
+                            state,
+                            group.entry(),
+                            TransferStatus::Transmission,
+                            next_offset,
+                            total,
+                        );
+                    }
                 }
             } else {
                 crate::log::emit_lazy(|| {
@@ -72,6 +76,9 @@ pub(crate) async fn handle_worker_event(event: WorkerEvent, state: &mut Schedule
                 crate::inner::safe_key(&key),
                 total_size
             );
+            // Complete 与 cancel 在终态边界竞态时，worker 已经完成远端/本地
+            // finalize 并释放资源，因此已完成的结果胜出，不再反向 abort。
+            state.canceling_set_mut().remove(&key);
             state.remove_active(&key);
             // 完成后无论此前是否 paused，都要清理 paused 标记。
             state.paused_set_mut().remove(&key);
@@ -123,6 +130,9 @@ pub(crate) async fn handle_worker_event(event: WorkerEvent, state: &mut Schedule
             error,
             total_size,
         } => {
+            // 真实 worker 失败优先于同时到达的用户 cancel；调度器会在
+            // 调用本函数前完成可选的远程 abort，这里仅收敛本地状态。
+            state.canceling_set_mut().remove(&key);
             state.remove_active(&key);
             // 失败终态会结束任务生命周期，因此同步清理 paused 标记。
             state.paused_set_mut().remove(&key);
@@ -186,16 +196,36 @@ pub(crate) async fn handle_worker_event(event: WorkerEvent, state: &mut Schedule
                 "canceled: key={}",
                 crate::inner::safe_key(&key)
             );
+            let was_canceling = state.canceling_set_mut().remove(&key);
             state.remove_active(&key);
-            // 若 key 在 paused_set 中，表示该取消来自 pause 流程，仅收敛执行态，不销毁 group。
-            if state.paused_set().contains(&key) {
+            // 若 key 在 paused_set 中且没有被后续 cancel 升级，表示该事件
+            // 来自 pause/close 流程。只有现在（worker 已 checkpoint 并释放锁）
+            // 才发射 Paused，避免回调里立即操作同一目标时发生锁冲突。
+            if state.paused_set().contains(&key) && !was_canceling {
                 crate::meow_key_log!(
                     "worker_event",
                     "canceled from pause flow; keep group for resume: key={}",
                     crate::inner::safe_key(&key)
                 );
+                if let Some(group) = state.groups().get(&key) {
+                    group.leader_inner().reset_terminal_pause();
+                    let current = state.offsets().get(&key).copied().unwrap_or(0);
+                    let total = total_size.max(crate::inner::exec_impl::emit::effective_total(
+                        state,
+                        &key,
+                        group.entry().inner(),
+                    ));
+                    crate::inner::exec_impl::emit::emit_status(
+                        state,
+                        group.entry(),
+                        TransferStatus::Paused,
+                        current,
+                        total,
+                    );
+                }
                 return;
             }
+            state.paused_set_mut().remove(&key);
             if let Some(group) = state.groups_mut().remove(&key) {
                 state
                     .task_id_to_dedupe_mut()

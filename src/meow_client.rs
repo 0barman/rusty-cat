@@ -38,6 +38,8 @@ pub struct TaskOutcome {
     pub payload: Option<String>,
 }
 
+type TerminalMsg = Result<(TaskId, Option<String>), MeowError>;
+
 /// Main entry point of the `rusty-cat` SDK.
 ///
 /// `MeowClient` owns runtime state and provides high-level operations:
@@ -133,6 +135,8 @@ pub struct MeowClient {
     config: MeowConfig,
     /// Global listeners receiving progress records for all tasks.
     global_progress_listener: crate::inner::scheduler_state::GlobalProgressStore,
+    /// Stable identity shared with this client's transfer callback dispatcher.
+    callback_dispatcher_owner: crate::inner::cb_dispatcher::CallbackDispatcherOwner,
     /// Global closed flag. Once set to `true`, task control APIs reject calls.
     closed: Arc<AtomicBool>,
 }
@@ -180,6 +184,7 @@ impl MeowClient {
             close_notify: Arc::new(tokio::sync::Notify::new()),
             config,
             global_progress_listener: Arc::new(RwLock::new(Arc::from([]))),
+            callback_dispatcher_owner: crate::inner::cb_dispatcher::CallbackDispatcherOwner::new(),
             closed: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -263,6 +268,7 @@ impl MeowClient {
             self.config.clone(),
             Arc::new(default_http_transfer),
             self.global_progress_listener.clone(),
+            self.callback_dispatcher_owner.clone(),
         )?);
         self.executor.set(exec).map_err(|_| {
             crate::meow_error_log!(
@@ -833,7 +839,6 @@ impl MeowClient {
     where
         PCB: Fn(FileTransferRecord) + Send + Sync + 'static,
     {
-        type TerminalMsg = Result<(TaskId, Option<String>), MeowError>;
         let (tx, rx) = oneshot::channel::<TerminalMsg>();
         let tx_slot: Arc<StdMutex<Option<oneshot::Sender<TerminalMsg>>>> =
             Arc::new(StdMutex::new(Some(tx)));
@@ -1055,8 +1060,9 @@ impl MeowClient {
     ///
     /// # Errors
     ///
-    /// Returns `ClientClosed` when already closed, or underlying executor close
-    /// errors when shutdown is not completed.
+    /// Returns `ClientClosed` when already closed, `InvalidTaskState` when
+    /// synchronously awaited from this client's transfer callback dispatcher,
+    /// or underlying executor close errors when shutdown is not completed.
     ///
     /// # Examples
     ///
@@ -1070,6 +1076,19 @@ impl MeowClient {
     /// # }
     /// ```
     pub async fn close(&self) -> Result<(), MeowError> {
+        // Close drains and joins the Pounce callback dispatcher before replying.
+        // Reject on that same thread before touching any lifecycle bit or sending
+        // a command; otherwise the callback waits for close while close waits for
+        // the callback to return. Callers may schedule close elsewhere after the
+        // callback returns without changing normal callback-drain semantics.
+        if crate::inner::cb_dispatcher::is_callback_dispatcher_thread_for(
+            &self.callback_dispatcher_owner,
+        ) {
+            return Err(MeowError::from_code_str(
+                InnerErrorCode::InvalidTaskState,
+                "close cannot be awaited from a transfer callback; schedule it after the callback returns",
+            ));
+        }
         let close_notification = self.close_notify.notified();
         tokio::pin!(close_notification);
         // `notify_waiters` does not retain a permit for a Future that has not
@@ -1314,8 +1333,8 @@ async fn run_mixed_close_attempt(
 }
 
 fn send_terminal_once(
-    slot: &Arc<StdMutex<Option<oneshot::Sender<Result<(TaskId, Option<String>), MeowError>>>>>,
-    msg: Result<(TaskId, Option<String>), MeowError>,
+    slot: &Arc<StdMutex<Option<oneshot::Sender<TerminalMsg>>>>,
+    msg: TerminalMsg,
 ) {
     if let Ok(mut guard) = slot.lock() {
         if let Some(sender) = guard.take() {

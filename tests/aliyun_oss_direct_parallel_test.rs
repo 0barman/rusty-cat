@@ -41,7 +41,6 @@ struct ServerState {
 struct OssMock {
     base_url: String,
     state: Arc<Mutex<ServerState>>,
-    etag_seq: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -77,7 +76,6 @@ impl OssMock {
         Self {
             base_url: format!("http://{addr}"),
             state,
-            etag_seq,
             stop,
             handle: Some(handle),
         }
@@ -291,7 +289,10 @@ async fn oss_direct_parallel_parts_upload_concurrently_and_complete_once() {
         matches!(terminal, Some(TransferStatus::Complete)),
         "concurrent OSS direct upload must reach Complete, got {terminal:?}"
     );
-    assert_eq!(initiate_calls, 1, "Initiate Multipart must fire exactly once");
+    assert_eq!(
+        initiate_calls, 1,
+        "Initiate Multipart must fire exactly once"
+    );
     assert_eq!(
         parts,
         (1..=n_parts as u64).collect::<Vec<_>>(),

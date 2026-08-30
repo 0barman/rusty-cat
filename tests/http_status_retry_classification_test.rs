@@ -113,9 +113,8 @@ fn handle_conn(mut stream: std::net::TcpStream, status_line: &str, hits: Arc<Ato
                     }
                     // Count only after we have a full request.
                     hits.fetch_add(1, Ordering::AcqRel);
-                    let resp = format!(
-                        "{status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    );
+                    let resp =
+                        format!("{status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                     let _ = stream.write_all(resp.as_bytes());
                     let _ = stream.flush();
                     return;
@@ -236,8 +235,7 @@ async fn hard_4xx_response_fast_fails_without_retry() {
     // 403 is a hard client error: re-sending the same request cannot help, so the
     // retry layer must NOT retry — exactly one upload attempt, then Failed, even
     // though up to 5 retries are allowed.
-    let (terminal, hits) =
-        run_against_status("forbidden", "HTTP/1.1 403 Forbidden", 5).await;
+    let (terminal, hits) = run_against_status("forbidden", "HTTP/1.1 403 Forbidden", 5).await;
 
     assert!(
         matches!(terminal, Some(TransferStatus::Failed(_))),

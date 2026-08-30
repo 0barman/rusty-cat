@@ -85,7 +85,11 @@ impl Drop for AzureMock {
     }
 }
 
-fn handle_conn(mut stream: std::net::TcpStream, state: Arc<Mutex<ServerState>>, block_delay_ms: u64) {
+fn handle_conn(
+    mut stream: std::net::TcpStream,
+    state: Arc<Mutex<ServerState>>,
+    block_delay_ms: u64,
+) {
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
     stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
 
@@ -148,7 +152,10 @@ fn handle_conn(mut stream: std::net::TcpStream, state: Arc<Mutex<ServerState>>, 
         ("HTTP/1.1 201 Created", "")
     } else if method == "GET" {
         // List uncommitted blocks (only hit on resume; fresh prepare is local).
-        ("HTTP/1.1 200 OK", "<?xml version=\"1.0\"?><BlockList></BlockList>")
+        (
+            "HTTP/1.1 200 OK",
+            "<?xml version=\"1.0\"?><BlockList></BlockList>",
+        )
     } else {
         ("HTTP/1.1 200 OK", "")
     };

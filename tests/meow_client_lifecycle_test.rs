@@ -6,7 +6,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -427,5 +427,168 @@ async fn close_waits_for_already_dispatched_callbacks_to_finish() {
     );
 
     let _ = fs::remove_file(&path);
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn progress_callback_close_is_rejected_without_deadlock() {
+    let client = Arc::new(MeowClient::new(MeowConfig::default()));
+    let callback_client = Arc::clone(&client);
+    let attempted = Arc::new(AtomicBool::new(false));
+    let attempted_in_callback = Arc::clone(&attempted);
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let path = temp_download_path("progress_callback_close");
+
+    client
+        .try_enqueue_paused(
+            DownloadPounceBuilder::new(
+                "progress-callback-close.bin",
+                &path,
+                1024,
+                "https://example.invalid/progress-callback-close.bin",
+            )
+            .build(),
+            move |_record: FileTransferRecord| {
+                if !attempted_in_callback.swap(true, Ordering::SeqCst) {
+                    let _ = result_tx.send(block_on_without_tokio(callback_client.close()));
+                }
+            },
+            |_, _| {},
+        )
+        .await
+        .expect("import paused task");
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || result_rx.recv_timeout(Duration::from_secs(1))),
+    )
+    .await
+    .expect("progress callback close attempt timed out")
+    .expect("progress callback result waiter panicked")
+    .expect("progress callback did not return from close");
+    let error = result.expect_err("close from a progress callback must be rejected");
+    assert_eq!(error.code(), InnerErrorCode::InvalidTaskState as i32);
+    assert!(
+        !client.is_closed(),
+        "rejected callback close must not mutate client lifecycle"
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), client.close())
+        .await
+        .expect("normal close timed out after rejected callback close")
+        .expect("normal close after rejected callback close");
+    let _ = fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn progress_callback_may_close_an_independent_client() {
+    let callback_owner = Arc::new(MeowClient::new(MeowConfig::default()));
+    let independent = Arc::new(MeowClient::new(MeowConfig::default()));
+    let independent_for_callback = Arc::clone(&independent);
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let owner_path = temp_download_path("cross_client_callback_owner");
+    let independent_path = temp_download_path("cross_client_callback_target");
+
+    independent
+        .try_enqueue_paused(
+            DownloadPounceBuilder::new(
+                "cross-client-target.bin",
+                &independent_path,
+                1024,
+                "https://example.invalid/cross-client-target.bin",
+            )
+            .build(),
+            |_record: FileTransferRecord| {},
+            |_, _| {},
+        )
+        .await
+        .expect("initialize independent client dispatcher");
+
+    callback_owner
+        .try_enqueue_paused(
+            DownloadPounceBuilder::new(
+                "cross-client-owner.bin",
+                &owner_path,
+                1024,
+                "https://example.invalid/cross-client-owner.bin",
+            )
+            .build(),
+            move |_record: FileTransferRecord| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("create callback-local runtime");
+                let _ = result_tx.send(runtime.block_on(independent_for_callback.close()));
+            },
+            |_, _| {},
+        )
+        .await
+        .expect("import callback owner task");
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || result_rx.recv_timeout(Duration::from_secs(1))),
+    )
+    .await
+    .expect("cross-client close attempt timed out")
+    .expect("cross-client close result waiter panicked")
+    .expect("callback did not return from cross-client close");
+    result.expect("a callback may close an independent client");
+    assert!(independent.is_closed());
+
+    tokio::time::timeout(Duration::from_secs(2), callback_owner.close())
+        .await
+        .expect("callback owner close timed out")
+        .expect("close callback owner");
+    let _ = fs::remove_file(owner_path);
+    let _ = fs::remove_file(independent_path);
+}
+
+#[tokio::test]
+async fn complete_callback_close_is_rejected_without_deadlock() {
+    let payload = b"complete-callback-close".repeat(1024);
+    let server = dev_server::DevFileServer::spawn(payload);
+    let client = Arc::new(MeowClient::new(MeowConfig::default()));
+    let callback_client = Arc::clone(&client);
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let path = temp_download_path("complete_callback_close");
+
+    client
+        .try_enqueue(
+            DownloadPounceBuilder::new(
+                "complete-callback-close.bin",
+                &path,
+                1024,
+                format!("{}/download/complete-callback-close.bin", server.base_url()),
+            )
+            .build(),
+            |_record: FileTransferRecord| {},
+            move |_, _| {
+                let _ = result_tx.send(block_on_without_tokio(callback_client.close()));
+            },
+        )
+        .await
+        .expect("enqueue callback-close task");
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::task::spawn_blocking(move || result_rx.recv_timeout(Duration::from_secs(2))),
+    )
+    .await
+    .expect("complete callback close attempt timed out")
+    .expect("complete callback result waiter panicked")
+    .expect("complete callback did not return from close");
+    let error = result.expect_err("close from a complete callback must be rejected");
+    assert_eq!(error.code(), InnerErrorCode::InvalidTaskState as i32);
+    assert!(
+        !client.is_closed(),
+        "rejected callback close must not mutate client lifecycle"
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), client.close())
+        .await
+        .expect("normal close timed out after rejected complete callback close")
+        .expect("normal close after rejected complete callback close");
+    let _ = fs::remove_file(path);
     server.shutdown();
 }

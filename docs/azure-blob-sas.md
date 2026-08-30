@@ -4,7 +4,10 @@ This guide explains how to use `rusty-cat` with Azure Blob SAS URLs. SAS mode me
 
 SAS mode is the preferred Azure integration for untrusted clients. The storage account key stays on your backend, while the client receives a scoped URL with limited permissions and a limited lifetime.
 
-Example source: [../examples/azure_blob_sas_chunk_transfer.rs](../examples/azure_blob_sas_chunk_transfer.rs)
+Runnable test coverage lives in [`test-app`](../../test-app/README.md): the
+`loonadm` path consumes backend-issued upload URLs, while
+[`download::oss_azure`](../../test-app/src/download/oss_azure.rs) exercises a
+read-only Azure SAS download.
 
 ## Security model
 
@@ -21,17 +24,25 @@ For upload, the SAS token generally needs write (`w`) permission, and create (`c
 
 ```toml
 [dependencies]
-rusty-cat = { version = "0.2.4", features = ["azure-blob-sas"] }
+rusty-cat = { version = "0.3.6", features = ["azure-blob-sas"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-Run the official example with:
+Run the backend-issued presigned/SAS flow from the repository root:
 
 ```text
-cargo run --example azure_blob_sas_chunk_transfer --features azure-blob-sas
+cargo run --manifest-path test-app/Cargo.toml -- loonadm
 ```
 
-Before running it, replace `BLOB_SAS_URL` and `DOWNLOAD_SAS_URL` in [../examples/azure_blob_sas_chunk_transfer.rs](../examples/azure_blob_sas_chunk_transfer.rs).
+The upload URLs come from the backend multipart-init response. The fixed
+read-only validation URL is `AZURE_SAS_URL` in
+[`test-app/src/config.rs`](../../test-app/src/config.rs). To validate another
+SAS download without running the backend flow, set `RC_DIRECT_URL` and run the
+`direct-download` test-app scenario.
+
+```text
+cargo run --manifest-path test-app/Cargo.toml -- direct-download
+```
 
 ## Upload flow
 
@@ -112,6 +123,13 @@ High-level process:
 4. Attach `PresignedRangeDownload` to `DownloadPounceBuilder`.
 5. Submit with `enqueue_and_wait(...)` and await the terminal result.
 6. If the SAS URL expires during a long download, request a fresh SAS URL from your backend and retry according to your application policy.
+
+`with_total_size` skips HEAD. It therefore cannot authenticate or reuse an old
+`.rcdl` checkpoint; existing local bytes are fetched again from byte zero. For
+cross-process resume, provide a HEAD-capable metadata URL that returns a strong
+ETag. Whether serial or parallel, a run needing multiple ranges must receive one
+stable strong ETag on every 206 response; a one-range run may omit it only when
+HEAD did not prepare a validator.
 
 ```rust,no_run
 use std::sync::Arc;

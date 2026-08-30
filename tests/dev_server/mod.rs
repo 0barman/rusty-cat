@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+type HttpRequest = (String, Vec<(String, String)>, Vec<u8>);
+
 #[derive(Debug, Default, Clone)]
 pub struct UploadInspector {
     pub prepare_calls: usize,
@@ -66,10 +68,8 @@ impl DevFileServer {
                 if let Err(e) = handle_one_connection(&mut stream, &payload, &inspector_for_thread)
                 {
                     let _ = stream.write_all(
-                        format!(
-                            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        )
-                        .as_bytes(),
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .as_bytes(),
                     );
                     let _ = stream.flush();
                     eprintln!("dev file server connection error: {e}");
@@ -276,7 +276,10 @@ fn handle_one_connection(
             write_http_response(
                 stream,
                 "200 OK",
-                vec![("Content-Length".to_string(), payload.len().to_string())],
+                vec![
+                    ("Content-Length".to_string(), payload.len().to_string()),
+                    ("ETag".to_string(), "\"dev-server-payload-v1\"".to_string()),
+                ],
                 &[],
             )
             .map_err(|e| e.to_string())?;
@@ -308,6 +311,7 @@ fn handle_one_connection(
                         format!("bytes {}-{}/{}", start, end, payload.len()),
                     ),
                     ("Content-Length".to_string(), chunk.len().to_string()),
+                    ("ETag".to_string(), "\"dev-server-payload-v1\"".to_string()),
                 ],
                 chunk,
             )
@@ -369,9 +373,7 @@ fn handle_one_connection(
     Ok(())
 }
 
-fn read_http_request(
-    stream: &mut std::net::TcpStream,
-) -> std::io::Result<(String, Vec<(String, String)>, Vec<u8>)> {
+fn read_http_request(stream: &mut std::net::TcpStream) -> std::io::Result<HttpRequest> {
     let mut buf = Vec::new();
     let mut temp = [0u8; 4096];
     let mut idle_reads = 0u32;

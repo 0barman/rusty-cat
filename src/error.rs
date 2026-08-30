@@ -87,7 +87,14 @@ impl MeowError {
     /// ```
     pub fn new(code: i32, msg: String) -> Self {
         crate::log::emit_lazy(|| {
-            crate::log::Log::debug("error", format!("MeowError::new code={} msg={}", code, msg))
+            crate::log::Log::debug(
+                "error",
+                format!(
+                    "MeowError::new code={} msg={}",
+                    code,
+                    crate::log::redact_secrets(&msg)
+                ),
+            )
         });
         MeowError {
             code,
@@ -189,7 +196,11 @@ impl MeowError {
         crate::log::emit_lazy(|| {
             crate::log::Log::debug(
                 "error",
-                format!("MeowError::from_code code={:?} msg={}", code, msg),
+                format!(
+                    "MeowError::from_code code={:?} msg={}",
+                    code,
+                    crate::log::redact_secrets(&msg)
+                ),
             )
         });
         MeowError {
@@ -214,7 +225,11 @@ impl MeowError {
         crate::log::emit_lazy(|| {
             crate::log::Log::debug(
                 "error",
-                format!("MeowError::from_code_str code={:?} msg={}", code, msg),
+                format!(
+                    "MeowError::from_code_str code={:?} msg={}",
+                    code,
+                    crate::log::redact_secrets(msg)
+                ),
             )
         });
         MeowError {
@@ -249,7 +264,9 @@ impl MeowError {
                 "error",
                 format!(
                     "MeowError::from_source code={:?} msg={} source={}",
-                    code, msg, source_preview
+                    code,
+                    crate::log::redact_secrets(&msg),
+                    crate::log::redact_secrets(&source_preview)
                 ),
             )
         });

@@ -18,6 +18,9 @@ pub(crate) struct SchedulerState {
     max_upload_concurrency: usize,
     /// 下载方向的并发上限；与 `max_upload_concurrency` 对称，控制下载组的并行度。
     max_download_concurrency: usize,
+    /// Byte-level backpressure shared by parallel parts from every active file
+    /// owned by this client executor.
+    parallel_memory_budget: crate::inner::exec_impl::memory_budget::ParallelMemoryBudget,
     /// 全局进度监听器集合（监听器 id + 回调）；每次状态变更时会广播到这里注册的回调。
     global_progress_listener: GlobalProgressStore,
 
@@ -33,6 +36,11 @@ pub(crate) struct SchedulerState {
     paused_set: HashSet<UniqueId>,
     /// 正在执行中的任务组；值里持有取消令牌等运行态信息，供取消与并发统计使用。
     active: HashMap<UniqueId, ActiveState>,
+    /// 已接受用户 cancel、正等待 worker 收敛的执行中组。
+    ///
+    /// 组和 active 状态在 worker 终态事件到达前必须保留：这样 Canceled
+    /// 回调才不会早于文件 checkpoint、实际文件锁和 path lease 释放。
+    canceling_set: HashSet<UniqueId>,
     /// Active group counts by direction. These are updated atomically with
     /// `active` through the methods below so scheduler capacity checks are O(1).
     active_uploads: usize,
@@ -62,6 +70,8 @@ impl SchedulerState {
         Self {
             max_upload_concurrency,
             max_download_concurrency,
+            parallel_memory_budget:
+                crate::inner::exec_impl::memory_budget::ParallelMemoryBudget::for_current_target(),
             global_progress_listener,
             groups: HashMap::new(),
             task_id_to_dedupe: HashMap::new(),
@@ -69,6 +79,7 @@ impl SchedulerState {
             queued_set: HashSet::new(),
             paused_set: HashSet::new(),
             active: HashMap::new(),
+            canceling_set: HashSet::new(),
             active_uploads: 0,
             active_downloads: 0,
             offsets: HashMap::new(),
@@ -83,6 +94,12 @@ impl SchedulerState {
 
     pub(crate) fn max_download_concurrency(&self) -> usize {
         self.max_download_concurrency
+    }
+
+    pub(crate) fn parallel_memory_budget(
+        &self,
+    ) -> &crate::inner::exec_impl::memory_budget::ParallelMemoryBudget {
+        &self.parallel_memory_budget
     }
 
     pub(crate) fn global_progress_listener(&self) -> &GlobalProgressStore {
@@ -123,6 +140,14 @@ impl SchedulerState {
 
     pub(crate) fn active(&self) -> &HashMap<UniqueId, ActiveState> {
         &self.active
+    }
+
+    pub(crate) fn canceling_set(&self) -> &HashSet<UniqueId> {
+        &self.canceling_set
+    }
+
+    pub(crate) fn canceling_set_mut(&mut self) -> &mut HashSet<UniqueId> {
+        &mut self.canceling_set
     }
 
     pub(crate) fn active_direction_count(&self, direction: Direction) -> usize {

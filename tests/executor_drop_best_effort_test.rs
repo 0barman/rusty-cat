@@ -16,11 +16,11 @@ use rusty_cat::{set_debug_log_listener, DebugLogListener};
 
 /// 全局日志监听器是进程级单例，而 Rust 集成测试默认在同一二进制内并行执行。
 /// 为避免各用例互相覆盖监听器，使用一把专属互斥量串行化这些用例。
-fn serial_guard() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+async fn serial_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()
-        .expect("serial guard lock")
+        .await
 }
 
 /// 线程安全地聚合 `executor_drop` 相关日志，供断言使用。
@@ -73,7 +73,7 @@ impl DropLogCollector {
 
 #[tokio::test]
 async fn dropping_meow_client_without_close_emits_warn_and_does_not_hang() {
-    let _guard = serial_guard();
+    let _guard = serial_guard().await;
     let collector = Arc::new(DropLogCollector::default());
     collector.install();
 
@@ -114,7 +114,7 @@ async fn dropping_meow_client_without_close_emits_warn_and_does_not_hang() {
 
 #[tokio::test]
 async fn dropping_meow_client_after_close_does_not_emit_warn() {
-    let _guard = serial_guard();
+    let _guard = serial_guard().await;
     let collector = Arc::new(DropLogCollector::default());
     collector.install();
 
@@ -151,7 +151,7 @@ async fn dropping_meow_client_after_close_does_not_emit_warn() {
 async fn dropping_meow_client_without_ever_touching_executor_is_silent() {
     // 从未使用过的 client（executor 懒初始化槽位仍为空）被 Drop，
     // 不应触发任何 executor_drop 相关日志：因为根本没有后台线程需要回收。
-    let _guard = serial_guard();
+    let _guard = serial_guard().await;
     let collector = Arc::new(DropLogCollector::default());
     collector.install();
 

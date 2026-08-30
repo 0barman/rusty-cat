@@ -113,21 +113,23 @@ impl PresignedMultipartUpload {
             return Ok(part);
         };
 
-        let refreshed = refresher.refresh_upload_part(&part).await.map_err(|e| {
-            crate::log::emit_lazy(|| {
-                crate::log::Log::error(
-                    "upload_part",
-                    format!(
-                        "presigned upload-part re-sign failed: {}",
-                        crate::log::redact_secrets(&e.to_string())
-                    ),
-                )
-                .with_part(part.part_number)
-                .with_range(part.offset, part.size)
-                .with_url(part.url.as_str())
-            });
-            e
-        })?;
+        let refreshed = refresher
+            .refresh_upload_part(&part)
+            .await
+            .inspect_err(|e| {
+                crate::log::emit_lazy(|| {
+                    crate::log::Log::error(
+                        "upload_part",
+                        format!(
+                            "presigned upload-part re-sign failed: {}",
+                            crate::log::redact_secrets(&e.to_string())
+                        ),
+                    )
+                    .with_part(part.part_number)
+                    .with_range(part.offset, part.size)
+                    .with_url(part.url.as_str())
+                });
+            })?;
         if refreshed.part_number != part.part_number
             || refreshed.offset != part.offset
             || refreshed.size != part.size
@@ -417,7 +419,10 @@ impl BreakpointUpload for PresignedMultipartUpload {
         crate::log::emit_lazy(|| {
             crate::log::Log::trace(
                 "upload_part",
-                format!("presigned part committed to uploaded_parts part={}", part.part_number),
+                format!(
+                    "presigned part committed to uploaded_parts part={}",
+                    part.part_number
+                ),
             )
             .with_task_id(ctx.task.file_sign())
             .with_part(part.part_number)
@@ -446,19 +451,22 @@ impl BreakpointUpload for PresignedMultipartUpload {
         let body = if let Some(body) = &req.body {
             Some(body.clone())
         } else if let Some(builder) = &self.plan.complete_body_builder {
-            Some(builder.build_body(&self.plan, &uploaded_parts).map_err(|e| {
-                crate::log::emit_lazy(|| {
-                    crate::log::Log::error(
-                        "complete",
-                        format!(
-                            "complete build_body failed: {}",
-                            crate::log::redact_secrets(&e.to_string())
-                        ),
-                    )
-                    .with_url(req.url.as_str())
-                });
-                e
-            })?)
+            Some(
+                builder
+                    .build_body(&self.plan, &uploaded_parts)
+                    .inspect_err(|e| {
+                        crate::log::emit_lazy(|| {
+                            crate::log::Log::error(
+                                "complete",
+                                format!(
+                                    "complete build_body failed: {}",
+                                    crate::log::redact_secrets(&e.to_string())
+                                ),
+                            )
+                            .with_url(req.url.as_str())
+                        });
+                    })?,
+            )
         } else if req.uploaded_parts_json_body {
             Some(self.completion_json_body(&uploaded_parts)?)
         } else {

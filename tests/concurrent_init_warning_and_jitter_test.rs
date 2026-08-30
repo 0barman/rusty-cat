@@ -23,11 +23,11 @@ fn temp_download_path(case: &str, idx: usize) -> PathBuf {
     p
 }
 
-fn serial_guard() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+async fn serial_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()
-        .expect("serial guard lock")
+        .await
 }
 
 #[derive(Default)]
@@ -57,7 +57,7 @@ impl InitLogCollector {
 
 #[tokio::test]
 async fn concurrent_first_init_does_not_emit_executor_drop_warn_or_multi_start_jitter() {
-    let _guard = serial_guard();
+    let _guard = serial_guard().await;
     let collector = Arc::new(InitLogCollector::default());
     collector.install();
 

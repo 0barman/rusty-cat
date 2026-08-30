@@ -103,7 +103,9 @@ pub(crate) async fn transfer_chunk_with_retry(
         // 真正执行一次分片传输。两种模式仅调用的 executor 方法不同，重试语义一致。
         let transfer = match mode {
             ChunkTransferMode::Whole => {
-                executor.transfer_chunk(task, offset, chunk_size, known_total).await
+                executor
+                    .transfer_chunk(task, offset, chunk_size, known_total)
+                    .await
             }
             ChunkTransferMode::Part => {
                 executor
@@ -129,7 +131,8 @@ pub(crate) async fn transfer_chunk_with_retry(
             Err(err) => {
                 // pause/cancel 可能在 in-flight 请求返回后才落到令牌上；此时错误常为 HttpError
                 //（底层 Canceled/reset），应优先走取消分支而不是按网络错误重试或失败。
-                if cancel.is_cancelled() {
+                let cancellation_related = cancellation_can_mask(&err);
+                if cancel.is_cancelled() && cancellation_related {
                     crate::meow_trace_log!(
                         "chunk_retry",
                         "cancel after chunk error: key={} offset={} attempt={} err={}",
@@ -203,6 +206,19 @@ pub(crate) async fn transfer_chunk_with_retry(
     }
 }
 
+/// Only transport errors that can be caused by aborting an in-flight request
+/// may be translated into the scheduler's `Cancelled` outcome. Local source
+/// integrity failures (for example `ChecksumMismatch`) must remain failures even
+/// when a pause/cancel races their return, so upload cleanup still aborts the
+/// provider session instead of publishing a resumable pause.
+pub(crate) fn cancellation_can_mask(error: &MeowError) -> bool {
+    matches!(
+        error.code(),
+        code if code == InnerErrorCode::HttpError as i32
+            || code == InnerErrorCode::TaskCanceled as i32
+    )
+}
+
 /// 判断网络/HTTP 层瞬时错误是否可按与分片相同的策略重试（prepare / chunk 共用）。
 ///
 /// 目前按“错误码边界常量”判定；后续如需动态配置可在此处平滑接入配置表。
@@ -269,7 +285,7 @@ pub(crate) fn calc_backoff_with_jitter_ms(attempt: u32) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_retryable_http_status, is_transport_retryable};
+    use super::{cancellation_can_mask, is_retryable_http_status, is_transport_retryable};
     use crate::error::{InnerErrorCode, MeowError};
 
     fn response_status_err(status: Option<u16>) -> MeowError {
@@ -323,6 +339,22 @@ mod tests {
         // A code outside the retryable set is never retried.
         assert!(!is_transport_retryable(&MeowError::from_code1(
             InnerErrorCode::InvalidRange
+        )));
+    }
+
+    #[test]
+    fn cancellation_never_masks_local_integrity_failure() {
+        assert!(!cancellation_can_mask(&MeowError::from_code1(
+            InnerErrorCode::ChecksumMismatch
+        )));
+        assert!(!cancellation_can_mask(&MeowError::from_code1(
+            InnerErrorCode::LocalFileRemoved
+        )));
+        assert!(cancellation_can_mask(&MeowError::from_code1(
+            InnerErrorCode::HttpError
+        )));
+        assert!(cancellation_can_mask(&MeowError::from_code1(
+            InnerErrorCode::TaskCanceled
         )));
     }
 }

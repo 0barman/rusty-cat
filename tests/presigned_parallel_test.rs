@@ -92,12 +92,8 @@ impl Drop for PutServer {
 
 fn handle_put(mut stream: std::net::TcpStream, etag: u64, total: u64, chunk: u64) {
     stream.set_nonblocking(false).ok();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .ok();
-    stream
-        .set_write_timeout(Some(Duration::from_secs(2)))
-        .ok();
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
 
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
@@ -267,7 +263,11 @@ async fn presigned_parallel_out_of_order_records_every_part_once_and_completes()
     let mut by_offset: BTreeMap<u64, u64> = BTreeMap::new();
     for p in &recorded {
         let prev = by_offset.insert(p.offset, p.size);
-        assert!(prev.is_none(), "offset {} recorded more than once", p.offset);
+        assert!(
+            prev.is_none(),
+            "offset {} recorded more than once",
+            p.offset
+        );
         assert!(p.etag.is_some(), "part at offset {} missing etag", p.offset);
     }
     let offsets: Vec<u64> = by_offset.keys().copied().collect();

@@ -60,6 +60,22 @@ impl AliOssDirectDownload {
 }
 
 impl BreakpointDownload for AliOssDirectDownload {
+    fn resume_identity(&self, task: &TransferTask) -> Result<Option<Vec<u8>>, MeowError> {
+        let mut headers = task.headers().clone();
+        if !headers.contains_key(ACCEPT) {
+            headers.insert(ACCEPT, header_value(DEFAULT_RANGE_ACCEPT)?);
+        }
+        let mut context = crate::http_breakpoint::canonical_resume_headers(headers);
+        context.extend_from_slice(b"rusty-cat/aliyun-oss-direct/v1\0");
+        crate::http_breakpoint::append_resume_identity_field(&mut context, self.bucket.as_bytes());
+        crate::http_breakpoint::append_resume_identity_field(
+            &mut context,
+            self.access_key_id.as_bytes(),
+        );
+        crate::http_breakpoint::append_resume_identity_field(&mut context, self.region.as_bytes());
+        Ok(Some(context))
+    }
+
     fn merge_head_headers(&self, ctx: DownloadHeadCtx<'_>) -> Result<(), MeowError> {
         self.apply_signed_headers(ctx.task, "HEAD", ctx.base)
     }

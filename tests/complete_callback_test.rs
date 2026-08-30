@@ -11,6 +11,8 @@ use rusty_cat::{
     UploadPounceBuilder,
 };
 
+type CompleteCalls = Arc<Mutex<Vec<(TaskId, Option<String>)>>>;
+
 fn temp_upload_path(case: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
     let ts = SystemTime::now()
@@ -65,8 +67,7 @@ async fn complete_callback_receives_payload_from_upload_protocol() {
             .build()
             .expect("valid config"),
     );
-    let complete_calls: Arc<Mutex<Vec<(TaskId, Option<String>)>>> =
-        Arc::new(Mutex::new(Vec::new()));
+    let complete_calls: CompleteCalls = Arc::new(Mutex::new(Vec::new()));
     let statuses: Arc<Mutex<Vec<TransferStatus>>> = Arc::new(Mutex::new(Vec::new()));
 
     let complete_calls_cb = complete_calls.clone();

@@ -20,7 +20,6 @@ use rusty_cat::http_breakpoint::{
 };
 use rusty_cat::meow_config::MeowConfig;
 use rusty_cat::transfer_status::TransferStatus;
-use rusty_cat::transfer_task::TransferTask;
 use rusty_cat::up_pounce_builder::UploadPounceBuilder;
 use rusty_cat::MeowClient;
 

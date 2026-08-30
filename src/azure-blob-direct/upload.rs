@@ -97,13 +97,12 @@ impl AzureBlobDirectUpload {
             self.account_name.as_str(),
             &key,
         )
-        .map_err(|e| {
+        .inspect_err(|e| {
             crate::log::emit_lazy(|| {
                 crate::log::Log::error("sign", "azure SharedKey signing failed")
                     .with_url(url.as_str())
                     .with_error_code(e.code())
             });
-            e
         })
     }
 
@@ -117,12 +116,11 @@ impl AzureBlobDirectUpload {
         if let Some(key) = guard.as_ref() {
             return Ok(key.clone());
         }
-        let key = decode_account_key(self.account_key_b64.as_str()).map_err(|e| {
+        let key = decode_account_key(self.account_key_b64.as_str()).inspect_err(|e| {
             crate::log::emit_lazy(|| {
                 crate::log::Log::error("sign", "azure account key base64 decode failed")
                     .with_error_code(e.code())
             });
-            e
         })?;
         *guard = Some(key.clone());
         Ok(key)

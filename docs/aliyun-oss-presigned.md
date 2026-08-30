@@ -4,7 +4,8 @@ This guide explains how to use `rusty-cat` with Aliyun OSS presigned URLs. Presi
 
 This is the recommended integration model for untrusted clients. The client does not need to know the AccessKey ID or AccessKey secret, and the backend can restrict each URL to a specific object, method, part number, and expiration time.
 
-Example source: [../examples/aliyun_oss_presigned_chunk_transfer.rs](../examples/aliyun_oss_presigned_chunk_transfer.rs)
+Runnable download scenario:
+[`test-app/src/download/aliyun_presigned.rs`](../../test-app/src/download/aliyun_presigned.rs)
 
 ## Security model
 
@@ -23,17 +24,23 @@ The client receives only temporary URLs and metadata. `rusty-cat` does not persi
 
 ```toml
 [dependencies]
-rusty-cat = { version = "0.2.4", features = ["aliyun-oss-presigned"] }
+rusty-cat = { version = "0.3.6", features = ["aliyun-oss-presigned"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-Run the official example with:
+Run the configured signed-download scenario from the repository root:
 
 ```text
-cargo run --example aliyun_oss_presigned_chunk_transfer --features aliyun-oss-presigned
+cargo run --manifest-path test-app/Cargo.toml -- aliyun-presigned
 ```
 
-Before running it, replace the placeholder URLs at the top of [../examples/aliyun_oss_presigned_chunk_transfer.rs](../examples/aliyun_oss_presigned_chunk_transfer.rs).
+The bundled URL is temporary. If it has expired, provide a fresh signed GET URL
+through `RC_ALIYUN_DOWNLOAD_URL`; optionally set
+`RC_ALIYUN_DOWNLOAD_EXPIRES_AT` to its Unix expiry time and
+`RC_EXPECTED_SIZE` to the expected object size. The scenario covers presigned
+range download only. Presigned multipart upload still requires the backend
+metadata described below: upload ID, part URLs, part boundaries, required
+headers, and completion semantics.
 
 ## Upload flow
 
@@ -133,6 +140,13 @@ High-level process:
 4. Attach the protocol with `with_breakpoint_download(...)`.
 5. Submit with `enqueue_and_wait(...)` and await the terminal result.
 6. If the URL expires during a long download, request a refreshed plan from your backend and retry or re-enqueue according to your application policy.
+
+`with_total_size` skips HEAD. It therefore cannot authenticate or reuse an old
+`.rcdl` checkpoint; existing local bytes are fetched again from byte zero. For
+cross-process resume, provide a HEAD-capable metadata URL that returns a strong
+ETag. Whether serial or parallel, a run needing multiple ranges must receive one
+stable strong ETag on every 206 response; a one-range run may omit it only when
+HEAD did not prepare a validator.
 
 ```rust,no_run
 use std::sync::Arc;

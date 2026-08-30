@@ -1,10 +1,20 @@
+use std::error::Error as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rusty_cat::log;
 use rusty_cat::{
-    debug_log_listener_active, set_debug_log_listener, try_set_debug_log_listener, Log, LogLevel,
+    debug_log_listener_active, set_debug_log_listener, try_set_debug_log_listener, InnerErrorCode,
+    Log, LogLevel, MeowError,
 };
+
+struct DebugLogListenerReset;
+
+impl Drop for DebugLogListenerReset {
+    fn drop(&mut self) {
+        let _ = set_debug_log_listener(None);
+    }
+}
 
 #[test]
 fn log_listener_register_duplicate_and_panic_suppression_paths() {
@@ -25,13 +35,20 @@ fn log_listener_register_duplicate_and_panic_suppression_paths() {
 
     let call_count = Arc::new(AtomicUsize::new(0));
     let count_ref = call_count.clone();
+    let captured_messages = Arc::new(Mutex::new(Vec::new()));
+    let captured_messages_ref = Arc::clone(&captured_messages);
     try_set_debug_log_listener(move |entry: Log| {
         count_ref.fetch_add(1, Ordering::Relaxed);
+        captured_messages_ref
+            .lock()
+            .expect("captured log messages")
+            .push(entry.message().to_owned());
         if entry.tag() == "panic_tag" {
             panic!("listener panic for suppression test");
         }
     })
     .expect("first log listener registration should succeed");
+    let listener_reset = DebugLogListenerReset;
     assert!(debug_log_listener_active(), "listener should become active");
 
     log::emit(Log::new(LogLevel::Info, "normal_tag", "emit path"));
@@ -43,6 +60,39 @@ fn log_listener_register_duplicate_and_panic_suppression_paths() {
         "panic suppression path",
     ));
 
+    // Error values retain their original diagnostic message for the caller,
+    // but constructor-side debug breadcrumbs must never publish signed URL or
+    // token values through the global listener.
+    const SECRET: &str = "constructor-secret-value";
+    let raw = MeowError::new(9999, format!("https://example.invalid/a?sig={SECRET}"));
+    let coded = MeowError::from_code(
+        InnerErrorCode::HttpError,
+        format!("https://example.invalid/b?token={SECRET}"),
+    );
+    let credential = format!("https://example.invalid/c?X-Amz-Credential={SECRET}");
+    let borrowed = MeowError::from_code_str(InnerErrorCode::ResponseStatusError, &credential);
+    let sourced = MeowError::from_source(
+        InnerErrorCode::HttpError,
+        format!("https://example.invalid/d?x-oss-signature={SECRET}"),
+        std::io::Error::other(format!(
+            "upstream https://example.invalid/e?security-token={SECRET}"
+        )),
+    );
+    for error in [&raw, &coded, &borrowed, &sourced] {
+        assert!(
+            error.msg().contains(SECRET),
+            "log redaction must not change the public error value: {error:?}"
+        );
+    }
+    assert!(
+        sourced
+            .source()
+            .expect("source error remains available")
+            .to_string()
+            .contains(SECRET),
+        "log redaction must not change the public error source"
+    );
+
     assert!(
         call_count.load(Ordering::Relaxed) >= 3,
         "listener should be invoked for normal/lazy/panic-tag emits"
@@ -53,5 +103,26 @@ fn log_listener_register_duplicate_and_panic_suppression_paths() {
         second_set.is_err(),
         "second try_set should fail when listener already exists"
     );
-    set_debug_log_listener(None).expect("clear listener after test");
+    drop(listener_reset);
+
+    let messages = captured_messages.lock().expect("captured log messages");
+    assert!(
+        messages.iter().all(|message| !message.contains(SECRET)),
+        "error constructor debug logs leaked a secret: {messages:?}"
+    );
+    let error_breadcrumbs = messages
+        .iter()
+        .filter(|message| message.contains("MeowError::"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        error_breadcrumbs.len(),
+        4,
+        "every exercised constructor must emit one breadcrumb: {messages:?}"
+    );
+    assert!(
+        error_breadcrumbs
+            .iter()
+            .all(|message| message.contains("REDACTED")),
+        "every error breadcrumb carrying a secret must visibly redact it: {messages:?}"
+    );
 }

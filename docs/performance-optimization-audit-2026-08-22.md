@@ -491,10 +491,10 @@ TDD 执行规则：每个工作项先把该行缺口转成会在旧实现上失�
 
 | ID | 状态 | 实施结果 |
 |---|---|---|
-| D0 | 核心逻辑完成；跨平台门禁待 CI | sidecar v2 绑定强 ETag 和语义 URL、保存并验证每 part SHA-256；无强 validator 时不信任旧 sidecar；每个 206 必须携带同一强 ETag；query 只剔除已识别的 AWS/Google/OSS/Azure 签名字段；目标 lease 覆盖进程内、跨进程、symlink/hardlink，并在 macOS 保守覆盖大小写别名；part/offset/sidecar 分配均受 checked arithmetic 和上限保护。 |
+| D0 | 核心逻辑完成；跨平台门禁待 CI | sidecar v2 绑定强 ETag 和语义 URL、保存并验证每 part SHA-256；无 strong validator 时不信任旧 sidecar。HEAD 已提供 strong ETag 时每个 206 必须一致；无 HEAD validator 的多 range 运行从首个 206 锁定并要求同一 strong ETag，单 range 可无 ETag。query 只剔除已识别的 AWS/Google/OSS/Azure 签名字段；目标 lease 覆盖进程内、跨进程、symlink/hardlink，并在 macOS 保守覆盖大小写别名；part/offset/sidecar 分配均受 checked arithmetic 和上限保护。 |
 | D1 | 完成 | 8 part epoch checkpoint，最后不足一批强制收敛，并增加真实 250 ms one-shot 定时触发；数据 barrier 成功后才原子替换含 bitmap+digest 的 sidecar；checkpoint I/O 移到 blocking worker；失败保留 pending，pause/cancel/final 路径重试或传播错误。 |
 | U0 | 完成 | 排队/暂停任务在初始 MD5 后关闭 FD；激活时重开并先强复验内容，再让所有 positioned read 共享同一 handle；完成前再次全内容校验，换版则 abort，不 complete。仅 metadata 一致不再被当成内容证明。 |
-| U1 | 完成 | Unix `read_at` / Windows `seek_read` 循环读取，去掉共享 cursor 锁；blocking read、short read、offset/usize 转换受控；实际进入并行 driver 后按真实 part grid 检查，最多 256 个 part task、512 MiB chunk window，串行降级和小文件不会被虚假的大配置拒绝。 |
+| U1 | 完成 | Unix `read_at` / Windows `seek_read` 循环读取，去掉共享 cursor 锁；blocking read、short read、offset/usize 转换受控；实际进入并行 driver 后按真实 part grid 检查，最多 256 个 part task；上传 body+verification scratch、下载 response frame+目标 Vec 双缓冲受每客户端共享预算约束（64 位 512 MiB、32 位 64 MiB），取消/panic 通过 RAII 释放 permit，串行降级和小文件不会被虚假的大配置拒绝。 |
 | S1 | 计划内必做阶段完成 | Progress event 不再触发无意义重调度；上传/下载活跃计数改为 O(1)，有计数一致性测试。ready index 仍按计划保持条件化：当前基准已证明 Progress 扫描被直接消除，尚无证据需要承担改变调度结构的风险。 |
 | U2 | 安全子项完成 | MD5 buffer 从 64 KiB 增至 1 MiB，初始 hash blocking jobs 由全局 semaphore 限制为 1–4；MD5/去重语义不变。为满足 U0，激活重开和完成前仍需强内容复验，因此不宣称减少整文件安全校验次数。 |
 | PR1 | 完成 | plan 使用不可变 `Arc` 快照和 single-flight refresh；URL 与 headers 来自同一快照；同步 refresher 在 blocking worker 中执行；递归刷新和 panic 转为受控错误。没有为此增加公开 trait 方法。 |

@@ -25,6 +25,7 @@ wire contracts, provider setup, restart behavior, and operational limits.
 | [Custom protocols](custom-protocols.md) | Implementing `BreakpointUpload` and `BreakpointDownload` |
 | [Progress, status, and observability](progress-status-observability.md) | Callbacks, status values, snapshots, logs, and metrics |
 | [Error codes](error-codes.md) | Stable numeric codes and retry classification |
+| [0.3.6 release notes](release-0.3.6.md) | Windows stable-Rust fix, checkpoint identity, locking boundary, and pre-release verification gates |
 
 ## HTTP and presigned protocols
 
@@ -41,9 +42,10 @@ wire contracts, provider setup, restart behavior, and operational limits.
 - [Azure Blob direct](azure-blob-direct.md)
 - [Azure Blob SAS](azure-blob-sas.md)
 
-## Examples and API reference
+## Test application and API reference
 
-- Runnable programs: [`../examples`](../examples)
+- Test coverage and verification scenarios: [English](test-scenarios.md) | [简体中文](test-scenarios.zh-CN.md)
+- Runnable transfer scenarios: [`../../test-app`](../../test-app/README.md)
 - Crate overview: [`../README.md`](../README.md)
 - Generate local API docs: `cargo doc -p rusty-cat --all-features --open`
 

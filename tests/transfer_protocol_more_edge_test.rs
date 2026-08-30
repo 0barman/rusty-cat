@@ -117,8 +117,8 @@ async fn download_invalid_content_range_unit_and_order_branches() {
     let status_a = run_download_case_with_responses(
         "invalid_unit",
         vec![
-            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n".to_string(),
-            "HTTP/1.1 206 Partial Content\r\nContent-Range: items 0-3/8\r\nContent-Length: 4\r\nConnection: close\r\n\r\nabcd".to_string(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nETag: \"edge-v1\"\r\nConnection: close\r\n\r\n".to_string(),
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: items 0-3/8\r\nContent-Length: 4\r\nETag: \"edge-v1\"\r\nConnection: close\r\n\r\nabcd".to_string(),
         ],
         Some(b""),
     )
@@ -136,8 +136,8 @@ async fn download_invalid_content_range_unit_and_order_branches() {
     let status_b = run_download_case_with_responses(
         "invalid_order",
         vec![
-            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n".to_string(),
-            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 3-0/8\r\nContent-Length: 4\r\nConnection: close\r\n\r\nabcd".to_string(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nETag: \"edge-v1\"\r\nConnection: close\r\n\r\n".to_string(),
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 3-0/8\r\nContent-Length: 4\r\nETag: \"edge-v1\"\r\nConnection: close\r\n\r\nabcd".to_string(),
         ],
         Some(b""),
     )
@@ -161,8 +161,8 @@ async fn download_body_length_mismatch_branch_is_detected() {
     let status = run_download_case_with_responses(
         "body_len_mismatch",
         vec![
-            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n".to_string(),
-            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/8\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc".to_string(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nETag: \"edge-v1\"\r\nConnection: close\r\n\r\n".to_string(),
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/8\r\nContent-Length: 3\r\nETag: \"edge-v1\"\r\nConnection: close\r\n\r\nabc".to_string(),
         ],
         Some(b""),
     )
