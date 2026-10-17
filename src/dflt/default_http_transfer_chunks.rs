@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_ENCODING, CONTENT_RANGE, IF_MATCH};
+use reqwest::header::{HeaderMap, HeaderValue, CONTENT_LENGTH, CONTENT_RANGE, IF_MATCH};
 use sha2::{Digest, Sha256};
 use tokio::fs::File;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -13,7 +13,11 @@ use crate::http_breakpoint::{
 use crate::transfer_task::TransferTask;
 use crate::upload_source::UploadSource;
 
-use super::download_generation_validator;
+use super::{
+    download_generation_validator, ensure_accept_encoding_identity,
+    ensure_response_identity_encoding, require_single_header, require_unambiguous_etag,
+    set_accept_encoding_identity,
+};
 
 const MAX_ERROR_BODY_PREVIEW_BYTES: usize = 4096;
 
@@ -117,6 +121,7 @@ async fn build_download_range_request(
     tokio::task::spawn_blocking(move || {
         let expected_if_match = expected_if_match_header(&task)?;
         let mut headers = base;
+        set_accept_encoding_identity(&mut headers);
         if let Some(value) = expected_if_match.as_ref() {
             headers.insert(IF_MATCH, value.clone());
         }
@@ -132,6 +137,7 @@ async fn build_download_range_request(
         if let Some(expected) = expected_if_match.as_ref() {
             ensure_expected_if_match_preserved(&headers, expected)?;
         }
+        ensure_accept_encoding_identity(&headers, "download Range request")?;
         Ok((range_url, headers))
     })
     .await
@@ -145,7 +151,9 @@ async fn build_download_range_request(
 
 /// Maps `reqwest::Error` into SDK error type.
 pub(crate) fn map_reqwest(e: reqwest::Error) -> MeowError {
-    MeowError::from_source(InnerErrorCode::HttpError, e.to_string(), e)
+    let e = e.without_url();
+    let message = e.to_string();
+    MeowError::from_source(InnerErrorCode::HttpError, message, e)
 }
 
 async fn rollback_download_file(file: &mut File, offset: u64, path: &std::path::Path) {
@@ -327,6 +335,41 @@ fn defer_upload_abort_until_worker_quiescence(task: &TransferTask) {
     task.require_upload_abort();
 }
 
+/// Validates the server-suggested cursor for the strict-serial upload path.
+///
+/// A server may acknowledge only a prefix of the chunk, but it cannot make the
+/// cursor stand still, move backwards, or claim bytes that were not in this
+/// request. Parallel uploads deliberately do not use this single-cursor rule.
+fn validate_serial_upload_ack(
+    offset: u64,
+    uploaded_end: u64,
+    total: u64,
+    next_byte: Option<u64>,
+) -> Result<u64, MeowError> {
+    let next = next_byte.unwrap_or(uploaded_end);
+    if next > total {
+        return Err(MeowError::from_code(
+            InnerErrorCode::InvalidRange,
+            format!("upload next offset exceeds total: next={next} total={total}"),
+        ));
+    }
+    if next <= offset {
+        return Err(MeowError::from_code(
+            InnerErrorCode::InvalidRange,
+            format!("upload next offset did not advance: offset={offset} next={next}"),
+        ));
+    }
+    if next > uploaded_end {
+        return Err(MeowError::from_code(
+            InnerErrorCode::InvalidRange,
+            format!(
+                "upload next offset exceeds sent chunk: next={next} uploaded_end={uploaded_end}"
+            ),
+        ));
+    }
+    Ok(next)
+}
+
 async fn validate_serial_upload_before_last_part(
     task: &TransferTask,
     offset: u64,
@@ -413,6 +456,9 @@ pub(crate) async fn upload_one_chunk_part(
             });
             e
         })?;
+    // Parallel progress is owned by the scheduler's local part grid. Keep the
+    // historical outcome for compatibility; the scheduler deliberately ignores
+    // this provider cursor when advancing its contiguous watermark.
     let next = info.next_byte.unwrap_or(uploaded_end).min(total);
     Ok(ChunkOutcome {
         next_offset: next,
@@ -492,7 +538,18 @@ pub(crate) async fn upload_one_chunk(
             });
             e
         })?;
-    let next = info.next_byte.unwrap_or(uploaded_end).min(total);
+    // `completed_file_id` remains the protocol's authoritative terminal signal
+    // (an existing public contract). Validate the cursor only when it controls
+    // the next serial source range.
+    let next = if info.completed_file_id.is_some() {
+        total
+    } else {
+        validate_serial_upload_ack(offset, uploaded_end, total, info.next_byte).inspect_err(
+            |_| {
+                defer_upload_abort_until_worker_quiescence(task);
+            },
+        )?
+    };
     if info.completed_file_id.is_some() || next >= total {
         if let Some(snapshot) = task.upload_file_snapshot() {
             // Metadata is never content proof (especially on stable Windows),
@@ -627,6 +684,71 @@ fn parse_content_range(value: &str) -> Result<(u64, u64, Option<u64>), MeowError
     Ok((start, end, total))
 }
 
+fn require_content_range(headers: &HeaderMap, mode: &str) -> Result<String, MeowError> {
+    require_single_header(headers, CONTENT_RANGE, mode)?
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            MeowError::from_code(
+                InnerErrorCode::InvalidRange,
+                format!("{mode} response missing content-range"),
+            )
+        })
+}
+
+fn validate_known_content_range_total(
+    range_total: Option<u64>,
+    expected_total: u64,
+    mode: &str,
+) -> Result<(), MeowError> {
+    match range_total {
+        Some(actual) if actual == expected_total => Ok(()),
+        Some(actual) => Err(MeowError::from_code(
+            InnerErrorCode::InvalidRange,
+            format!("{mode} content-range total mismatch: expected {expected_total}, got {actual}"),
+        )),
+        None => Err(MeowError::from_code(
+            InnerErrorCode::InvalidRange,
+            format!(
+                "{mode} content-range used wildcard total after total {expected_total} was known"
+            ),
+        )),
+    }
+}
+
+fn validate_optional_content_length(
+    headers: &HeaderMap,
+    expected_len: u64,
+    mode: &str,
+) -> Result<(), MeowError> {
+    let Some(value) = require_single_header(headers, CONTENT_LENGTH, mode)? else {
+        // A correctly framed chunked response has no Content-Length and is
+        // validated byte-for-byte by the streaming length guard below.
+        return Ok(());
+    };
+    let actual = value.parse::<u64>().map_err(|_| {
+        MeowError::from_code(
+            InnerErrorCode::InvalidRange,
+            format!("{mode} response contains an invalid content-length"),
+        )
+    })?;
+    if actual != expected_len {
+        return Err(MeowError::from_code(
+            InnerErrorCode::InvalidRange,
+            format!("{mode} content-length mismatch: expected {expected_len}, got {actual}"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_range_safety_headers(headers: &HeaderMap, mode: &str) -> Result<(), MeowError> {
+    ensure_response_identity_encoding(headers, mode)?;
+    // ETag remains optional for one-part compatibility, but it must never be
+    // selected from an ambiguous set. Multi-part requirements are enforced by
+    // `validate_or_latch_range_validator` after this cardinality check.
+    let _ = require_unambiguous_etag(headers, mode)?;
+    Ok(())
+}
+
 /// Downloads exactly one range chunk and appends/writes it to local file.
 pub(crate) async fn download_one_chunk(
     client: &reqwest::Client,
@@ -711,15 +833,13 @@ pub(crate) async fn download_one_chunk(
     let status = resp.status();
     if status != reqwest::StatusCode::PARTIAL_CONTENT {
         let body = read_error_body_preview(&mut resp, MAX_ERROR_BODY_PREVIEW_BYTES).await;
+        let safe_body = crate::log::redact_secrets(&body);
         crate::log::emit_lazy(|| {
             crate::log::Log::error(
                 "range_get",
                 format!(
                     "invalid status for range GET: status={} offset={} spec={} body={}",
-                    status,
-                    offset,
-                    spec,
-                    crate::log::redact_secrets(&body)
+                    status, offset, spec, safe_body
                 ),
             )
             .with_key(task.file_name())
@@ -729,20 +849,17 @@ pub(crate) async fn download_one_chunk(
         });
         return Err(MeowError::from_code(
             InnerErrorCode::InvalidRange,
-            format!("download GET requires 206 Partial Content, got {status}: {body}"),
+            format!("download GET requires 206 Partial Content, got {status}: {safe_body}"),
         ));
     }
-    let content_range = resp
-        .headers()
-        .get(CONTENT_RANGE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .ok_or_else(|| {
+    validate_range_safety_headers(resp.headers(), "serial range")?;
+    let content_range =
+        require_content_range(resp.headers(), "serial range").inspect_err(|_| {
             crate::log::emit_lazy(|| {
                 crate::log::Log::error(
                     "range_get",
                     format!(
-                        "missing content-range header: offset={} spec={}",
+                        "missing or ambiguous content-range header: offset={} spec={}",
                         offset, spec
                     ),
                 )
@@ -750,10 +867,6 @@ pub(crate) async fn download_one_chunk(
                 .with_offset(offset)
                 .with_url(sanitized_range_url.as_str())
             });
-            MeowError::from_code_str(
-                InnerErrorCode::InvalidRange,
-                "download response missing content-range for ranged GET",
-            )
         })?;
     let (range_start, range_end, range_total) = parse_content_range(&content_range)?;
     if range_start != offset {
@@ -785,26 +898,7 @@ pub(crate) async fn download_one_chunk(
             ),
         ));
     }
-    if let Some(rt) = range_total {
-        if rt != total {
-            crate::log::emit_lazy(|| {
-                crate::log::Log::error(
-                    "range_get",
-                    format!(
-                        "content-range total mismatch: head_total={} range_total={}",
-                        total, rt
-                    ),
-                )
-                .with_key(task.file_name())
-                .with_offset(offset)
-                .with_url(sanitized_range_url.as_str())
-            });
-            return Err(MeowError::from_code(
-                InnerErrorCode::InvalidRange,
-                format!("download total size changed: HEAD={total}, Content-Range={rt}"),
-            ));
-        }
-    }
+    validate_known_content_range_total(range_total, total, "serial range")?;
     let expected_len = range_end
         .checked_sub(range_start)
         .and_then(|len| len.checked_add(1))
@@ -814,6 +908,7 @@ pub(crate) async fn download_one_chunk(
                 "content-range length overflow",
             )
         })?;
+    validate_optional_content_length(resp.headers(), expected_len, "serial range")?;
     validate_or_latch_range_validator(
         task,
         download_generation_validator(resp.headers()),
@@ -1016,43 +1111,14 @@ pub(crate) async fn download_one_chunk_part_positioned(
     }
     if status != reqwest::StatusCode::PARTIAL_CONTENT {
         let body = read_error_body_preview(&mut resp, MAX_ERROR_BODY_PREVIEW_BYTES).await;
+        let safe_body = crate::log::redact_secrets(&body);
         return Err(MeowError::from_code(
             InnerErrorCode::InvalidRange,
-            format!("range GET requires 206, got {status}: {body}"),
+            format!("range GET requires 206, got {status}: {safe_body}"),
         ));
     }
-    if let Some(encoding) = resp.headers().get(CONTENT_ENCODING) {
-        let encoding = encoding.to_str().unwrap_or("<invalid>");
-        if !encoding.eq_ignore_ascii_case("identity") {
-            return Err(MeowError::from_code(
-                InnerErrorCode::InvalidRange,
-                format!("parallel range response used content-encoding {encoding}"),
-            ));
-        }
-    }
-    // Every range in one positioned download must prove that it belongs to one
-    // immutable remote generation. HEAD may have supplied the validator; when
-    // callers intentionally skip HEAD, the first 206 latches it under the
-    // progress lock and every concurrent response is compared with that value.
-    // Missing/weak ETags fail closed because byte digests only validate local
-    // persistence, not that disjoint ranges came from the same object version.
-    validate_or_latch_range_validator(
-        task,
-        download_generation_validator(resp.headers()),
-        total > chunk_size,
-        "parallel",
-    )?;
-    let content_range = resp
-        .headers()
-        .get(CONTENT_RANGE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .ok_or_else(|| {
-            MeowError::from_code_str(
-                InnerErrorCode::InvalidRange,
-                "range response missing content-range",
-            )
-        })?;
+    validate_range_safety_headers(resp.headers(), "parallel range")?;
+    let content_range = require_content_range(resp.headers(), "parallel range")?;
     let (range_start, range_end, range_total) = parse_content_range(&content_range)?;
     if range_start != offset {
         return Err(MeowError::from_code(
@@ -1069,18 +1135,7 @@ pub(crate) async fn download_one_chunk_part_positioned(
             format!("content-range end mismatch: expected {requested_end}, got {range_end}"),
         ));
     }
-    if let Some(rt) = range_total {
-        if rt != total {
-            return Err(MeowError::from_code(
-                InnerErrorCode::InvalidRange,
-                format!(
-                    "content-range total mismatch (remote file may have been resized \
-                     mid-download): expected total={total}, server reports {rt}; \
-                     verify the URL is stable and retry"
-                ),
-            ));
-        }
-    }
+    validate_known_content_range_total(range_total, total, "parallel range")?;
     let expected_len = range_end
         .checked_sub(range_start)
         .and_then(|len| len.checked_add(1))
@@ -1090,6 +1145,17 @@ pub(crate) async fn download_one_chunk_part_positioned(
                 "content-range length overflow",
             )
         })?;
+    validate_optional_content_length(resp.headers(), expected_len, "parallel range")?;
+    // Every range in one positioned download must prove that it belongs to one
+    // immutable remote generation. Run the latch only after every immutable
+    // response header has passed validation, so malformed metadata cannot
+    // mutate task progress even transiently.
+    validate_or_latch_range_validator(
+        task,
+        download_generation_validator(resp.headers()),
+        total > chunk_size,
+        "parallel",
+    )?;
     let part_end = offset.checked_add(expected_len).ok_or_else(|| {
         MeowError::from_code_str(InnerErrorCode::InvalidRange, "download part end overflow")
     })?;
@@ -1149,11 +1215,44 @@ pub(crate) async fn download_one_chunk_part_positioned(
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as _;
+
+    use reqwest::header::{HeaderMap, HeaderValue, CONTENT_LENGTH, CONTENT_RANGE};
+
     use super::ensure_download_file_present;
+    use super::map_reqwest;
     use super::parse_content_range;
     use super::range_spec;
+    use super::require_content_range;
     use super::rollback_download_file;
+    use super::validate_known_content_range_total;
+    use super::validate_optional_content_length;
     use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn mapped_reqwest_error_preserves_type_without_secret_url() {
+        const SECRET: &str = "RC_SECRET_REQWEST_CANARY";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        let address = listener.local_addr().expect("reserved port address");
+        drop(listener);
+        let url = format!("http://{address}/object?sig={SECRET}&mode=range");
+        let source = reqwest::Client::new()
+            .get(url)
+            .send()
+            .await
+            .expect_err("closed loopback port must fail");
+
+        let error = map_reqwest(source);
+        let concrete = error
+            .source()
+            .and_then(|source| source.downcast_ref::<reqwest::Error>())
+            .expect("mapping must preserve reqwest::Error as the concrete source");
+        let rendered = format!("{error}\n{error:?}\n{concrete}\n{concrete:?}");
+
+        assert!(!rendered.contains(SECRET), "secret URL leaked: {rendered}");
+        assert_eq!(error.code(), crate::error::InnerErrorCode::HttpError as i32);
+        assert!(rendered.contains("error sending request"));
+    }
 
     #[test]
     fn range_spec_clamps_last_part() {
@@ -1251,6 +1350,328 @@ mod tests {
     fn parse_content_range_invalid_order_fail() {
         let err = parse_content_range("bytes 100-1/1000").unwrap_err();
         assert!(err.msg().contains("invalid content-range order"));
+    }
+
+    #[test]
+    fn content_range_header_requires_exactly_one_value() {
+        let mut headers = HeaderMap::new();
+        assert!(require_content_range(&headers, "unit range").is_err());
+
+        headers.insert(CONTENT_RANGE, HeaderValue::from_static("bytes 0-3/8"));
+        assert_eq!(
+            require_content_range(&headers, "unit range").expect("single range"),
+            "bytes 0-3/8"
+        );
+
+        for second in ["bytes 0-3/8", "bytes 1-4/8"] {
+            let mut duplicated = headers.clone();
+            duplicated.append(CONTENT_RANGE, HeaderValue::from_static(second));
+            let error = require_content_range(&duplicated, "unit range")
+                .expect_err("duplicate Content-Range must fail");
+            assert_eq!(
+                error.code(),
+                crate::error::InnerErrorCode::InvalidRange as i32
+            );
+        }
+    }
+
+    #[test]
+    fn known_total_requires_exact_matching_content_range_total() {
+        validate_known_content_range_total(Some(8), 8, "unit range").expect("exact total is valid");
+        for total in [None, Some(7), Some(9), Some(u64::MAX)] {
+            let error = validate_known_content_range_total(total, 8, "unit range")
+                .expect_err("wildcard or mismatching total must fail");
+            assert_eq!(
+                error.code(),
+                crate::error::InnerErrorCode::InvalidRange as i32
+            );
+        }
+    }
+
+    #[test]
+    fn optional_content_length_must_be_single_numeric_and_exact() {
+        let mut headers = HeaderMap::new();
+        validate_optional_content_length(&headers, 4, "unit range")
+            .expect("missing Content-Length permits chunked framing");
+
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("4"));
+        validate_optional_content_length(&headers, 4, "unit range")
+            .expect("exact Content-Length is valid");
+
+        for value in ["3", "5", "not-a-number", "18446744073709551616"] {
+            headers.insert(
+                CONTENT_LENGTH,
+                HeaderValue::from_str(value).expect("ASCII Content-Length fixture"),
+            );
+            let error = validate_optional_content_length(&headers, 4, "unit range")
+                .expect_err("invalid or inconsistent Content-Length must fail");
+            assert_eq!(
+                error.code(),
+                crate::error::InnerErrorCode::InvalidRange as i32
+            );
+        }
+
+        for second in ["4", "5"] {
+            let mut duplicated = HeaderMap::new();
+            duplicated.insert(CONTENT_LENGTH, HeaderValue::from_static("4"));
+            duplicated.append(CONTENT_LENGTH, HeaderValue::from_static(second));
+            validate_optional_content_length(&duplicated, 4, "unit range")
+                .expect_err("duplicate Content-Length must fail");
+        }
+    }
+
+    mod request_headers {
+        use std::sync::Arc;
+
+        use reqwest::header::{HeaderValue, ACCEPT_ENCODING, RANGE};
+
+        use super::super::build_download_range_request;
+        use crate::download_trait::{BreakpointDownload, DownloadRangeGetCtx};
+        use crate::error::{InnerErrorCode, MeowError};
+        use crate::http_breakpoint::{
+            BreakpointDownloadHttpConfig, DefaultStyleUpload, StandardRangeDownload,
+        };
+        use crate::inner::inner_task::InnerTask;
+        use crate::transfer_task::TransferTask;
+        use crate::DownloadPounceBuilder;
+
+        async fn task_with(download: Arc<dyn BreakpointDownload + Send + Sync>) -> TransferTask {
+            let pounce = DownloadPounceBuilder::new(
+                "range-request-unit.bin",
+                "./range-request-unit.bin",
+                4,
+                "https://protocol.invalid/range-request-unit",
+            )
+            .with_total_size(8)
+            .with_breakpoint_download(Arc::clone(&download))
+            .build();
+            let inner = InnerTask::from_pounce(
+                pounce,
+                BreakpointDownloadHttpConfig::default(),
+                None,
+                Arc::new(DefaultStyleUpload::default()),
+                download,
+            )
+            .await
+            .expect("normalize range request task");
+            TransferTask::from_inner(&inner)
+        }
+
+        struct AppendsGzip;
+
+        impl BreakpointDownload for AppendsGzip {
+            fn merge_range_get_headers(
+                &self,
+                ctx: DownloadRangeGetCtx<'_>,
+            ) -> Result<(), MeowError> {
+                ctx.base.insert(
+                    RANGE,
+                    HeaderValue::from_str(ctx.range_value).expect("range fixture"),
+                );
+                ctx.base
+                    .append(ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
+                Ok(())
+            }
+        }
+
+        #[tokio::test]
+        async fn final_range_request_has_one_identity_encoding() {
+            let download: Arc<dyn BreakpointDownload + Send + Sync> =
+                Arc::new(StandardRangeDownload);
+            let task = task_with(Arc::clone(&download)).await;
+            let (_, headers) =
+                build_download_range_request(download, &task, "bytes=0-3", task.headers().clone())
+                    .await
+                    .expect("standard request builder");
+
+            assert_eq!(headers.get_all(ACCEPT_ENCODING).iter().count(), 1);
+            assert_eq!(
+                headers.get(ACCEPT_ENCODING),
+                Some(&HeaderValue::from_static("identity"))
+            );
+        }
+
+        #[tokio::test]
+        async fn range_hook_cannot_append_an_ambiguous_encoding() {
+            let download: Arc<dyn BreakpointDownload + Send + Sync> = Arc::new(AppendsGzip);
+            let task = task_with(Arc::clone(&download)).await;
+            let error =
+                build_download_range_request(download, &task, "bytes=0-3", task.headers().clone())
+                    .await
+                    .expect_err("hook must preserve executor-owned encoding");
+
+            assert_eq!(error.code(), InnerErrorCode::InvalidRange as i32);
+        }
+    }
+
+    mod upload_ack {
+        use std::sync::Arc;
+
+        use async_trait::async_trait;
+
+        use super::super::{upload_one_chunk, validate_serial_upload_ack};
+        use crate::download_trait::BreakpointDownload;
+        use crate::error::{InnerErrorCode, MeowError};
+        use crate::http_breakpoint::{
+            BreakpointDownloadHttpConfig, BreakpointUpload, DefaultStyleUpload,
+            StandardRangeDownload, UploadResumeInfo,
+        };
+        use crate::inner::inner_task::InnerTask;
+        use crate::transfer_task::TransferTask;
+        use crate::up_pounce_builder::UploadPounceBuilder;
+        use crate::upload_trait::{UploadChunkCtx, UploadPrepareCtx};
+
+        struct FixedAck {
+            next_byte: Option<u64>,
+        }
+
+        #[async_trait]
+        impl BreakpointUpload for FixedAck {
+            async fn prepare(
+                &self,
+                _ctx: UploadPrepareCtx<'_>,
+            ) -> Result<UploadResumeInfo, MeowError> {
+                Ok(UploadResumeInfo::default())
+            }
+
+            async fn upload_chunk(
+                &self,
+                _ctx: UploadChunkCtx<'_>,
+            ) -> Result<UploadResumeInfo, MeowError> {
+                Ok(UploadResumeInfo {
+                    completed_file_id: None,
+                    next_byte: self.next_byte,
+                    provider_upload_id: None,
+                })
+            }
+        }
+
+        async fn task_with(upload: Arc<dyn BreakpointUpload + Send + Sync>) -> TransferTask {
+            let pounce = UploadPounceBuilder::from_bytes("ack-unit.bin", vec![0; 8], 4)
+                .with_url("https://protocol.invalid/ack-unit")
+                .with_breakpoint_upload(upload)
+                .with_max_upload_prepare_retries(0)
+                .with_max_chunk_retries(0)
+                .build()
+                .expect("build ack task");
+            let inner = InnerTask::from_pounce(
+                pounce,
+                BreakpointDownloadHttpConfig::default(),
+                None,
+                Arc::new(DefaultStyleUpload::default()),
+                Arc::new(StandardRangeDownload) as Arc<dyn BreakpointDownload + Send + Sync>,
+            )
+            .await
+            .expect("normalize ack task");
+            TransferTask::from_inner(&inner)
+        }
+
+        #[tokio::test]
+        async fn serial_ack_rejects_nonprogress_backward_gap_and_above_total() {
+            for (offset, next, label) in [
+                (0, 0, "non-progress"),
+                (4, 2, "backward"),
+                (0, 5, "forward gap"),
+                (0, 9, "above total"),
+            ] {
+                let upload: Arc<dyn BreakpointUpload + Send + Sync> = Arc::new(FixedAck {
+                    next_byte: Some(next),
+                });
+                let task = task_with(Arc::clone(&upload)).await;
+
+                let error = upload_one_chunk(&reqwest::Client::new(), &task, upload, offset, 4)
+                    .await
+                    .expect_err("unsafe ack must fail");
+
+                assert_eq!(error.code(), InnerErrorCode::InvalidRange as i32, "{label}");
+                assert!(task.upload_abort_required(), "{label} must require abort");
+            }
+        }
+
+        #[tokio::test]
+        async fn serial_ack_accepts_none_partial_progress_and_exact_end() {
+            for (next, expected, label) in [
+                (None, 4, "none"),
+                (Some(2), 2, "partial"),
+                (Some(4), 4, "exact end"),
+            ] {
+                let upload: Arc<dyn BreakpointUpload + Send + Sync> =
+                    Arc::new(FixedAck { next_byte: next });
+                let task = task_with(Arc::clone(&upload)).await;
+
+                let outcome = upload_one_chunk(&reqwest::Client::new(), &task, upload, 0, 4)
+                    .await
+                    .unwrap_or_else(|error| panic!("{label} ack failed: {error}"));
+
+                assert_eq!(outcome.next_offset, expected, "{label}");
+                assert!(!outcome.done, "{label}");
+                assert!(!task.upload_abort_required(), "{label}");
+            }
+        }
+
+        #[test]
+        fn serial_ack_validator_handles_u64_boundary_without_clamping() {
+            let offset = u64::MAX - 4;
+            let uploaded_end = u64::MAX - 1;
+
+            assert_eq!(
+                validate_serial_upload_ack(offset, uploaded_end, u64::MAX, None)
+                    .expect("implicit acknowledgement remains bounded"),
+                uploaded_end
+            );
+            assert_eq!(
+                validate_serial_upload_ack(offset, uploaded_end, u64::MAX, Some(uploaded_end))
+                    .expect("exact acknowledgement remains bounded"),
+                uploaded_end
+            );
+            assert!(
+                validate_serial_upload_ack(offset, uploaded_end, u64::MAX, Some(offset)).is_err()
+            );
+            assert!(
+                validate_serial_upload_ack(offset, uploaded_end, u64::MAX, Some(u64::MAX)).is_err()
+            );
+        }
+
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            #[test]
+            fn serial_ack_only_accepts_the_strictly_advancing_sent_interval(
+                offset in 0u64..u64::MAX / 2,
+                sent_len in 1u64..1_048_576,
+                extra_total in 0u64..1_048_576,
+            ) {
+                let uploaded_end = offset + sent_len;
+                let total = uploaded_end + extra_total;
+
+                prop_assert_eq!(
+                    validate_serial_upload_ack(offset, uploaded_end, total, None)
+                        .map_err(|error| error.code()),
+                    Ok(uploaded_end)
+                );
+
+                let partial = offset + 1 + sent_len / 2;
+                let partial = partial.min(uploaded_end);
+                prop_assert_eq!(
+                    validate_serial_upload_ack(offset, uploaded_end, total, Some(partial))
+                        .map_err(|error| error.code()),
+                    Ok(partial)
+                );
+
+                prop_assert!(
+                    validate_serial_upload_ack(offset, uploaded_end, total, Some(offset)).is_err()
+                );
+                prop_assert!(validate_serial_upload_ack(
+                    offset,
+                    uploaded_end,
+                    total.saturating_add(1),
+                    Some(uploaded_end + 1),
+                )
+                .is_err());
+            }
+        }
     }
 
     // ------------------------------------------------------------------

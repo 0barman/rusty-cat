@@ -153,11 +153,11 @@ async fn download_invalid_content_range_unit_and_order_branches() {
 }
 
 #[tokio::test]
-async fn download_body_length_mismatch_branch_is_detected() {
+async fn download_declared_or_streamed_length_mismatch_is_detected() {
     // 场景说明：
     // 1) HEAD 声明总长 8；
     // 2) GET 的 Content-Range 声明 0-3 共 4 字节，但 body 实际只给 3 字节；
-    // 3) 应触发 body length mismatch 分支并失败。
+    // 3) 应在 header 或 body 校验阶段触发 length mismatch 并失败。
     let status = run_download_case_with_responses(
         "body_len_mismatch",
         vec![
@@ -170,8 +170,8 @@ async fn download_body_length_mismatch_branch_is_detected() {
 
     match status {
         TransferStatus::Failed(err) => assert!(
-            err.msg().contains("body length mismatch"),
-            "expected body length mismatch message, got {}",
+            err.msg().contains("length mismatch"),
+            "expected length mismatch message, got {}",
             err.msg()
         ),
         other => panic!("expected failed status, got {other:?}"),

@@ -128,7 +128,7 @@ pub struct MeowClient {
     executor_init: StdMutex<()>,
     /// Lazily initialized executor dedicated to bounded in-memory GETs.
     binary_executor: OnceLock<Arc<BinaryExecutor>>,
-    /// Serializes BinaryExecutor publication/task admission with close.
+    /// Serializes executor publication/task admission with close.
     binary_lifecycle: Arc<StdMutex<BinaryLifecycle>>,
     close_notify: Arc<tokio::sync::Notify>,
     /// Immutable runtime configuration.
@@ -150,6 +150,11 @@ enum BinaryLifecycle {
         pounce_closed: bool,
         binary_closed: bool,
     },
+}
+
+enum CancelExecutor {
+    Binary(Arc<BinaryExecutor>),
+    Pounce(Arc<Executor>),
 }
 
 impl std::fmt::Debug for MeowClient {
@@ -234,10 +239,13 @@ impl MeowClient {
         )
     }
 
-    fn get_exec(&self) -> Result<&Executor, MeowError> {
+    /// Returns the Pounce executor while the caller holds `binary_lifecycle`.
+    /// Keeping publication behind that shared lifecycle gate prevents a fresh
+    /// admission from creating an executor after `close()` has won.
+    fn get_exec_locked(&self) -> Result<Arc<Executor>, MeowError> {
         if let Some(exec) = self.executor.get() {
             crate::meow_flow_log!("executor", "reuse existing executor");
-            return Ok(exec.as_ref());
+            return Ok(Arc::clone(exec));
         }
 
         let _init_guard = self.executor_init.lock().map_err(|e| {
@@ -251,7 +259,7 @@ impl MeowClient {
                 "executor",
                 "reuse executor initialized by concurrent caller"
             );
-            return Ok(exec.as_ref());
+            return Ok(Arc::clone(exec));
         }
 
         let default_http_transfer = DefaultHttpTransfer::try_with_http_timeouts(
@@ -280,7 +288,7 @@ impl MeowClient {
                 "executor init race failed",
             )
         })?;
-        self.executor.get().map(Arc::as_ref).ok_or_else(|| {
+        self.executor.get().cloned().ok_or_else(|| {
             crate::meow_error_log!(
                 "executor",
                 "executor init race failed after set; returning RuntimeCreationFailedError"
@@ -298,7 +306,10 @@ impl MeowClient {
         if let Some(exec) = self.binary_executor.get() {
             return Ok(exec.as_ref());
         }
-        let exec = Arc::new(BinaryExecutor::new(&self.config)?);
+        let exec = Arc::new(BinaryExecutor::new(
+            &self.config,
+            self.callback_dispatcher_owner.clone(),
+        )?);
         self.binary_executor.set(exec).map_err(|_| {
             MeowError::from_code_str(
                 InnerErrorCode::RuntimeCreationFailedError,
@@ -326,6 +337,19 @@ impl MeowClient {
         } else {
             Ok(())
         }
+    }
+
+    fn lock_open_lifecycle(&self) -> Result<std::sync::MutexGuard<'_, BinaryLifecycle>, MeowError> {
+        let lifecycle = self.binary_lifecycle.lock().map_err(|error| {
+            MeowError::from_code(
+                InnerErrorCode::LockPoisoned,
+                format!("client lifecycle lock poisoned: {error}"),
+            )
+        })?;
+        if !matches!(*lifecycle, BinaryLifecycle::Open) || self.closed.load(Ordering::SeqCst) {
+            return Err(client_closed_error());
+        }
+        Ok(lifecycle)
     }
 
     /// Registers a global progress listener for all tasks.
@@ -627,7 +651,8 @@ impl MeowClient {
         )
         .await?;
 
-        let task_id = self.get_exec()?.try_enqueue(inner, callbacks)?;
+        let _lifecycle = self.lock_open_lifecycle()?;
+        let task_id = self.get_exec_locked()?.try_enqueue(inner, callbacks)?;
         crate::meow_key_log!("try_enqueue", "try_enqueue success: task_id={:?}", task_id);
         Ok(task_id)
     }
@@ -752,7 +777,10 @@ impl MeowClient {
         )
         .await?;
 
-        let task_id = self.get_exec()?.try_enqueue_paused(inner, callbacks)?;
+        let _lifecycle = self.lock_open_lifecycle()?;
+        let task_id = self
+            .get_exec_locked()?
+            .try_enqueue_paused(inner, callbacks)?;
         crate::meow_key_log!(
             "try_enqueue_paused",
             "try_enqueue_paused success: task_id={:?}",
@@ -911,15 +939,19 @@ impl MeowClient {
     pub async fn pause(&self, task_id: TaskId) -> Result<(), MeowError> {
         self.ensure_open()?;
         crate::meow_key_log!("client_api", "pause called: task_id={:?}", task_id);
-        if let Some(exec) = self.binary_executor.get() {
-            if exec.contains_task(task_id)? {
-                return Err(MeowError::from_code_str(
-                    InnerErrorCode::InvalidTaskState,
-                    "binary tasks do not support pause",
-                ));
+        let exec = {
+            let _lifecycle = self.lock_open_lifecycle()?;
+            if let Some(exec) = self.binary_executor.get() {
+                if exec.contains_task(task_id)? {
+                    return Err(MeowError::from_code_str(
+                        InnerErrorCode::InvalidTaskState,
+                        "binary tasks do not support pause",
+                    ));
+                }
             }
-        }
-        self.get_exec()?.pause(task_id).await
+            self.get_exec_locked()?
+        };
+        exec.pause(task_id).await
     }
 
     /// Resumes a previously paused PounceTask.
@@ -946,15 +978,19 @@ impl MeowClient {
     pub async fn resume(&self, task_id: TaskId) -> Result<(), MeowError> {
         self.ensure_open()?;
         crate::meow_key_log!("client_api", "resume called: task_id={:?}", task_id);
-        if let Some(exec) = self.binary_executor.get() {
-            if exec.contains_task(task_id)? {
-                return Err(MeowError::from_code_str(
-                    InnerErrorCode::InvalidTaskState,
-                    "binary tasks do not support resume",
-                ));
+        let exec = {
+            let _lifecycle = self.lock_open_lifecycle()?;
+            if let Some(exec) = self.binary_executor.get() {
+                if exec.contains_task(task_id)? {
+                    return Err(MeowError::from_code_str(
+                        InnerErrorCode::InvalidTaskState,
+                        "binary tasks do not support resume",
+                    ));
+                }
             }
-        }
-        self.get_exec()?.resume(task_id).await
+            self.get_exec_locked()?
+        };
+        exec.resume(task_id).await
     }
 
     /// Cancels a task by ID.
@@ -984,12 +1020,22 @@ impl MeowClient {
     pub async fn cancel(&self, task_id: TaskId) -> Result<(), MeowError> {
         self.ensure_open()?;
         crate::meow_key_log!("client_api", "cancel called: task_id={:?}", task_id);
-        if let Some(exec) = self.binary_executor.get() {
-            if exec.contains_task(task_id)? {
-                return exec.cancel(task_id).await;
+        let executor = {
+            let _lifecycle = self.lock_open_lifecycle()?;
+            if let Some(exec) = self.binary_executor.get() {
+                if exec.contains_task(task_id)? {
+                    CancelExecutor::Binary(Arc::clone(exec))
+                } else {
+                    CancelExecutor::Pounce(self.get_exec_locked()?)
+                }
+            } else {
+                CancelExecutor::Pounce(self.get_exec_locked()?)
             }
+        };
+        match executor {
+            CancelExecutor::Binary(exec) => exec.cancel(task_id).await,
+            CancelExecutor::Pounce(exec) => exec.cancel(task_id).await,
         }
-        self.get_exec()?.cancel(task_id).await
     }
 
     /// Returns a snapshot of queue and active Pounce transfer groups.
@@ -1017,7 +1063,11 @@ impl MeowClient {
     pub async fn snapshot(&self) -> Result<TransferSnapshot, MeowError> {
         self.ensure_open()?;
         crate::meow_flow_log!("client_api", "snapshot called");
-        self.get_exec()?.snapshot().await
+        let exec = {
+            let _lifecycle = self.lock_open_lifecycle()?;
+            self.get_exec_locked()?
+        };
+        exec.snapshot().await
     }
 
     /// Closes this client and every initialized Pounce/Binary executor.
@@ -1357,8 +1407,10 @@ impl MeowClient {
     /// pause/resume and are deliberately excluded from [`Self::snapshot`].
     /// The callback may run concurrently before this method returns. It owns a
     /// [`BinaryDownloadOutput`]; move or clone its `Bytes` when retaining data.
-    /// The callback must return in bounded time and must not synchronously wait
-    /// for `close()` on this same client because close drains callbacks.
+    /// The callback must return in bounded time. Synchronously awaiting
+    /// [`Self::close`] from this same client's callback returns
+    /// `InvalidTaskState` without closing the client, because close drains its
+    /// callback queue; schedule close after the callback returns instead.
     ///
     /// At most two binary HTTP requests run concurrently. At most 1024 accepted
     /// tasks may be queued, active, or waiting for their callback to return.
@@ -1394,6 +1446,126 @@ impl MeowClient {
 #[cfg(test)]
 mod close_tests {
     use super::*;
+
+    #[test]
+    fn fresh_paused_admission_cannot_publish_an_executor_after_close() {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("build deterministic admission runtime");
+        runtime.block_on(async {
+            let (blocker_started_tx, blocker_started_rx) = oneshot::channel();
+            let (blocker_release_tx, blocker_release_rx) = std::sync::mpsc::sync_channel(0);
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = blocker_started_tx.send(());
+                blocker_release_rx
+                    .recv()
+                    .expect("release the occupied blocking thread");
+            });
+            blocker_started_rx
+                .await
+                .expect("blocking-thread occupant did not start");
+
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock before Unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "rusty-cat-fresh-admission-{}-{unique}.bin",
+                std::process::id()
+            ));
+            std::fs::write(&path, b"fresh-admission-payload")
+                .expect("write fresh admission fixture");
+            let task = crate::up_pounce_builder::UploadPounceBuilder::new(
+                "fresh-admission.bin",
+                &path,
+                4,
+            )
+            .with_url("https://example.invalid/fresh-admission")
+            .build()
+            .expect("build fresh admission task");
+            let client = MeowClient::new(MeowConfig::default());
+            let mut admission = Box::pin(client.try_enqueue_paused(task, |_| {}, |_, _| {}));
+
+            poll_fn(|cx| match admission.as_mut().poll(cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => panic!(
+                    "fresh file admission must suspend behind the occupied blocking thread: {result:?}"
+                ),
+            })
+            .await;
+            assert!(client.executor.get().is_none());
+            client
+                .close()
+                .await
+                .expect("close executor-free client during normalization");
+            blocker_release_tx
+                .send(())
+                .expect("release the occupied blocking thread");
+            blocker.await.expect("join blocking-thread occupant");
+
+            let result = admission.await;
+            let executor_was_published = client.executor.get().is_some();
+            drop(client);
+            let _ = std::fs::remove_file(path);
+            let error = result.expect_err("close must win before fresh task publication");
+            assert_eq!(error.code(), InnerErrorCode::ClientClosed as i32);
+            assert!(
+                !executor_was_published,
+                "a losing admission must not publish an executor after close"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn binary_callback_dispatcher_marks_the_owning_client() {
+        use std::io::Write as _;
+
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind binary marker server");
+        let address = listener.local_addr().expect("binary marker server address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept binary marker request");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .expect("write binary marker response");
+        });
+        let client = Arc::new(MeowClient::new(
+            MeowConfig::builder()
+                .binary_download_config(
+                    crate::binary::BinaryDownloadConfig::builder()
+                        .retry_delays(Vec::new())
+                        .build()
+                        .expect("binary marker config"),
+                )
+                .build()
+                .expect("client config"),
+        ));
+        let owner = client.callback_dispatcher_owner.clone();
+        let (marker_tx, marker_rx) = oneshot::channel();
+        client
+            .try_enqueue_binary_task(
+                BinaryTask::new(format!("http://{address}/marker")),
+                move |_, _| {
+                    let _ = marker_tx.send(
+                        crate::inner::cb_dispatcher::is_callback_dispatcher_thread_for(&owner),
+                    );
+                },
+            )
+            .expect("enqueue binary marker task");
+        let marked = tokio::time::timeout(std::time::Duration::from_secs(2), marker_rx)
+            .await
+            .expect("binary marker callback timed out")
+            .expect("binary marker callback sender dropped");
+        client.close().await.expect("close binary marker client");
+        server.join().expect("join binary marker server");
+        assert!(marked, "Binary callback thread must carry its client owner");
+    }
 
     #[test]
     fn supervisor_panic_preserves_completed_executor_progress() {

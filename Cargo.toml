@@ -1,6 +1,6 @@
 [package]
 name = "rusty-cat"
-version = "0.3.6"
+version = "0.3.7"
 edition = "2021"
 rust-version = "1.89"
 description = "Async HTTP client for resumable file upload and download."
@@ -26,16 +26,16 @@ all = [
     "azure-blob-sas",
 ]
 presigned = []
-aliyun-oss-direct = ["dep:hmac", "dep:time"]
+aliyun-oss-direct = ["dep:hmac", "dep:time", "dep:roxmltree"]
 aliyun-oss-presigned = ["presigned"]
-azure-blob-direct = ["dep:base64", "dep:hmac", "dep:time"]
+azure-blob-direct = ["dep:base64", "dep:hmac", "dep:time", "dep:roxmltree"]
 azure-blob-sas = ["presigned", "dep:base64"]
 aliyun-oss = ["aliyun-oss-presigned"]
 azure-blob = ["azure-blob-sas"]
 oss-providers = ["aliyun-oss", "azure-blob"]
 
 [dependencies]
-tokio = { version = "1.50.0", default-features = false, features = [
+tokio = { version = "1.53.1", default-features = false, features = [
     "rt-multi-thread",
     "sync",
     "macros",
@@ -43,31 +43,32 @@ tokio = { version = "1.50.0", default-features = false, features = [
     "fs",
     "time",
 ] }
-reqwest = { version = "0.12.28", default-features = false, features = [
+reqwest = { version = "0.13.5", default-features = false, features = [
     "multipart",
-    "rustls-tls",
+    "rustls",
     "stream",
 ] }
-async-trait = "0.1.89"
-tokio-util = { version = "0.7.18", default-features = false }
-serde = { version = "1.0.219", default-features = false, features = ["derive"] }
-serde_json = "1.0.140"
+async-trait = "0.1.92"
+tokio-util = { version = "0.7.19", default-features = false }
+serde = { version = "1.0.229", default-features = false, features = ["derive"] }
+serde_json = "1.0.151"
 md5 = { version = "0.7", default-features = false }
-bytes = { version = "1", default-features = false }
+bytes = { version = "1.12.1", default-features = false }
 base64 = { version = "0.22.1", optional = true }
 hmac = { version = "0.12", optional = true }
+roxmltree = { version = "0.21.1", optional = true, default-features = false, features = ["std"] }
 sha2 = { version = "0.10" }
 fs2 = "0.4"
-time = { version = "0.3", optional = true }
+time = { version = "0.3.55", optional = true }
 
 [dev-dependencies]
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 criterion = { version = "0.5.1", features = ["html_reports"] }
 hmac = "0.12"
 hex = "0.4"
 indicatif = "0.17"
 proptest = "1.5"
-tokio = { version = "1.50.0", default-features = false, features = [
+tokio = { version = "1.53.1", default-features = false, features = [
     "rt-multi-thread",
     "macros",
     "time",

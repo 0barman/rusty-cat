@@ -20,6 +20,7 @@ use super::{
 pub struct PresignedMultipartUpload {
     plan: Arc<PresignedMultipartUploadPlan>,
     uploaded_parts: Arc<Mutex<Vec<PresignedUploadedPart>>>,
+    resumed_parts_error: Option<MeowError>,
     url_refresher: Option<Arc<dyn PresignedUploadUrlRefresher>>,
 }
 
@@ -29,6 +30,7 @@ impl PresignedMultipartUpload {
         Self {
             plan: Arc::new(plan),
             uploaded_parts: Arc::new(Mutex::new(Vec::new())),
+            resumed_parts_error: None,
             url_refresher: None,
         }
     }
@@ -44,14 +46,32 @@ impl PresignedMultipartUpload {
     /// `complete_upload` includes those parts and `prepare` resumes past the
     /// already-uploaded contiguous prefix.
     ///
-    /// Parts are de-duplicated by `offset` (last occurrence wins). They are not
-    /// validated against the plan here; `prepare` validates the contiguous
-    /// prefix and resumes from the first gap or mismatch, so resume never skips
-    /// bytes that were not verifiably uploaded.
+    /// Byte-identical duplicates are de-duplicated by `offset` (last occurrence
+    /// wins). A conflicting duplicate or a part that does not match the
+    /// immutable plan is recorded and rejected by `prepare`, before network
+    /// I/O. Valid unordered/sparse inputs remain supported: `prepare` trusts the
+    /// longest contiguous prefix and re-uploads from the first gap.
     pub fn with_resumed_parts(mut self, parts: Vec<PresignedUploadedPart>) -> Self {
+        // Repeated builder calls replace both the manifest and its validation
+        // result; an earlier rejected input must not poison a later valid one.
+        self.resumed_parts_error = None;
         let mut by_offset: std::collections::BTreeMap<u64, PresignedUploadedPart> =
             std::collections::BTreeMap::new();
         for part in parts {
+            if self.resumed_parts_error.is_none() {
+                self.resumed_parts_error = self.validate_resumed_part(&part).err();
+            }
+            if let Some(existing) = by_offset.get(&part.offset) {
+                if existing != &part && self.resumed_parts_error.is_none() {
+                    self.resumed_parts_error = Some(MeowError::from_code(
+                        InnerErrorCode::InvalidTaskState,
+                        format!(
+                            "conflicting resumed presigned parts for offset {}",
+                            part.offset
+                        ),
+                    ));
+                }
+            }
             by_offset.insert(part.offset, part);
         }
         self.uploaded_parts = Arc::new(Mutex::new(by_offset.into_values().collect()));
@@ -133,6 +153,8 @@ impl PresignedMultipartUpload {
         if refreshed.part_number != part.part_number
             || refreshed.offset != part.offset
             || refreshed.size != part.size
+            || (part.provider_part_id.is_some()
+                && refreshed.provider_part_id != part.provider_part_id)
         {
             crate::log::emit_lazy(|| {
                 crate::log::Log::error(
@@ -163,7 +185,58 @@ impl PresignedMultipartUpload {
                 ),
             ));
         }
+        if Self::is_expired(&refreshed)? {
+            return Err(MeowError::from_code(
+                InnerErrorCode::InvalidTaskState,
+                format!(
+                    "refreshed presigned upload part {} URL is already expired",
+                    part.part_number
+                ),
+            ));
+        }
         Ok(refreshed)
+    }
+
+    fn validate_resumed_part(&self, part: &PresignedUploadedPart) -> Result<(), MeowError> {
+        let Some(plan_part) = self.plan.part_for_offset(part.offset) else {
+            return Err(MeowError::from_code(
+                InnerErrorCode::InvalidTaskState,
+                format!(
+                    "resumed presigned part is outside the plan: part={} offset={}",
+                    part.part_number, part.offset
+                ),
+            ));
+        };
+        if part.part_number != plan_part.part_number || part.size != plan_part.size {
+            return Err(MeowError::from_code(
+                InnerErrorCode::InvalidTaskState,
+                format!(
+                    "resumed presigned part does not match plan identity at offset {}",
+                    part.offset
+                ),
+            ));
+        }
+        if let Some(expected) = plan_part.provider_part_id.as_deref() {
+            if part.provider_part_id.as_deref() != Some(expected) {
+                return Err(MeowError::from_code(
+                    InnerErrorCode::InvalidTaskState,
+                    format!(
+                        "resumed presigned part does not match bound provider identity at offset {}",
+                        part.offset
+                    ),
+                ));
+            }
+        }
+        part.offset.checked_add(part.size).ok_or_else(|| {
+            MeowError::from_code(
+                InnerErrorCode::InvalidTaskState,
+                format!(
+                    "resumed presigned part range overflow at offset {}",
+                    part.offset
+                ),
+            )
+        })?;
+        Ok(())
     }
 
     /// Computes the resume offset from already-uploaded parts: the end of the
@@ -178,12 +251,13 @@ impl PresignedMultipartUpload {
             if p.offset != running {
                 break;
             }
-            match self.plan.part_for_offset(p.offset) {
-                Some(plan_part) if plan_part.size == p.size => {
-                    running = running.saturating_add(p.size);
-                }
-                _ => break,
+            if self.validate_resumed_part(p).is_err() {
+                break;
             }
+            let Some(next) = running.checked_add(p.size) else {
+                break;
+            };
+            running = next;
         }
         running
     }
@@ -200,6 +274,7 @@ impl PresignedMultipartUpload {
             builder = builder.body(body);
         }
         let resp = builder.send().await.map_err(|e| {
+            let e = e.without_url();
             crate::log::emit_lazy(|| {
                 crate::log::Log::error(
                     "callback",
@@ -225,20 +300,18 @@ impl PresignedMultipartUpload {
             }
         };
         if !status.is_success() {
+            let safe_body = crate::log::redact_secrets(&body);
             crate::log::emit_lazy(|| {
                 crate::log::Log::error(
                     "callback",
-                    format!(
-                        "{label} non-2xx status={status}, body: {}",
-                        crate::log::redact_secrets(&body)
-                    ),
+                    format!("{label} non-2xx status={status}, body: {}", safe_body),
                 )
                 .with_http_status(status.as_u16())
                 .with_url(req.url.as_str())
             });
             return Err(MeowError::from_code(
                 InnerErrorCode::ResponseStatusError,
-                format!("{label} failed: {status}, body: {body}"),
+                format!("{label} failed: {status}, body: {safe_body}"),
             )
             .with_http_status(status.as_u16()));
         }
@@ -290,6 +363,9 @@ impl PresignedMultipartUpload {
 impl BreakpointUpload for PresignedMultipartUpload {
     async fn prepare(&self, ctx: UploadPrepareCtx<'_>) -> Result<UploadResumeInfo, MeowError> {
         self.plan.validate()?;
+        if let Some(error) = &self.resumed_parts_error {
+            return Err(error.clone());
+        }
         if self.plan.total_size != ctx.task.total_size() {
             return Err(MeowError::from_code(
                 InnerErrorCode::InvalidTaskState,
@@ -314,8 +390,18 @@ impl BreakpointUpload for PresignedMultipartUpload {
         // re-injected via `with_resumed_parts` after a restart. The executor
         // still merges this with its own local_offset.
         let resumed = {
-            let parts = self.uploaded_parts.lock().await;
-            self.resumed_offset_from(&parts)
+            let mut parts = self.uploaded_parts.lock().await;
+            for part in parts.iter() {
+                self.validate_resumed_part(part)?;
+            }
+            parts.sort_by_key(|part| part.offset);
+            let resumed = self.resumed_offset_from(&parts);
+            // Entries after the first gap are individually plausible but not
+            // yet trustworthy as part of this upload's contiguous generation.
+            // Drop that suffix so a later retry cannot accidentally promote it
+            // after only the missing part succeeds.
+            parts.retain(|part| part.offset < resumed);
+            resumed
         };
         Ok(UploadResumeInfo {
             completed_file_id: None,
@@ -328,6 +414,12 @@ impl BreakpointUpload for PresignedMultipartUpload {
 
     async fn upload_chunk(&self, ctx: UploadChunkCtx<'_>) -> Result<UploadResumeInfo, MeowError> {
         let part = self.part_for_upload(ctx.offset).await?;
+        if ctx.task.stop_requested() {
+            return Err(MeowError::from_code_str(
+                InnerErrorCode::TaskCanceled,
+                "presigned upload stopped while refreshing part URL",
+            ));
+        }
         if part.size != ctx.chunk.len() as u64 {
             return Err(MeowError::from_code(
                 InnerErrorCode::InvalidRange,
@@ -347,6 +439,7 @@ impl BreakpointUpload for PresignedMultipartUpload {
             .send()
             .await
             .map_err(|e| {
+                let e = e.without_url();
                 crate::log::emit_lazy(|| {
                     crate::log::Log::error(
                         "upload_part",
@@ -380,12 +473,13 @@ impl BreakpointUpload for PresignedMultipartUpload {
                     String::new()
                 }
             };
+            let safe_body = crate::log::redact_secrets(&body);
             crate::log::emit_lazy(|| {
                 crate::log::Log::error(
                     "upload_part",
                     format!(
                         "presigned upload part non-2xx status={status}, body: {}",
-                        crate::log::redact_secrets(&body)
+                        safe_body
                     ),
                 )
                 .with_task_id(ctx.task.file_sign())
@@ -396,7 +490,7 @@ impl BreakpointUpload for PresignedMultipartUpload {
             });
             return Err(MeowError::from_code(
                 InnerErrorCode::ResponseStatusError,
-                format!("presigned upload part failed: {status}, body: {body}"),
+                format!("presigned upload part failed: {status}, body: {safe_body}"),
             )
             .with_http_status(status.as_u16()));
         }

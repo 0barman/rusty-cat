@@ -124,6 +124,26 @@ mod lifecycle_tests {
             assert!(lifecycle.finish_incomplete_completion().is_some());
         }
     }
+
+    #[test]
+    fn stop_requested_distinguishes_control_stop_from_completion() {
+        let completing = TransferLifecycle::new();
+        assert!(!completing.stop_requested());
+        assert!(completing.begin_completion());
+        assert!(
+            !completing.stop_requested(),
+            "an ordinary terminal request is not a pause/cancel"
+        );
+        assert_eq!(
+            completing.begin_cancel(),
+            StopRequestDisposition::DeferredUntilRequestReturns
+        );
+        assert!(completing.stop_requested());
+
+        let pausing = TransferLifecycle::new();
+        assert_eq!(pausing.begin_pause(), StopRequestDisposition::InterruptNow);
+        assert!(pausing.stop_requested());
+    }
 }
 
 impl TransferLifecycle {
@@ -313,6 +333,20 @@ impl TransferLifecycle {
 
     pub(crate) fn abort_required(&self) -> bool {
         self.abort_required.load(Ordering::Acquire)
+    }
+
+    /// Returns true only after pause/cancel has won or is pending behind an
+    /// in-flight terminal request. Ordinary completion is deliberately false:
+    /// callers use this to suppress work released after a control-plane stop,
+    /// not to change completion-vs-cancel arbitration.
+    pub(crate) fn stop_requested(&self) -> bool {
+        matches!(
+            self.terminal.load(Ordering::Acquire),
+            TRANSFER_CANCELING
+                | TRANSFER_PAUSING
+                | TRANSFER_COMPLETING_CANCEL_PENDING
+                | TRANSFER_COMPLETING_PAUSE_PENDING
+        )
     }
 }
 

@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use fs2::FileExt;
 use reqwest::header::HeaderMap;
@@ -168,6 +168,11 @@ pub struct TransferTask {
     /// parallel `download_prepare` initializes it). Guarded so concurrent parts
     /// can flip their bit without racing.
     download_progress: Arc<StdMutex<Option<crate::dflt::download_progress::DownloadProgress>>>,
+    /// Remote size resolved for this execution after an unknown-size HEAD.
+    ///
+    /// This is deliberately task-local: reusable protocol plans must not retain
+    /// metadata learned from one task and apply it to a later task.
+    resolved_download_total: Arc<OnceLock<u64>>,
     /// Max retries after first failed upload prepare (`BreakpointUpload::prepare`).
     max_upload_prepare_retries: u32,
 }
@@ -221,6 +226,7 @@ impl TransferTask {
             target_lease: Arc::new(StdMutex::new(None)),
             max_parts_in_flight: inner.max_parts_in_flight(),
             download_progress: Arc::new(StdMutex::new(None)),
+            resolved_download_total: Arc::new(OnceLock::new()),
             max_upload_prepare_retries: inner.max_upload_prepare_retries(),
         }
     }
@@ -433,6 +439,54 @@ impl TransferTask {
         &self,
     ) -> Option<crate::inner::inner_task::DeferredStop> {
         self.transfer_lifecycle.finish_incomplete_completion()
+    }
+
+    pub(crate) fn stop_requested(&self) -> bool {
+        self.transfer_lifecycle.stop_requested()
+    }
+
+    pub(crate) fn freeze_resolved_download_total(
+        &self,
+        total: u64,
+    ) -> Result<(), crate::MeowError> {
+        if let Some(expected) = self.resolved_download_total.get().copied() {
+            return if expected == total {
+                Ok(())
+            } else {
+                Err(crate::MeowError::from_code(
+                    crate::InnerErrorCode::InvalidTaskState,
+                    format!(
+                        "download task total_size changed: expected={expected} observed={total}"
+                    ),
+                ))
+            };
+        }
+
+        match self.resolved_download_total.set(total) {
+            Ok(()) => Ok(()),
+            Err(observed) => {
+                let expected = self
+                    .resolved_download_total
+                    .get()
+                    .copied()
+                    .unwrap_or(observed);
+                if expected == observed {
+                    Ok(())
+                } else {
+                    Err(crate::MeowError::from_code(
+                        crate::InnerErrorCode::InvalidTaskState,
+                        format!(
+                            "download task total_size changed: expected={expected} observed={observed}"
+                        ),
+                    ))
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "presigned")]
+    pub(crate) fn resolved_download_total(&self) -> Option<u64> {
+        self.resolved_download_total.get().copied()
     }
 
     pub(crate) async fn ensure_download_target_lease(&self) -> Result<(), crate::MeowError> {
@@ -1101,7 +1155,7 @@ mod checkpoint_timer_tests {
         BreakpointDownloadHttpConfig, DefaultStyleUpload, StandardRangeDownload,
     };
     use reqwest::{header::HeaderMap, Method};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
 
     fn download_task_for(target: &std::path::Path) -> TransferTask {
         TransferTask {
@@ -1126,6 +1180,7 @@ mod checkpoint_timer_tests {
             target_lease: Arc::new(Mutex::new(None)),
             max_parts_in_flight: 2,
             download_progress: Arc::new(Mutex::new(None)),
+            resolved_download_total: Arc::new(OnceLock::new()),
             max_upload_prepare_retries: 0,
         }
     }

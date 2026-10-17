@@ -132,7 +132,23 @@ pub(crate) async fn transfer_chunk_with_retry(
                 // pause/cancel 可能在 in-flight 请求返回后才落到令牌上；此时错误常为 HttpError
                 //（底层 Canceled/reset），应优先走取消分支而不是按网络错误重试或失败。
                 let cancellation_related = cancellation_can_mask(&err);
-                if cancel.is_cancelled() && cancellation_related {
+                // The final serial chunk claims completion before entering the
+                // protocol. A later accepted pause/cancel is deliberately
+                // deferred and therefore does not cancel this worker token.
+                // Honor only an explicit protocol TaskCanceled signal in that
+                // narrow state; unrelated transport/integrity failures retain
+                // their normal retry/failure classification.
+                let deferred_protocol_stop =
+                    err.code() == InnerErrorCode::TaskCanceled as i32 && task.stop_requested();
+                if (cancel.is_cancelled() && cancellation_related) || deferred_protocol_stop {
+                    if deferred_protocol_stop {
+                        // The protocol returned without completing the request.
+                        // Settle its predictive completion claim before the
+                        // scheduler resets a quiescent pause for resume. This
+                        // also preserves any concurrent upgrade from pause to
+                        // cancel in the shared lifecycle arbitration.
+                        let _ = task.finish_incomplete_completion();
+                    }
                     crate::meow_trace_log!(
                         "chunk_retry",
                         "cancel after chunk error: key={} offset={} attempt={} err={}",
@@ -285,8 +301,24 @@ pub(crate) fn calc_backoff_with_jitter_ms(attempt: u32) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{cancellation_can_mask, is_retryable_http_status, is_transport_retryable};
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use tokio_util::sync::CancellationToken;
+
+    use super::{
+        cancellation_can_mask, is_retryable_http_status, is_transport_retryable,
+        transfer_chunk_with_retry, ChunkRetryResult, ChunkTransferMode,
+    };
+    use crate::chunk_outcome::ChunkOutcome;
+    use crate::dflt::default_http_transfer::default_breakpoint_arcs;
+    use crate::down_pounce_builder::DownloadPounceBuilder;
     use crate::error::{InnerErrorCode, MeowError};
+    use crate::http_breakpoint::BreakpointDownloadHttpConfig;
+    use crate::inner::inner_task::{InnerTask, StopRequestDisposition};
+    use crate::prepare_outcome::PrepareOutcome;
+    use crate::transfer_executor_trait::TransferTrait;
+    use crate::transfer_task::TransferTask;
 
     fn response_status_err(status: Option<u16>) -> MeowError {
         let err = MeowError::from_code(InnerErrorCode::ResponseStatusError, "status".to_string());
@@ -294,6 +326,73 @@ mod tests {
             Some(s) => err.with_http_status(s),
             None => err,
         }
+    }
+
+    struct AlwaysFails {
+        error: MeowError,
+    }
+
+    #[async_trait]
+    impl TransferTrait for AlwaysFails {
+        async fn prepare(
+            &self,
+            _task: &TransferTask,
+            _local_offset: u64,
+        ) -> Result<PrepareOutcome, MeowError> {
+            panic!("retry unit test never calls prepare")
+        }
+
+        async fn transfer_chunk(
+            &self,
+            _task: &TransferTask,
+            _offset: u64,
+            _chunk_size: u64,
+            _remote_total_size: u64,
+        ) -> Result<ChunkOutcome, MeowError> {
+            Err(self.error.clone())
+        }
+    }
+
+    async fn retry_task(tag: &str) -> (InnerTask, TransferTask) {
+        let target =
+            std::env::temp_dir().join(format!("rusty-cat-retry-{tag}-{}.bin", std::process::id()));
+        let pounce = DownloadPounceBuilder::new(
+            format!("retry-{tag}.bin"),
+            target,
+            1,
+            format!("https://retry.invalid/{tag}"),
+        )
+        .with_total_size(1)
+        .build();
+        let (default_upload, default_download) = default_breakpoint_arcs();
+        let inner = InnerTask::from_pounce(
+            pounce,
+            BreakpointDownloadHttpConfig::default(),
+            None,
+            default_upload,
+            default_download,
+        )
+        .await
+        .expect("build retry unit task");
+        let task = TransferTask::from_inner(&inner);
+        (inner, task)
+    }
+
+    async fn run_once(task: &TransferTask, error: MeowError) -> ChunkRetryResult {
+        let executor: Arc<dyn TransferTrait> = Arc::new(AlwaysFails { error });
+        let key = (task.direction(), task.url().to_owned());
+        transfer_chunk_with_retry(
+            &executor,
+            task,
+            &key,
+            &CancellationToken::new(),
+            0,
+            1,
+            1,
+            0,
+            ChunkTransferMode::Whole,
+        )
+        .await
     }
 
     #[test]
@@ -356,5 +455,153 @@ mod tests {
         assert!(cancellation_can_mask(&MeowError::from_code1(
             InnerErrorCode::TaskCanceled
         )));
+    }
+
+    #[tokio::test]
+    async fn task_canceled_without_lifecycle_stop_remains_failed() {
+        let (_inner, task) = retry_task("task-canceled-open").await;
+
+        match run_once(&task, MeowError::from_code1(InnerErrorCode::TaskCanceled)).await {
+            ChunkRetryResult::Failed(error) => {
+                assert_eq!(error.code(), InnerErrorCode::TaskCanceled as i32)
+            }
+            ChunkRetryResult::Done(_) => panic!("unexpected retry success"),
+            ChunkRetryResult::Cancelled => panic!("an open task must not become canceled"),
+        }
+    }
+
+    #[tokio::test]
+    async fn task_canceled_with_deferred_lifecycle_stop_becomes_cancelled() {
+        let (inner, task) = retry_task("task-canceled-pending").await;
+        assert!(task.begin_terminal_completion());
+        assert_eq!(
+            inner.begin_terminal_cancel(),
+            StopRequestDisposition::DeferredUntilRequestReturns
+        );
+
+        match run_once(&task, MeowError::from_code1(InnerErrorCode::TaskCanceled)).await {
+            ChunkRetryResult::Cancelled => {}
+            ChunkRetryResult::Done(_) => panic!("unexpected retry success"),
+            ChunkRetryResult::Failed(_) => {
+                panic!("a protocol stop signal must honor the deferred control request")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_lifecycle_stop_does_not_mask_http_error_without_canceled_token() {
+        let (inner, task) = retry_task("http-error-pending").await;
+        assert!(task.begin_terminal_completion());
+        assert_eq!(
+            inner.begin_terminal_cancel(),
+            StopRequestDisposition::DeferredUntilRequestReturns
+        );
+
+        match run_once(&task, MeowError::from_code1(InnerErrorCode::HttpError)).await {
+            ChunkRetryResult::Failed(error) => {
+                assert_eq!(error.code(), InnerErrorCode::HttpError as i32)
+            }
+            ChunkRetryResult::Done(_) => panic!("unexpected retry success"),
+            ChunkRetryResult::Cancelled => {
+                panic!("a lifecycle stop alone must not mask a transport error")
+            }
+        }
+    }
+
+    async fn review_retry_task(tag: &str) -> Result<(InnerTask, TransferTask), MeowError> {
+        let pounce = DownloadPounceBuilder::new(
+            format!("review-{tag}.bin"),
+            std::env::temp_dir().join(format!("review-retry-{tag}.bin")),
+            1,
+            format!("https://retry.invalid/review-{tag}"),
+        )
+        .with_total_size(1)
+        .build();
+        let (upload, download) = default_breakpoint_arcs();
+        let inner = InnerTask::from_pounce(
+            pounce,
+            BreakpointDownloadHttpConfig::default(),
+            None,
+            upload,
+            download,
+        )
+        .await?;
+        let task = TransferTask::from_inner(&inner);
+        Ok((inner, task))
+    }
+
+    #[tokio::test]
+    async fn review_deferred_protocol_pause_releases_completion_for_resume(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (inner, task) = review_retry_task("pause-resume").await?;
+        if !task.begin_terminal_completion()
+            || inner.begin_terminal_pause() != StopRequestDisposition::DeferredUntilRequestReturns
+        {
+            return Err("fixture did not enter deferred completion pause".into());
+        }
+        if !matches!(
+            run_once(&task, MeowError::from_code1(InnerErrorCode::TaskCanceled)).await,
+            ChunkRetryResult::Cancelled
+        ) {
+            return Err("protocol stop must report cancellation to scheduler".into());
+        }
+        inner.reset_terminal_pause();
+        if task.stop_requested() || !task.begin_terminal_completion() {
+            return Err("quiescent deferred pause must allow a resumed completion claim".into());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn review_deferred_protocol_cancel_upgrade_cannot_reset_as_pause(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (inner, task) = review_retry_task("pause-cancel").await?;
+        if !task.begin_terminal_completion()
+            || inner.begin_terminal_pause() != StopRequestDisposition::DeferredUntilRequestReturns
+            || inner.begin_terminal_cancel() != StopRequestDisposition::DeferredUntilRequestReturns
+        {
+            return Err("fixture did not upgrade deferred pause to cancel".into());
+        }
+        if !matches!(
+            run_once(&task, MeowError::from_code1(InnerErrorCode::TaskCanceled)).await,
+            ChunkRetryResult::Cancelled
+        ) {
+            return Err("upgraded protocol stop must report cancellation".into());
+        }
+        inner.reset_terminal_pause();
+        if !task.stop_requested()
+            || task.begin_terminal_completion()
+            || inner.begin_terminal_cancel() != StopRequestDisposition::InterruptNow
+        {
+            return Err(
+                "returned incomplete request must settle cancel without allowing resume".into(),
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn review_deferred_pause_preserves_integrity_failure(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (inner, task) = review_retry_task("pause-integrity").await?;
+        if !task.begin_terminal_completion()
+            || inner.begin_terminal_pause() != StopRequestDisposition::DeferredUntilRequestReturns
+        {
+            return Err("fixture did not enter deferred pause".into());
+        }
+        match run_once(
+            &task,
+            MeowError::from_code1(InnerErrorCode::ChecksumMismatch),
+        )
+        .await
+        {
+            ChunkRetryResult::Failed(error)
+                if error.code() == InnerErrorCode::ChecksumMismatch as i32 => {}
+            _ => return Err("deferred pause must not conceal integrity failure".into()),
+        }
+        if !task.stop_requested() {
+            return Err("integrity failure must not reopen lifecycle".into());
+        }
+        Ok(())
     }
 }

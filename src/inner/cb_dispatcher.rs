@@ -112,10 +112,10 @@ pub(crate) fn is_callback_dispatcher_thread_for(owner: &CallbackDispatcherOwner)
     CALLBACK_DISPATCHER_OWNER.with(|current| current.get() == Some(expected))
 }
 
-struct CallbackDispatcherThreadMarker;
+pub(crate) struct CallbackDispatcherThreadMarker;
 
 impl CallbackDispatcherThreadMarker {
-    fn enter(owner: &CallbackDispatcherOwner) -> Self {
+    pub(crate) fn enter(owner: &CallbackDispatcherOwner) -> Self {
         CALLBACK_DISPATCHER_OWNER.with(|current| {
             debug_assert!(
                 current.get().is_none(),
@@ -327,4 +327,26 @@ pub(crate) fn start_for(
             handle: Some(handle),
         },
     ))
+}
+
+#[cfg(test)]
+mod owner_marker_tests {
+    use super::*;
+
+    #[test]
+    fn owner_marker_is_scoped_distinguishes_clients_and_clears_after_unwind() {
+        let owner = CallbackDispatcherOwner::new();
+        let other = CallbackDispatcherOwner::new();
+        assert!(!is_callback_dispatcher_thread_for(&owner));
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _marker = CallbackDispatcherThreadMarker::enter(&owner);
+            assert!(is_callback_dispatcher_thread_for(&owner));
+            assert!(!is_callback_dispatcher_thread_for(&other));
+            panic!("exercise callback owner unwind cleanup");
+        }));
+        assert!(unwind.is_err());
+        assert!(!is_callback_dispatcher_thread_for(&owner));
+        assert!(!is_callback_dispatcher_thread_for(&other));
+    }
 }

@@ -72,6 +72,10 @@ pub mod pounce_task;
 pub mod prepare_outcome;
 #[cfg(feature = "presigned")]
 pub mod presigned;
+#[cfg(any(feature = "aliyun-oss-direct", feature = "azure-blob-direct"))]
+mod provider_body;
+#[cfg(any(feature = "aliyun-oss-direct", feature = "azure-blob-direct"))]
+mod provider_xml;
 pub(crate) mod target_lease;
 pub mod transfer_executor_trait;
 pub mod transfer_snapshot;
