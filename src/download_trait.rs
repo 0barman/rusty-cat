@@ -222,16 +222,39 @@ pub trait BreakpointDownload: Send + Sync {
     /// # Ok::<(), rusty_cat::api::MeowError>(())
     /// ```
     fn total_size_from_head(&self, headers: &HeaderMap) -> Result<u64, MeowError> {
-        headers
-            .get(reqwest::header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .filter(|&n| n > 0)
-            .ok_or_else(|| {
-                MeowError::from_code_str(
-                    InnerErrorCode::MissingOrInvalidContentLengthFromHead,
-                    "missing or invalid content-length from HEAD",
-                )
-            })
+        crate::dflt::require_single_header(
+            headers,
+            reqwest::header::CONTENT_LENGTH,
+            "download HEAD response",
+        )?
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .ok_or_else(|| {
+            MeowError::from_code_str(
+                InnerErrorCode::MissingOrInvalidContentLengthFromHead,
+                "missing or invalid content-length from HEAD",
+            )
+        })
+    }
+}
+
+#[cfg(test)]
+mod head_metadata_tests {
+    use reqwest::header::{HeaderMap, HeaderValue, CONTENT_LENGTH};
+
+    use super::BreakpointDownload;
+    use crate::http_breakpoint::StandardRangeDownload;
+
+    #[test]
+    fn default_head_parser_rejects_duplicate_or_conflicting_content_length() {
+        for second in ["8", "9"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_LENGTH, HeaderValue::from_static("8"));
+            headers.append(CONTENT_LENGTH, HeaderValue::from_static(second));
+
+            StandardRangeDownload
+                .total_size_from_head(&headers)
+                .expect_err("multiple Content-Length fields must be rejected");
+        }
     }
 }

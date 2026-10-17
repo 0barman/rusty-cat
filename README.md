@@ -29,13 +29,24 @@ restart recovery.
 | Rust edition | 2021 |
 | MSRV | Rust 1.89 stable |
 | Runtime | Tokio-based async runtime hosted by an internal scheduler thread |
-| HTTP stack | `reqwest` with `rustls-tls` |
+| HTTP stack | `reqwest` 0.13.5 with the `rustls` feature |
 | Platforms | Release targets are native Linux, macOS, and Windows; Android and iOS remain compile-gated and experimental at runtime. See the verification boundary below. |
 | License | MIT |
 | Repository | <https://github.com/0barman/rusty-cat> |
 
 See the [0.3.6 release notes](docs/release-0.3.6.md) for the Windows stable-Rust
 compatibility fix and the local-file consistency changes.
+
+Consumers that inject a `reqwest::Client` or pass a `reqwest::multipart::Form`
+through the public protocol API must use reqwest 0.13 in their own dependencies.
+The `rustls` feature enables AWS-LC as the default crypto provider and uses
+`rustls-platform-verifier` for platform/system certificate verification.
+
+On Android, the host application must include the verifier's Kotlin component
+and initialize `rustls-platform-verifier` with its JVM/context before networking
+starts; see the [Android integration instructions](https://docs.rs/crate/rustls-platform-verifier/0.7.0#android).
+The compile gate does not perform this host setup or verify device TLS behavior;
+Android runtime support remains experimental.
 
 ### Platform support levels
 

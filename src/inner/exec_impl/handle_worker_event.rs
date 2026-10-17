@@ -60,7 +60,7 @@ pub(crate) async fn handle_worker_event(event: WorkerEvent, state: &mut Schedule
                             next_offset, total_size
                         ),
                     )
-                    .with_key(key.1.as_str())
+                    .with_key(crate::inner::safe_object_key(&key))
                     .with_offset(next_offset)
                 });
             }
@@ -119,7 +119,7 @@ pub(crate) async fn handle_worker_event(event: WorkerEvent, state: &mut Schedule
                             total_size
                         ),
                     )
-                    .with_key(key.1.as_str())
+                    .with_key(crate::inner::safe_object_key(&key))
                 });
             }
             state.offsets_mut().remove(&key);
@@ -152,7 +152,7 @@ pub(crate) async fn handle_worker_event(event: WorkerEvent, state: &mut Schedule
                             crate::log::redact_secrets(&error.to_string())
                         ),
                     )
-                    .with_key(key.1.as_str())
+                    .with_key(crate::inner::safe_object_key(&key))
                     .with_offset(current)
                     .with_error_code(error.code());
                     if let Some(status) = error.http_status() {
@@ -183,7 +183,7 @@ pub(crate) async fn handle_worker_event(event: WorkerEvent, state: &mut Schedule
                             crate::log::redact_secrets(&error.to_string())
                         ),
                     )
-                    .with_key(key.1.as_str())
+                    .with_key(crate::inner::safe_object_key(&key))
                     .with_error_code(error.code())
                 });
             }
@@ -250,7 +250,7 @@ pub(crate) async fn handle_worker_event(event: WorkerEvent, state: &mut Schedule
                         "worker_event",
                         "Canceled for unknown group; nothing to finalize".to_string(),
                     )
-                    .with_key(key.1.as_str())
+                    .with_key(crate::inner::safe_object_key(&key))
                 });
             }
             state.offsets_mut().remove(&key);

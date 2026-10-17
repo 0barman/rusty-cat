@@ -152,7 +152,11 @@ struct HeaderAwareUploadServer {
 }
 
 impl HeaderAwareUploadServer {
-    fn spawn(required_header: &'static str, required_value: &'static str) -> Self {
+    fn spawn(
+        required_header: &'static str,
+        required_value: &'static str,
+        completed_next_byte: u64,
+    ) -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind header server");
         let addr = listener.local_addr().expect("read local addr");
         listener.set_nonblocking(true).expect("set nonblocking");
@@ -216,13 +220,13 @@ impl HeaderAwareUploadServer {
                 }
 
                 state_for_thread.lock().expect("lock state").chunk_calls += 1;
-                let body = b"{\"nextByte\":999999999}";
+                let body = format!(r#"{{"nextByte":{completed_next_byte}}}"#);
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
                 let _ = stream.write_all(resp.as_bytes());
-                let _ = stream.write_all(body);
+                let _ = stream.write_all(body.as_bytes());
                 let _ = stream.flush();
             }
         });
@@ -270,10 +274,11 @@ async fn custom_reqwest_client_is_used_on_upload_path() {
     let required_header = "x-rusty-custom-upload-client";
     let required_value = "enabled";
 
-    let server = HeaderAwareUploadServer::spawn(required_header, required_value);
     let upload_path = temp_upload_path("header_required");
-    fs::write(&upload_path, b"custom-client-upload-payload".repeat(2048))
-        .expect("write upload fixture");
+    let payload = b"custom-client-upload-payload".repeat(2048);
+    fs::write(&upload_path, &payload).expect("write upload fixture");
+    let server =
+        HeaderAwareUploadServer::spawn(required_header, required_value, payload.len() as u64);
 
     let mut headers = HeaderMap::new();
     headers.insert(required_header, HeaderValue::from_static(required_value));

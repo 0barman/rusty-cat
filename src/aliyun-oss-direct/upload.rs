@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, ETAG};
+use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use reqwest::{Method, Url};
 use tokio::sync::Mutex;
 
@@ -16,10 +16,25 @@ use super::signing::{
     current_date, derive_signing_key, header_value, param_error, signed_headers_with_key,
     SecretKeyBytes,
 };
-use super::xml::{extract_part_numbers, extract_upload_ids_for_key, extract_xml_tag};
+use super::xml::{extract_xml_tag, parse_part_page, parse_upload_page_for_key, OssPart};
 use crate::http_breakpoint::UploadResumeInfo;
 use crate::upload_trait::{UploadChunkCtx, UploadPrepareCtx};
 use crate::{BreakpointUpload, InnerErrorCode, MeowError, TransferTask};
+
+const OSS_RESERVED_QUERY_KEYS: &[&str] = &[
+    "uploads",
+    "uploadId",
+    "partNumber",
+    "prefix",
+    "max-uploads",
+    "max-parts",
+    "encoding-type",
+    "key-marker",
+    "upload-id-marker",
+    "part-number-marker",
+];
+
+const MAX_OSS_PAGINATION_REQUESTS: usize = MAX_OSS_PART_NUMBER as usize;
 
 /// Aliyun OSS direct multipart upload protocol using AccessKey signing.
 #[derive(Clone)]
@@ -59,7 +74,7 @@ impl AliOssDirectUpload {
 
     fn object_key_from_task_url(&self, task: &TransferTask) -> Result<String, MeowError> {
         let url = Url::parse(task.url()).map_err(param_error)?;
-        Ok(url.path().trim_start_matches('/').to_string())
+        decode_object_key(url.path().trim_start_matches('/'))
     }
 
     fn object_canonical_uri_from_task_url(&self, task: &TransferTask) -> Result<String, MeowError> {
@@ -119,16 +134,21 @@ impl AliOssDirectUpload {
     ) -> Result<String, MeowError> {
         let canonical_uri = self.object_canonical_uri_from_task_url(task)?;
         let mut url = Url::parse(task.url()).map_err(param_error)?;
-        url.set_query(Some("uploads"));
-        let raw_query = url.query().unwrap_or("uploads");
+        crate::provider_body::reject_reserved_query_keys(
+            &url,
+            OSS_RESERVED_QUERY_KEYS,
+            "Aliyun OSS",
+        )?;
+        let raw_query = crate::provider_body::append_raw_query_component(&mut url, "uploads");
         let headers =
-            self.build_signed_headers("POST", &canonical_uri, Some(raw_query), &[], None)?;
+            self.build_signed_headers("POST", &canonical_uri, Some(&raw_query), &[], None)?;
         let resp = client
             .request(Method::POST, url)
             .headers(headers)
             .send()
             .await
             .map_err(|e| {
+                let e = e.without_url();
                 crate::log::emit_lazy(|| {
                     crate::log::Log::error(
                         "initiate",
@@ -147,14 +167,17 @@ impl AliOssDirectUpload {
                 )
             })?;
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
+            let body = crate::provider_body::read_error_body(resp)
+                .await
+                .unwrap_or_default();
+            let safe_body = crate::log::redact_secrets(&body);
             crate::log::emit_lazy(|| {
                 crate::log::Log::error(
                     "initiate",
                     format!(
                         "oss initiate multipart non-2xx: {status}, body: {}",
-                        crate::log::redact_secrets(&body)
+                        safe_body
                     ),
                 )
                 .with_task_id(task.file_sign())
@@ -163,17 +186,19 @@ impl AliOssDirectUpload {
             });
             return Err(MeowError::from_code(
                 InnerErrorCode::ResponseStatusError,
-                format!("oss initiate multipart failed: {status}, body: {body}"),
+                format!("oss initiate multipart failed: {status}, body: {safe_body}"),
             )
             .with_http_status(status.as_u16()));
         }
+        let body = crate::provider_body::read_control_body(resp, "oss initiate multipart").await?;
         extract_xml_tag(&body, "UploadId").ok_or_else(|| {
+            let safe_body = crate::log::redact_secrets(&body);
             crate::log::emit_lazy(|| {
                 crate::log::Log::error(
                     "initiate",
                     format!(
                         "oss initiate multipart 2xx but UploadId unparseable, body: {}",
-                        crate::log::redact_secrets(&body)
+                        safe_body
                     ),
                 )
                 .with_task_id(task.file_sign())
@@ -181,7 +206,7 @@ impl AliOssDirectUpload {
             });
             MeowError::from_code(
                 InnerErrorCode::ResponseParseError,
-                format!("oss initiate multipart missing UploadId: {body}"),
+                format!("oss initiate multipart missing UploadId: {safe_body}"),
             )
         })
     }
@@ -192,151 +217,266 @@ impl AliOssDirectUpload {
         task: &TransferTask,
     ) -> Result<Option<String>, MeowError> {
         let object_key = self.object_key_from_task_url(task)?;
-        let mut url = Url::parse(task.url()).map_err(param_error)?;
-        url.set_path("/");
-        {
-            let mut pairs = url.query_pairs_mut();
-            pairs.append_pair("uploads", "");
-            pairs.append_pair("prefix", &object_key);
-            pairs.append_pair("max-uploads", OSS_LIST_MAX_UPLOADS);
-        }
-        let raw_query = url.query().ok_or_else(|| {
-            MeowError::from_code_str(
-                InnerErrorCode::ParameterEmpty,
-                "build list multipart query failed",
-            )
-        })?;
-        let headers = self.build_signed_headers(
-            "GET",
-            self.bucket_canonical_uri().as_str(),
-            Some(raw_query),
-            &[],
-            None,
-        )?;
-        let resp = client
-            .request(Method::GET, url)
-            .headers(headers)
-            .send()
-            .await
-            .map_err(|e| {
+        let safe_object_key = crate::log::redact_secrets(&object_key);
+        let mut marker: Option<(String, String)> = None;
+        let mut found_ids = std::collections::BTreeSet::new();
+
+        for _ in 0..MAX_OSS_PAGINATION_REQUESTS {
+            let mut url = Url::parse(task.url()).map_err(param_error)?;
+            crate::provider_body::reject_reserved_query_keys(
+                &url,
+                OSS_RESERVED_QUERY_KEYS,
+                "Aliyun OSS",
+            )?;
+            url.set_path("/");
+            crate::provider_body::append_raw_query_component(&mut url, "uploads");
+            let mut query_pairs = vec![
+                ("encoding-type", "url".to_owned()),
+                ("prefix", object_key.clone()),
+                ("max-uploads", OSS_LIST_MAX_UPLOADS.to_owned()),
+            ];
+            if let Some((key_marker, upload_id_marker)) = marker.as_ref() {
+                query_pairs.push(("key-marker", key_marker.clone()));
+                query_pairs.push(("upload-id-marker", upload_id_marker.clone()));
+            }
+            let raw_query =
+                crate::provider_body::append_query_pairs_preserving_raw(&mut url, &query_pairs);
+            let headers = self.build_signed_headers(
+                "GET",
+                self.bucket_canonical_uri().as_str(),
+                Some(&raw_query),
+                &[],
+                None,
+            )?;
+            let resp = client
+                .request(Method::GET, url)
+                .headers(headers)
+                .send()
+                .await
+                .map_err(|e| {
+                    let e = e.without_url();
+                    crate::log::emit_lazy(|| {
+                        crate::log::Log::warn(
+                            "list_uploads",
+                            format!(
+                                "oss list multipart uploads send failed: {}",
+                                crate::log::redact_secrets(&e.to_string())
+                            ),
+                        )
+                        .with_task_id(task.file_sign())
+                        .with_key(safe_object_key.as_str())
+                        .with_url(task.url())
+                    });
+                    MeowError::from_source(
+                        InnerErrorCode::HttpError,
+                        "oss list multipart uploads failed",
+                        e,
+                    )
+                })?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = crate::provider_body::read_error_body(resp)
+                    .await
+                    .unwrap_or_default();
+                let safe_body = crate::log::redact_secrets(&body);
                 crate::log::emit_lazy(|| {
                     crate::log::Log::warn(
                         "list_uploads",
                         format!(
-                            "oss list multipart uploads send failed: {}",
-                            crate::log::redact_secrets(&e.to_string())
+                            "oss list multipart uploads non-2xx: {status}, body: {}",
+                            safe_body
                         ),
                     )
                     .with_task_id(task.file_sign())
-                    .with_key(object_key.as_str())
+                    .with_key(safe_object_key.as_str())
+                    .with_http_status(status.as_u16())
                     .with_url(task.url())
                 });
-                MeowError::from_source(
-                    InnerErrorCode::HttpError,
-                    "oss list multipart uploads failed",
-                    e,
+                return Err(MeowError::from_code(
+                    InnerErrorCode::ResponseStatusError,
+                    format!("oss list multipart uploads failed: {status}, body: {safe_body}"),
+                )
+                .with_http_status(status.as_u16()));
+            }
+            let body =
+                crate::provider_body::read_control_body(resp, "oss list multipart uploads").await?;
+            let page = parse_upload_page_for_key(&body, &object_key).map_err(|reason| {
+                MeowError::from_code(
+                    InnerErrorCode::ResponseParseError,
+                    format!("oss list multipart uploads XML rejected: {reason}"),
                 )
             })?;
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            crate::log::emit_lazy(|| {
-                crate::log::Log::warn(
-                    "list_uploads",
-                    format!(
-                        "oss list multipart uploads non-2xx: {status}, body: {}",
-                        crate::log::redact_secrets(&body)
-                    ),
-                )
-                .with_task_id(task.file_sign())
-                .with_key(object_key.as_str())
-                .with_http_status(status.as_u16())
-                .with_url(task.url())
-            });
-            return Err(MeowError::from_code(
-                InnerErrorCode::ResponseStatusError,
-                format!("oss list multipart uploads failed: {status}, body: {body}"),
-            )
-            .with_http_status(status.as_u16()));
+            for upload_id in page.upload_ids_for_key {
+                if !found_ids.insert(upload_id) {
+                    return Err(MeowError::from_code_str(
+                        InnerErrorCode::ResponseParseError,
+                        "oss list multipart uploads repeated an entry across pages",
+                    ));
+                }
+                if found_ids.len() > 1 {
+                    crate::log::emit_lazy(|| {
+                        crate::log::Log::error(
+                            "list_uploads",
+                            format!(
+                                "found multiple multipart sessions for object '{safe_object_key}'; cannot safely adopt"
+                            ),
+                        )
+                        .with_task_id(task.file_sign())
+                        .with_key(safe_object_key.as_str())
+                        .with_url(task.url())
+                    });
+                    return Err(MeowError::from_code(
+                        InnerErrorCode::InvalidTaskState,
+                        format!("found multiple multipart sessions for object '{safe_object_key}'"),
+                    ));
+                }
+            }
+
+            let Some(next_marker) = page.next_markers else {
+                return Ok(found_ids.into_iter().next());
+            };
+            if next_marker.0.as_str() < object_key.as_str() {
+                return Err(MeowError::from_code_str(
+                    InnerErrorCode::ResponseParseError,
+                    "oss upload-list pagination marker precedes the requested object key",
+                ));
+            }
+            if next_marker.0.as_str() > object_key.as_str() {
+                // Results are ordered by object key, then UploadId. Once the
+                // marker has moved past this exact key, no later page can add a
+                // second session for it.
+                return Ok(found_ids.into_iter().next());
+            }
+            if next_marker.1.is_empty()
+                || marker
+                    .as_ref()
+                    .is_some_and(|current| next_marker <= *current)
+            {
+                return Err(MeowError::from_code_str(
+                    InnerErrorCode::ResponseParseError,
+                    "oss upload-list pagination marker did not advance",
+                ));
+            }
+            marker = Some(next_marker);
         }
-        let ids = extract_upload_ids_for_key(&body, &object_key);
-        if ids.len() > 1 {
-            crate::log::emit_lazy(|| {
-                crate::log::Log::error(
-                    "list_uploads",
-                    format!(
-                        "found multiple multipart sessions for object '{object_key}'; cannot safely adopt"
-                    ),
-                )
-                .with_task_id(task.file_sign())
-                .with_key(object_key.as_str())
-                .with_url(task.url())
-            });
-            return Err(MeowError::from_code(
-                InnerErrorCode::InvalidTaskState,
-                format!("found multiple multipart sessions for object '{object_key}'"),
-            ));
-        }
-        Ok(ids.into_iter().next())
+
+        Err(MeowError::from_code_str(
+            InnerErrorCode::ResponseParseError,
+            "oss upload-list pagination exceeded its bounded request limit",
+        ))
     }
 
-    async fn list_uploaded_part_numbers(
+    async fn list_uploaded_parts(
         &self,
         client: &reqwest::Client,
         task: &TransferTask,
         upload_id: &str,
-    ) -> Result<Vec<u64>, MeowError> {
+    ) -> Result<Vec<OssPart>, MeowError> {
         let canonical_uri = self.object_canonical_uri_from_task_url(task)?;
-        let (url, raw_query) = Self::build_query_url(
-            task,
-            &[
+        let mut marker: Option<u64> = None;
+        let mut parts = std::collections::BTreeMap::<u64, OssPart>::new();
+
+        for _ in 0..MAX_OSS_PAGINATION_REQUESTS {
+            let mut query_pairs = vec![
                 ("uploadId", upload_id.to_string()),
                 ("max-parts", OSS_LIST_MAX_PARTS.to_string()),
-            ],
-        )?;
-        let headers =
-            self.build_signed_headers("GET", &canonical_uri, Some(raw_query.as_str()), &[], None)?;
-        let resp = client
-            .request(Method::GET, url)
-            .headers(headers)
-            .send()
-            .await
-            .map_err(|e| {
+            ];
+            if let Some(part_number_marker) = marker {
+                query_pairs.push(("part-number-marker", part_number_marker.to_string()));
+            }
+            let (url, raw_query) = Self::build_query_url(task, &query_pairs)?;
+            let headers = self.build_signed_headers(
+                "GET",
+                &canonical_uri,
+                Some(raw_query.as_str()),
+                &[],
+                None,
+            )?;
+            let resp = client
+                .request(Method::GET, url)
+                .headers(headers)
+                .send()
+                .await
+                .map_err(|e| {
+                    let e = e.without_url();
+                    crate::log::emit_lazy(|| {
+                        crate::log::Log::warn(
+                            "list_parts",
+                            format!(
+                                "oss list parts send failed: {}",
+                                crate::log::redact_secrets(&e.to_string())
+                            ),
+                        )
+                        .with_task_id(task.file_sign())
+                        .with_url(task.url())
+                    });
+                    MeowError::from_source(InnerErrorCode::HttpError, "oss list parts failed", e)
+                })?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = crate::provider_body::read_error_body(resp)
+                    .await
+                    .unwrap_or_default();
+                let safe_body = crate::log::redact_secrets(&body);
                 crate::log::emit_lazy(|| {
                     crate::log::Log::warn(
                         "list_parts",
-                        format!(
-                            "oss list parts send failed: {}",
-                            crate::log::redact_secrets(&e.to_string())
-                        ),
+                        format!("oss list parts non-2xx: {status}, body: {}", safe_body),
                     )
                     .with_task_id(task.file_sign())
+                    .with_http_status(status.as_u16())
                     .with_url(task.url())
                 });
-                MeowError::from_source(InnerErrorCode::HttpError, "oss list parts failed", e)
-            })?;
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            crate::log::emit_lazy(|| {
-                crate::log::Log::warn(
-                    "list_parts",
-                    format!(
-                        "oss list parts non-2xx: {status}, body: {}",
-                        crate::log::redact_secrets(&body)
-                    ),
+                return Err(MeowError::from_code(
+                    InnerErrorCode::ResponseStatusError,
+                    format!("oss list parts failed: {status}, body: {safe_body}"),
                 )
-                .with_task_id(task.file_sign())
-                .with_http_status(status.as_u16())
-                .with_url(task.url())
-            });
-            return Err(MeowError::from_code(
-                InnerErrorCode::ResponseStatusError,
-                format!("oss list parts failed: {status}, body: {body}"),
-            )
-            .with_http_status(status.as_u16()));
+                .with_http_status(status.as_u16()));
+            }
+            let body = crate::provider_body::read_control_body(resp, "oss list parts").await?;
+            let page = parse_part_page(&body).map_err(|reason| {
+                MeowError::from_code(
+                    InnerErrorCode::ResponseParseError,
+                    format!("oss list parts XML rejected: {reason}"),
+                )
+            })?;
+            let page_last = page.parts.last().map(|part| part.part_number);
+            for part in page.parts {
+                if marker.is_some_and(|current| part.part_number <= current)
+                    || parts.insert(part.part_number, part).is_some()
+                {
+                    return Err(MeowError::from_code_str(
+                        InnerErrorCode::ResponseParseError,
+                        "oss list parts repeated or rewound an entry across pages",
+                    ));
+                }
+                if parts.len() > MAX_OSS_PART_NUMBER as usize {
+                    return Err(MeowError::from_code_str(
+                        InnerErrorCode::ResponseParseError,
+                        "oss list parts exceeded the provider part limit",
+                    ));
+                }
+            }
+
+            let Some(next_marker) = page.next_part_number_marker else {
+                return Ok(parts.into_values().collect());
+            };
+            if next_marker > MAX_OSS_PART_NUMBER
+                || next_marker <= marker.unwrap_or_default()
+                || page_last != Some(next_marker)
+            {
+                return Err(MeowError::from_code_str(
+                    InnerErrorCode::ResponseParseError,
+                    "oss part-list pagination marker did not advance exactly to the page tail",
+                ));
+            }
+            marker = Some(next_marker);
         }
-        Ok(extract_part_numbers(&body))
+
+        Err(MeowError::from_code_str(
+            InnerErrorCode::ResponseParseError,
+            "oss part-list pagination exceeded its bounded request limit",
+        ))
     }
 
     fn build_query_url(
@@ -344,15 +484,12 @@ impl AliOssDirectUpload {
         query_pairs: &[(&str, String)],
     ) -> Result<(Url, String), MeowError> {
         let mut url = Url::parse(task.url()).map_err(param_error)?;
-        {
-            let mut pairs = url.query_pairs_mut();
-            for (k, v) in query_pairs {
-                pairs.append_pair(k, v.as_str());
-            }
-        }
-        let query = url.query().map(|q| q.to_string()).ok_or_else(|| {
-            MeowError::from_code_str(InnerErrorCode::ParameterEmpty, "build query url failed")
-        })?;
+        crate::provider_body::reject_reserved_query_keys(
+            &url,
+            OSS_RESERVED_QUERY_KEYS,
+            "Aliyun OSS",
+        )?;
+        let query = crate::provider_body::append_query_pairs_preserving_raw(&mut url, query_pairs);
         Ok((url, query))
     }
 
@@ -392,14 +529,15 @@ impl AliOssDirectUpload {
     /// Shared `AbortMultipartUpload` request used by both the cancel hook and the
     /// out-of-band [`AliOssDirectUpload::abort_multipart`] cleanup path.
     ///
-    /// The `upload_id` is an OSS multipart session id, not a credential, so it is
-    /// safe to surface in error messages to make abort failures actionable.
+    /// The opaque provider value is preserved exactly for wire requests, while
+    /// diagnostics redact any credential-shaped content it may contain.
     async fn send_abort_multipart(
         &self,
         client: &reqwest::Client,
         task: &TransferTask,
         upload_id: &str,
     ) -> Result<(), MeowError> {
+        let safe_upload_id = crate::log::redact_secrets(upload_id);
         let canonical_uri = self.object_canonical_uri_from_task_url(task)?;
         let (url, raw_query) = Self::build_query_url(task, &[("uploadId", upload_id.to_string())])?;
         let headers = self.build_signed_headers(
@@ -415,11 +553,12 @@ impl AliOssDirectUpload {
             .send()
             .await
             .map_err(|e| {
+                let e = e.without_url();
                 crate::log::emit_lazy(|| {
                     crate::log::Log::warn(
                         "abort",
                         format!(
-                            "oss abort multipart send failed (uploadId={upload_id}); session id retained: {}",
+                            "oss abort multipart send failed (uploadId={safe_upload_id}); session id retained: {}",
                             crate::log::redact_secrets(&e.to_string())
                         ),
                     )
@@ -428,19 +567,22 @@ impl AliOssDirectUpload {
                 });
                 MeowError::from_source(
                     InnerErrorCode::HttpError,
-                    format!("oss abort multipart upload failed (uploadId={upload_id})"),
+                    format!("oss abort multipart upload failed (uploadId={safe_upload_id})"),
                     e,
                 )
             })?;
         let status = resp.status();
         if !(status.is_success() || status == reqwest::StatusCode::NOT_FOUND) {
-            let body = resp.text().await.unwrap_or_default();
+            let body = crate::provider_body::read_error_body(resp)
+                .await
+                .unwrap_or_default();
+            let safe_body = crate::log::redact_secrets(&body);
             crate::log::emit_lazy(|| {
                 crate::log::Log::warn(
                     "abort",
                     format!(
-                        "oss abort multipart non-2xx-non-404: {status}, uploadId={upload_id}, body: {}; session id retained",
-                        crate::log::redact_secrets(&body)
+                        "oss abort multipart non-2xx-non-404: {status}, uploadId={safe_upload_id}, body: {}; session id retained",
+                        safe_body
                     ),
                 )
                 .with_task_id(task.file_sign())
@@ -450,7 +592,7 @@ impl AliOssDirectUpload {
             return Err(MeowError::from_code(
                 InnerErrorCode::ResponseStatusError,
                 format!(
-                    "oss abort multipart upload failed: {status}, uploadId={upload_id}, body: {body}"
+                    "oss abort multipart upload failed: {status}, uploadId={safe_upload_id}, body: {safe_body}"
                 ),
             )
             .with_http_status(status.as_u16()));
@@ -487,16 +629,19 @@ impl BreakpointUpload for AliOssDirectUpload {
                 .await?
             {
                 let uploaded_parts = self
-                    .list_uploaded_part_numbers(ctx.client, ctx.task, &upload_id)
+                    .list_uploaded_parts(ctx.client, ctx.task, &upload_id)
                     .await?;
                 validate_remote_parts_for_resume(ctx.task, ctx.local_offset, &uploaded_parts)?;
                 let mut state = self.session.lock().await;
                 state.target_url = Some(ctx.task.url().to_string());
                 state.upload_id = Some(upload_id.clone());
+                let safe_upload_id = crate::log::redact_secrets(&upload_id);
                 crate::log::emit_lazy(|| {
                     crate::log::Log::key(
                         "initiate",
-                        format!("oss multipart adopted existing session (uploadId={upload_id})"),
+                        format!(
+                            "oss multipart adopted existing session (uploadId={safe_upload_id})"
+                        ),
                     )
                     .with_task_id(ctx.task.file_sign())
                     .with_offset(ctx.local_offset)
@@ -517,10 +662,11 @@ impl BreakpointUpload for AliOssDirectUpload {
         let mut state = self.session.lock().await;
         state.target_url = Some(ctx.task.url().to_string());
         state.upload_id = Some(upload_id.clone());
+        let safe_upload_id = crate::log::redact_secrets(&upload_id);
         crate::log::emit_lazy(|| {
             crate::log::Log::key(
                 "initiate",
-                format!("oss multipart initiated (uploadId={upload_id})"),
+                format!("oss multipart initiated (uploadId={safe_upload_id})"),
             )
             .with_task_id(ctx.task.file_sign())
             .with_url(ctx.task.url())
@@ -541,6 +687,7 @@ impl BreakpointUpload for AliOssDirectUpload {
                 "multipart upload_id missing; call prepare first",
             )
         })?;
+        let safe_upload_id = crate::log::redact_secrets(&upload_id);
         let part_number = (ctx.offset / ctx.task.chunk_size()) + 1;
         if part_number > MAX_OSS_PART_NUMBER {
             crate::log::emit_lazy(|| {
@@ -578,11 +725,12 @@ impl BreakpointUpload for AliOssDirectUpload {
             .send()
             .await
             .map_err(|e| {
+                let e = e.without_url();
                 crate::log::emit_lazy(|| {
                     crate::log::Log::error(
                         "upload_part",
                         format!(
-                            "oss upload part send failed (uploadId={upload_id}): {}",
+                            "oss upload part send failed (uploadId={safe_upload_id}): {}",
                             crate::log::redact_secrets(&e.to_string())
                         ),
                     )
@@ -595,15 +743,17 @@ impl BreakpointUpload for AliOssDirectUpload {
                 MeowError::from_source(InnerErrorCode::HttpError, "oss upload part failed", e)
             })?;
         let status = resp.status();
-        let etag_present = resp.headers().get(ETAG).is_some();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = crate::provider_body::read_error_body(resp)
+                .await
+                .unwrap_or_default();
+            let safe_body = crate::log::redact_secrets(&body);
             crate::log::emit_lazy(|| {
                 crate::log::Log::error(
                     "upload_part",
                     format!(
-                        "oss upload part non-2xx: {status}, uploadId={upload_id}, body: {}",
-                        crate::log::redact_secrets(&body)
+                        "oss upload part non-2xx: {status}, uploadId={safe_upload_id}, body: {}",
+                        safe_body
                     ),
                 )
                 .with_task_id(ctx.task.file_sign())
@@ -615,16 +765,25 @@ impl BreakpointUpload for AliOssDirectUpload {
             });
             return Err(MeowError::from_code(
                 InnerErrorCode::ResponseStatusError,
-                format!("oss upload part failed: {status}, body: {body}"),
+                format!("oss upload part failed: {status}, body: {safe_body}"),
             )
             .with_http_status(status.as_u16()));
         }
+        let etag_present =
+            crate::dflt::require_unambiguous_etag(resp.headers(), "OSS upload-part response")
+                .map_err(|_| {
+                    MeowError::from_code_str(
+                        InnerErrorCode::ResponseParseError,
+                        "oss upload part success but ETag header is ambiguous",
+                    )
+                })?
+                .is_some_and(|value| !value.trim().is_empty());
         if !etag_present {
             crate::log::emit_lazy(|| {
                 crate::log::Log::error(
                     "upload_part",
                     format!(
-                        "oss upload part 2xx but missing ETag header; part not durably acked (uploadId={upload_id})"
+                        "oss upload part 2xx but missing ETag header; part not durably acked (uploadId={safe_upload_id})"
                     ),
                 )
                 .with_task_id(ctx.task.file_sign())
@@ -657,9 +816,9 @@ impl BreakpointUpload for AliOssDirectUpload {
         let Some(upload_id) = upload_id else {
             return Ok(None);
         };
-        // Cloned before `upload_id` is moved into the query builder so the
-        // (non-credential) session id can be attached to the complete logs below.
-        let upload_id_for_log = upload_id.clone();
+        // Preserve the opaque value on the wire, but never trust it as safe log
+        // text: a malicious response can make UploadId look like a credential.
+        let safe_upload_id = crate::log::redact_secrets(&upload_id);
         let (url, raw_query) = Self::build_query_url(task, &[("uploadId", upload_id)])?;
         let mut headers = self.build_signed_headers(
             "POST",
@@ -679,11 +838,12 @@ impl BreakpointUpload for AliOssDirectUpload {
             .send()
             .await
             .map_err(|e| {
+                let e = e.without_url();
                 crate::log::emit_lazy(|| {
                     crate::log::Log::error(
                         "complete",
                         format!(
-                            "oss complete multipart send failed (uploadId={upload_id_for_log}): {}",
+                            "oss complete multipart send failed (uploadId={safe_upload_id}): {}",
                             crate::log::redact_secrets(&e.to_string())
                         ),
                     )
@@ -697,14 +857,17 @@ impl BreakpointUpload for AliOssDirectUpload {
                 )
             })?;
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
+            let body = crate::provider_body::read_error_body(resp)
+                .await
+                .unwrap_or_default();
+            let safe_body = crate::log::redact_secrets(&body);
             crate::log::emit_lazy(|| {
                 crate::log::Log::error(
                     "complete",
                     format!(
-                        "oss complete multipart non-2xx: {status}, uploadId={upload_id_for_log}, body: {}",
-                        crate::log::redact_secrets(&body)
+                        "oss complete multipart non-2xx: {status}, uploadId={safe_upload_id}, body: {}",
+                        safe_body
                     ),
                 )
                 .with_task_id(task.file_sign())
@@ -713,7 +876,7 @@ impl BreakpointUpload for AliOssDirectUpload {
             });
             return Err(MeowError::from_code(
                 InnerErrorCode::ResponseStatusError,
-                format!("oss complete multipart upload failed: {status}, body: {body}"),
+                format!("oss complete multipart upload failed: {status}, body: {safe_body}"),
             )
             .with_http_status(status.as_u16()));
         }
@@ -721,7 +884,7 @@ impl BreakpointUpload for AliOssDirectUpload {
         crate::log::emit_lazy(|| {
             crate::log::Log::key(
                 "complete",
-                format!("oss multipart completed (uploadId={upload_id_for_log})"),
+                format!("oss multipart completed (uploadId={safe_upload_id})"),
             )
             .with_task_id(task.file_sign())
             .with_url(task.url())
@@ -757,7 +920,43 @@ impl BreakpointUpload for AliOssDirectUpload {
     }
 }
 
+fn decode_object_key(encoded_path: &str) -> Result<String, MeowError> {
+    let bytes = encoded_path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+            {
+                decoded.push((high << 4) | low);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8(decoded).map_err(|_| {
+        MeowError::from_code_str(
+            InnerErrorCode::ParameterEmpty,
+            "OSS object key path is not valid UTF-8",
+        )
+    })
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn validate_oss_task(task: &TransferTask) -> Result<(), MeowError> {
+    let url = Url::parse(task.url()).map_err(param_error)?;
+    crate::provider_body::reject_reserved_query_keys(&url, OSS_RESERVED_QUERY_KEYS, "Aliyun OSS")?;
     let total_chunks = task.total_size().div_ceil(task.chunk_size());
     if total_chunks > MAX_OSS_PART_NUMBER {
         return Err(MeowError::from_code(
@@ -780,7 +979,7 @@ fn validate_resume_offset(task: &TransferTask, local_offset: u64) -> Result<(), 
             ),
         ));
     }
-    if local_offset != task.total_size() && local_offset % task.chunk_size() != 0 {
+    if local_offset != task.total_size() && !local_offset.is_multiple_of(task.chunk_size()) {
         return Err(MeowError::from_code(
             InnerErrorCode::InvalidTaskState,
             format!(
@@ -795,15 +994,46 @@ fn validate_resume_offset(task: &TransferTask, local_offset: u64) -> Result<(), 
 fn validate_remote_parts_for_resume(
     task: &TransferTask,
     local_offset: u64,
-    uploaded_parts: &[u64],
+    uploaded_parts: &[OssPart],
 ) -> Result<(), MeowError> {
+    let total_parts = task.total_size().div_ceil(task.chunk_size());
+    for part in uploaded_parts {
+        if part.part_number > total_parts {
+            return Err(MeowError::from_code(
+                InnerErrorCode::InvalidTaskState,
+                format!(
+                    "remote OSS part {} is outside the task plan of {total_parts} parts",
+                    part.part_number
+                ),
+            ));
+        }
+        let part_index = part.part_number.checked_sub(1).ok_or_else(|| {
+            MeowError::from_code_str(
+                InnerErrorCode::InvalidTaskState,
+                "remote OSS part number must be non-zero",
+            )
+        })?;
+        let expected_size = expected_part_size(task.total_size(), task.chunk_size(), part_index)?;
+        if part.size != expected_size {
+            return Err(MeowError::from_code(
+                InnerErrorCode::InvalidTaskState,
+                format!(
+                    "remote OSS part {} has size {}, expected {expected_size}",
+                    part.part_number, part.size
+                ),
+            ));
+        }
+    }
     let expected_parts = if local_offset == task.total_size() {
         task.total_size().div_ceil(task.chunk_size())
     } else {
         local_offset / task.chunk_size()
     };
     for part_number in 1..=expected_parts {
-        if uploaded_parts.binary_search(&part_number).is_err() {
+        if uploaded_parts
+            .binary_search_by_key(&part_number, |part| part.part_number)
+            .is_err()
+        {
             return Err(MeowError::from_code(
                 InnerErrorCode::InvalidTaskState,
                 format!(
@@ -813,6 +1043,28 @@ fn validate_remote_parts_for_resume(
         }
     }
     Ok(())
+}
+
+fn expected_part_size(total_size: u64, chunk_size: u64, part_index: u64) -> Result<u64, MeowError> {
+    let start = part_index.checked_mul(chunk_size).ok_or_else(|| {
+        MeowError::from_code_str(
+            InnerErrorCode::InvalidRange,
+            "OSS part offset arithmetic overflow",
+        )
+    })?;
+    let remaining = total_size.checked_sub(start).ok_or_else(|| {
+        MeowError::from_code_str(
+            InnerErrorCode::InvalidTaskState,
+            "OSS part starts beyond the task total",
+        )
+    })?;
+    if remaining == 0 {
+        return Err(MeowError::from_code_str(
+            InnerErrorCode::InvalidTaskState,
+            "OSS part starts at the task end",
+        ));
+    }
+    Ok(remaining.min(chunk_size))
 }
 
 #[cfg(test)]
@@ -867,5 +1119,23 @@ mod tests {
         assert_eq!(info.provider_upload_id.as_deref(), Some("uid-42"));
         // Default keeps it absent so providers without a session id opt out.
         assert!(UploadResumeInfo::default().provider_upload_id.is_none());
+    }
+
+    #[test]
+    fn expected_part_size_uses_exact_tail_and_checked_arithmetic() {
+        assert_eq!(expected_part_size(10, 4, 0).unwrap(), 4);
+        assert_eq!(expected_part_size(10, 4, 2).unwrap(), 2);
+        assert!(expected_part_size(10, 4, 3).is_err());
+        assert!(expected_part_size(u64::MAX, u64::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn object_key_path_is_percent_decoded_exactly_once() {
+        assert_eq!(
+            decode_object_key("objects/%E4%B8%AD%E6%96%87%20a%2Fb%252Fc").unwrap(),
+            "objects/中文 a/b%2Fc"
+        );
+        assert_eq!(decode_object_key("plus+name").unwrap(), "plus+name");
+        assert!(decode_object_key("%FF").is_err());
     }
 }

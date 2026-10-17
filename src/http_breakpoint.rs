@@ -97,9 +97,10 @@ fn parse_default_upload_response(body: &str) -> Result<UploadResumeInfo, MeowErr
             body.len(),
             e
         );
+        let safe_body = crate::log::redact_secrets(body);
         MeowError::from_code(
             InnerErrorCode::ResponseParseError,
-            format!("upload response json: {e}, body: {body}"),
+            format!("upload response json: {e}, body: {safe_body}"),
         )
     })?;
     crate::meow_trace_log!(
@@ -108,9 +109,19 @@ fn parse_default_upload_response(body: &str) -> Result<UploadResumeInfo, MeowErr
         v.file_id.is_some(),
         v.next_byte
     );
+    let next_byte = match v.next_byte {
+        Some(next) if next < 0 => {
+            return Err(MeowError::from_code(
+                InnerErrorCode::InvalidRange,
+                format!("upload response nextByte must be non-negative: {next}"),
+            ));
+        }
+        Some(next) => Some(next as u64),
+        None => None,
+    };
     Ok(UploadResumeInfo {
         completed_file_id: v.file_id,
-        next_byte: v.next_byte.map(|n| if n < 0 { 0u64 } else { n as u64 }),
+        next_byte,
         // The default multipart protocol carries no provider-side session id.
         provider_upload_id: None,
     })
@@ -158,21 +169,18 @@ async fn send_upload_request(
         map_reqwest(e)
     })?;
     if !status.is_success() {
+        let safe_body = crate::log::redact_secrets(&body);
         crate::log::emit_lazy(|| {
             crate::log::Log::error(
                 "upload_send",
-                format!(
-                    "upload HTTP non-2xx status={} body={}",
-                    status,
-                    crate::log::redact_secrets(&body)
-                ),
+                format!("upload HTTP non-2xx status={} body={}", status, safe_body),
             )
             .with_http_status(status.as_u16())
             .with_url(log_url.as_str())
         });
         return Err(MeowError::from_code(
             InnerErrorCode::ResponseStatusError,
-            format!("upload HTTP {status}: {body}"),
+            format!("upload HTTP {status}: {safe_body}"),
         )
         .with_http_status(status.as_u16()));
     }
@@ -181,7 +189,9 @@ async fn send_upload_request(
 
 /// Maps `reqwest` errors into SDK errors.
 fn map_reqwest(e: reqwest::Error) -> MeowError {
-    MeowError::from_source(InnerErrorCode::HttpError, e.to_string(), e)
+    let e = e.without_url();
+    let message = e.to_string();
+    MeowError::from_source(InnerErrorCode::HttpError, message, e)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -372,7 +382,20 @@ impl BreakpointDownload for StandardRangeDownload {
 
 #[cfg(test)]
 mod tests {
-    use super::{BreakpointUpload, DefaultStyleUpload, StandardRangeDownload};
+    use super::{
+        parse_default_upload_response, BreakpointUpload, DefaultStyleUpload, StandardRangeDownload,
+    };
+
+    #[test]
+    fn parse_default_upload_response_rejects_negative_next_byte() {
+        let error = parse_default_upload_response(r#"{"nextByte":-1}"#)
+            .expect_err("negative nextByte must be rejected");
+
+        assert_eq!(
+            error.code(),
+            crate::error::InnerErrorCode::InvalidRange as i32
+        );
+    }
 
     #[test]
     fn default_style_upload_is_serial_only() {

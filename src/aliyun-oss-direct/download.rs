@@ -29,21 +29,18 @@ impl AliOssDirectDownload {
         }
     }
 
-    fn object_canonical_uri_from_task_url(&self, task: &TransferTask) -> Result<String, MeowError> {
-        let url = Url::parse(task.url()).map_err(param_error)?;
-        Ok(format!("/{}{}", self.bucket, url.path()))
-    }
-
     fn apply_signed_headers(
         &self,
         task: &TransferTask,
         method: &str,
         base: &mut HeaderMap,
     ) -> Result<(), MeowError> {
+        let url = Url::parse(task.url()).map_err(param_error)?;
+        let canonical_uri = format!("/{}{}", self.bucket, url.path());
         let headers = signed_headers(
             method,
-            self.object_canonical_uri_from_task_url(task)?.as_str(),
-            None,
+            canonical_uri.as_str(),
+            url.query(),
             &[],
             None,
             self.access_key_id.as_str(),

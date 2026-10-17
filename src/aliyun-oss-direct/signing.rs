@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use hmac::{Hmac, Mac};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use sha2::{Digest, Sha256};
@@ -104,9 +106,9 @@ pub(crate) fn signed_headers_with_key(
         .map(|(k, v)| format!("{k}:{v}\n"))
         .collect::<String>();
     let additional_headers = additional_headers.unwrap_or_default();
+    let canonical_query = canonical_query(raw_query.unwrap_or_default());
     let canonical_request = format!(
-        "{method}\n{canonical_uri}\n{}\n{canonical_headers}\n{additional_headers}\n{OSS_UNSIGNED_PAYLOAD}",
-        raw_query.unwrap_or_default()
+        "{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{additional_headers}\n{OSS_UNSIGNED_PAYLOAD}",
     );
     let scope = format!("{date}/{region}/oss/aliyun_v4_request");
     let string_to_sign = format!(
@@ -138,6 +140,37 @@ pub(crate) fn signed_headers_with_key(
     auth.push_str(&signature);
     headers.insert("authorization", header_value(&auth)?);
     Ok(headers)
+}
+
+/// Builds the OSS v4 canonical query without changing the URL sent on the wire.
+///
+/// Mirrors Alibaba Cloud's official v4 header signer: normalize raw `+` to
+/// `%20`, skip empty components, retain the last value for each repeated encoded
+/// name, sort those encoded names, and omit `=` for an empty value. The request
+/// URL itself is never rewritten by this function.
+fn canonical_query(raw_query: &str) -> String {
+    let normalized = raw_query.replace('+', "%20");
+    let mut values = BTreeMap::new();
+    let mut names = Vec::new();
+    for component in normalized.split('&') {
+        if component.is_empty() {
+            continue;
+        }
+        let (name, value) = component
+            .split_once('=')
+            .map_or((component, ""), |(name, value)| (name, value));
+        values.insert(name, value);
+        names.push(name);
+    }
+    names.sort_unstable();
+    names
+        .into_iter()
+        .map(|name| match values.get(name).copied().unwrap_or_default() {
+            "" => name.to_owned(),
+            value => format!("{name}={value}"),
+        })
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 /// Builds OSS v4 signed headers, deriving the signing key on every call.
@@ -222,7 +255,7 @@ pub(crate) fn param_error(e: impl std::fmt::Display) -> MeowError {
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_signing_key, hex_encode, signed_headers_with_key};
+    use super::{canonical_query, derive_signing_key, hex_encode, signed_headers_with_key};
 
     #[test]
     fn test_hex_encode() {
@@ -272,6 +305,46 @@ mod tests {
             .unwrap_or_default();
         assert!(auth.starts_with("OSS4-HMAC-SHA256 Credential=akid/"));
         assert!(auth.contains("/cn-hangzhou/oss/aliyun_v4_request"));
+    }
+
+    #[test]
+    fn canonical_query_matches_official_raw_component_rules() {
+        assert_eq!(
+            canonical_query(
+                "z=last&a=space%20value&a=plus%2Bvalue&plus=raw+plus&slash=%2F&amp=%26&encoded=%252F&bare&empty=&lower=%2f&&"
+            ),
+            "a=plus%2Bvalue&a=plus%2Bvalue&amp=%26&bare&empty&encoded=%252F&lower=%2f&plus=raw%20plus&slash=%2F&z=last"
+        );
+        assert_eq!(canonical_query("uploads"), "uploads");
+        assert_eq!(canonical_query(""), "");
+        assert_eq!(canonical_query("bad=%GG"), "bad=%GG");
+        assert_eq!(canonical_query("=value&&a=1"), "=value&a=1");
+    }
+
+    #[test]
+    fn fixed_time_signatures_are_independent_of_distinct_query_name_order() {
+        let now =
+            time::OffsetDateTime::from_unix_timestamp(1_782_500_000).expect("valid timestamp");
+        let date = super::oss_date(now);
+        let key = derive_signing_key("secret", &date, "cn-hangzhou").expect("derive key");
+        let sign = |query| {
+            signed_headers_with_key(
+                "GET",
+                "/bucket/object",
+                Some(query),
+                &[],
+                None,
+                "akid",
+                "cn-hangzhou",
+                now,
+                &key,
+            )
+            .expect("sign")
+        };
+        assert_eq!(
+            sign("z=last&a=%2F").get("authorization"),
+            sign("a=%2F&z=last").get("authorization")
+        );
     }
 
     #[test]

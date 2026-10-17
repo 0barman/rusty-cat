@@ -12,10 +12,12 @@ use super::constants::{
 };
 use super::put_block_session::PutBlockSession;
 use super::signing::{decode_account_key, signed_headers_with_key};
-use super::xml::{block_list_xml, parse_block_indices_from_block_list};
+use super::xml::{block_list_xml, parse_block_entries_from_block_list, AzureBlock};
 use crate::http_breakpoint::UploadResumeInfo;
 use crate::upload_trait::{UploadChunkCtx, UploadPrepareCtx};
 use crate::{BreakpointUpload, InnerErrorCode, MeowError, TransferTask};
+
+const AZURE_RESERVED_QUERY_KEYS: &[&str] = &["comp", "blockid", "blocklisttype"];
 
 /// Azure Blob direct multipart upload protocol using SharedKey authentication.
 #[derive(Clone)]
@@ -70,12 +72,12 @@ impl AzureBlobDirectUpload {
                 ),
             )
         })?;
-        {
-            let mut pairs = url.query_pairs_mut();
-            for (k, v) in query_pairs {
-                pairs.append_pair(k, v.as_str());
-            }
-        }
+        crate::provider_body::reject_reserved_query_keys(
+            &url,
+            AZURE_RESERVED_QUERY_KEYS,
+            "Azure Blob",
+        )?;
+        crate::provider_body::append_query_pairs_preserving_raw(&mut url, query_pairs);
         Ok(url)
     }
 
@@ -130,7 +132,7 @@ impl AzureBlobDirectUpload {
         &self,
         client: &reqwest::Client,
         task: &TransferTask,
-    ) -> Result<Vec<usize>, MeowError> {
+    ) -> Result<Vec<AzureBlock>, MeowError> {
         let url = Self::build_query_url(
             task,
             &[
@@ -146,6 +148,7 @@ impl AzureBlobDirectUpload {
             .send()
             .await
             .map_err(|e| {
+                let e = e.without_url();
                 crate::log::emit_lazy(|| {
                     crate::log::Log::error("range_get", "azure list block list send failed")
                         .with_url(safe_url.as_str())
@@ -156,34 +159,40 @@ impl AzureBlobDirectUpload {
             return Ok(Vec::new());
         }
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_else(|e| {
-            crate::log::emit_lazy(|| {
-                crate::log::Log::warn("range_get", "azure list block list body read failed")
-                    .with_url(safe_url.as_str())
-                    .with_http_status(status.as_u16())
-            });
-            let _ = e;
-            String::new()
-        });
         if !status.is_success() {
+            let body = crate::provider_body::read_error_body(resp)
+                .await
+                .unwrap_or_else(|e| {
+                    crate::log::emit_lazy(|| {
+                        crate::log::Log::warn("range_get", "azure list block list body read failed")
+                            .with_url(safe_url.as_str())
+                            .with_http_status(status.as_u16())
+                    });
+                    let _ = e;
+                    String::new()
+                });
+            let safe_body = crate::log::redact_secrets(&body);
             crate::log::emit_lazy(|| {
                 crate::log::Log::error(
                     "range_get",
-                    format!(
-                        "azure list block list non-2xx: {}",
-                        crate::log::redact_secrets(body.as_str())
-                    ),
+                    format!("azure list block list non-2xx: {}", safe_body),
                 )
                 .with_url(safe_url.as_str())
                 .with_http_status(status.as_u16())
             });
             return Err(MeowError::from_code(
                 InnerErrorCode::ResponseStatusError,
-                format!("azure list block list failed: {status}, body: {body}"),
+                format!("azure list block list failed: {status}, body: {safe_body}"),
             )
             .with_http_status(status.as_u16()));
         }
-        Ok(parse_block_indices_from_block_list(body.as_str()))
+        let body = crate::provider_body::read_control_body(resp, "azure list block list").await?;
+        parse_block_entries_from_block_list(body.as_str()).map_err(|reason| {
+            MeowError::from_code(
+                InnerErrorCode::ResponseParseError,
+                format!("azure list block list XML rejected: {reason}"),
+            )
+        })
     }
 }
 
@@ -223,10 +232,13 @@ impl BreakpointUpload for AzureBlobDirectUpload {
                 });
             }
         }
-        let indices = self.list_uncommitted_blocks(ctx.client, ctx.task).await?;
+        let blocks = self.list_uncommitted_blocks(ctx.client, ctx.task).await?;
+        validate_remote_block_entries(ctx.task, ctx.local_offset, &blocks)?;
         let mut state = self.session.lock().await;
-        if !indices.is_empty() {
-            state.uploaded_blocks.extend(indices);
+        if !blocks.is_empty() {
+            state
+                .uploaded_blocks
+                .extend(blocks.iter().map(|block| block.index));
         }
         validate_remote_blocks_for_resume(ctx.task, ctx.local_offset, &state.uploaded_blocks)?;
         Ok(UploadResumeInfo {
@@ -281,6 +293,7 @@ impl BreakpointUpload for AzureBlobDirectUpload {
             .send()
             .await
             .map_err(|e| {
+                let e = e.without_url();
                 crate::log::emit_lazy(|| {
                     crate::log::Log::error("put_block", "azure put block send failed")
                         .with_part(part_index)
@@ -292,25 +305,28 @@ impl BreakpointUpload for AzureBlobDirectUpload {
             })?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_else(|e| {
-                crate::log::emit_lazy(|| {
-                    crate::log::Log::warn("put_block", "azure put block failed-body read failed")
+            let body = crate::provider_body::read_error_body(resp)
+                .await
+                .unwrap_or_else(|e| {
+                    crate::log::emit_lazy(|| {
+                        crate::log::Log::warn(
+                            "put_block",
+                            "azure put block failed-body read failed",
+                        )
                         .with_part(part_index)
                         .with_offset(chunk_offset)
                         .with_byte_len(chunk_len)
                         .with_http_status(status.as_u16())
                         .with_url(safe_url.as_str())
+                    });
+                    let _ = e;
+                    String::new()
                 });
-                let _ = e;
-                String::new()
-            });
+            let safe_body = crate::log::redact_secrets(&body);
             crate::log::emit_lazy(|| {
                 crate::log::Log::error(
                     "put_block",
-                    format!(
-                        "azure put block non-2xx: {}",
-                        crate::log::redact_secrets(body.as_str())
-                    ),
+                    format!("azure put block non-2xx: {}", safe_body),
                 )
                 .with_part(part_index)
                 .with_offset(chunk_offset)
@@ -320,7 +336,7 @@ impl BreakpointUpload for AzureBlobDirectUpload {
             });
             return Err(MeowError::from_code(
                 InnerErrorCode::ResponseStatusError,
-                format!("azure put block failed: {status}, body: {body}"),
+                format!("azure put block failed: {status}, body: {safe_body}"),
             )
             .with_http_status(status.as_u16()));
         }
@@ -370,6 +386,7 @@ impl BreakpointUpload for AzureBlobDirectUpload {
             .send()
             .await
             .map_err(|e| {
+                let e = e.without_url();
                 crate::log::emit_lazy(|| {
                     crate::log::Log::error("complete", "azure commit block list send failed")
                         .with_url(safe_url.as_str())
@@ -378,29 +395,32 @@ impl BreakpointUpload for AzureBlobDirectUpload {
             })?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_else(|e| {
-                crate::log::emit_lazy(|| {
-                    crate::log::Log::warn("complete", "azure commit block list body read failed")
+            let body = crate::provider_body::read_error_body(resp)
+                .await
+                .unwrap_or_else(|e| {
+                    crate::log::emit_lazy(|| {
+                        crate::log::Log::warn(
+                            "complete",
+                            "azure commit block list body read failed",
+                        )
                         .with_http_status(status.as_u16())
                         .with_url(safe_url.as_str())
+                    });
+                    let _ = e;
+                    String::new()
                 });
-                let _ = e;
-                String::new()
-            });
+            let safe_body = crate::log::redact_secrets(&body);
             crate::log::emit_lazy(|| {
                 crate::log::Log::error(
                     "complete",
-                    format!(
-                        "azure commit block list non-2xx: {}",
-                        crate::log::redact_secrets(body.as_str())
-                    ),
+                    format!("azure commit block list non-2xx: {}", safe_body),
                 )
                 .with_http_status(status.as_u16())
                 .with_url(safe_url.as_str())
             });
             return Err(MeowError::from_code(
                 InnerErrorCode::ResponseStatusError,
-                format!("azure put block list failed: {status}, body: {body}"),
+                format!("azure put block list failed: {status}, body: {safe_body}"),
             )
             .with_http_status(status.as_u16()));
         }
@@ -433,6 +453,11 @@ impl BreakpointUpload for AzureBlobDirectUpload {
                 ),
             )
         })?;
+        crate::provider_body::reject_reserved_query_keys(
+            &url,
+            AZURE_RESERVED_QUERY_KEYS,
+            "Azure Blob",
+        )?;
         let headers = self.signed_headers("DELETE", &url, None, None, &[])?;
         let safe_url = crate::log::sanitize_url(url.as_str());
         let resp = client
@@ -441,6 +466,7 @@ impl BreakpointUpload for AzureBlobDirectUpload {
             .send()
             .await
             .map_err(|e| {
+                let e = e.without_url();
                 crate::log::emit_lazy(|| {
                     crate::log::Log::error("abort", "azure delete blob send failed")
                         .with_url(safe_url.as_str())
@@ -453,29 +479,26 @@ impl BreakpointUpload for AzureBlobDirectUpload {
             })?;
         let status = resp.status();
         if !(status.is_success() || status == reqwest::StatusCode::NOT_FOUND) {
-            let body = resp.text().await.unwrap_or_else(|e| {
-                crate::log::emit_lazy(|| {
-                    crate::log::Log::warn("abort", "azure delete blob body read failed")
-                        .with_http_status(status.as_u16())
-                        .with_url(safe_url.as_str())
+            let body = crate::provider_body::read_error_body(resp)
+                .await
+                .unwrap_or_else(|e| {
+                    crate::log::emit_lazy(|| {
+                        crate::log::Log::warn("abort", "azure delete blob body read failed")
+                            .with_http_status(status.as_u16())
+                            .with_url(safe_url.as_str())
+                    });
+                    let _ = e;
+                    String::new()
                 });
-                let _ = e;
-                String::new()
-            });
+            let safe_body = crate::log::redact_secrets(&body);
             crate::log::emit_lazy(|| {
-                crate::log::Log::error(
-                    "abort",
-                    format!(
-                        "azure delete blob non-2xx: {}",
-                        crate::log::redact_secrets(body.as_str())
-                    ),
-                )
-                .with_http_status(status.as_u16())
-                .with_url(safe_url.as_str())
+                crate::log::Log::error("abort", format!("azure delete blob non-2xx: {}", safe_body))
+                    .with_http_status(status.as_u16())
+                    .with_url(safe_url.as_str())
             });
             return Err(MeowError::from_code(
                 InnerErrorCode::ResponseStatusError,
-                format!("azure delete blob on cancel failed: {status}, body: {body}"),
+                format!("azure delete blob on cancel failed: {status}, body: {safe_body}"),
             )
             .with_http_status(status.as_u16()));
         }
@@ -503,6 +526,17 @@ fn total_chunks(task: &TransferTask) -> Result<usize, MeowError> {
 }
 
 fn validate_azure_task(task: &TransferTask) -> Result<(), MeowError> {
+    let url = Url::parse(task.url()).map_err(|e| {
+        MeowError::from_code(
+            InnerErrorCode::ParameterEmpty,
+            format!("invalid azure blob URL: {e}"),
+        )
+    })?;
+    crate::provider_body::reject_reserved_query_keys(
+        &url,
+        AZURE_RESERVED_QUERY_KEYS,
+        "Azure Blob",
+    )?;
     if task.chunk_size() > MAX_AZURE_BLOCK_BYTES {
         return Err(MeowError::from_code(
             InnerErrorCode::InvalidRange,
@@ -534,7 +568,7 @@ fn validate_resume_offset(task: &TransferTask, local_offset: u64) -> Result<(), 
             ),
         ));
     }
-    if local_offset != task.total_size() && local_offset % task.chunk_size() != 0 {
+    if local_offset != task.total_size() && !local_offset.is_multiple_of(task.chunk_size()) {
         return Err(MeowError::from_code(
             InnerErrorCode::InvalidTaskState,
             format!(
@@ -562,6 +596,72 @@ fn validate_remote_blocks_for_resume(
         })?
     };
     validate_all_blocks_present(expected_blocks, uploaded_blocks)
+}
+
+fn validate_remote_block_entries(
+    task: &TransferTask,
+    local_offset: u64,
+    blocks: &[AzureBlock],
+) -> Result<(), MeowError> {
+    let total = total_chunks(task)?;
+    for block in blocks {
+        if block.index >= total {
+            return Err(MeowError::from_code(
+                InnerErrorCode::InvalidTaskState,
+                format!(
+                    "remote Azure block index {} is outside the task plan of {total} blocks",
+                    block.index
+                ),
+            ));
+        }
+        let expected_size = expected_block_size(task.total_size(), task.chunk_size(), block.index)?;
+        if block.size != expected_size {
+            return Err(MeowError::from_code(
+                InnerErrorCode::InvalidTaskState,
+                format!(
+                    "remote Azure block {} has size {}, expected {expected_size}",
+                    block.index, block.size
+                ),
+            ));
+        }
+    }
+    let indices = blocks
+        .iter()
+        .map(|block| block.index)
+        .collect::<std::collections::BTreeSet<_>>();
+    validate_remote_blocks_for_resume(task, local_offset, &indices)
+}
+
+fn expected_block_size(
+    total_size: u64,
+    chunk_size: u64,
+    block_index: usize,
+) -> Result<u64, MeowError> {
+    let index = u64::try_from(block_index).map_err(|error| {
+        MeowError::from_code(
+            InnerErrorCode::InvalidRange,
+            format!("Azure block index conversion overflow: {error}"),
+        )
+    })?;
+    let start = index.checked_mul(chunk_size).ok_or_else(|| {
+        MeowError::from_code_str(
+            InnerErrorCode::InvalidRange,
+            "Azure block offset arithmetic overflow",
+        )
+    })?;
+    let remaining = total_size.checked_sub(start).ok_or_else(|| {
+        MeowError::from_code_str(
+            InnerErrorCode::InvalidTaskState,
+            "Azure block starts beyond the task total",
+        )
+    })?;
+    if remaining == 0 {
+        return Err(MeowError::from_code_str(
+            InnerErrorCode::InvalidTaskState,
+            "Azure block starts at the task end",
+        ));
+    }
+    Ok(remaining.min(chunk_size))
 }
 
 fn validate_all_blocks_present(
@@ -593,5 +693,13 @@ mod tests {
     fn azure_direct_advertises_parallel_parts() {
         let upload = AzureBlobDirectUpload::new("acct", "a2V5");
         assert!(upload.supports_parallel_parts());
+    }
+
+    #[test]
+    fn expected_block_size_uses_exact_tail_and_checked_arithmetic() {
+        assert_eq!(super::expected_block_size(10, 4, 0).unwrap(), 4);
+        assert_eq!(super::expected_block_size(10, 4, 2).unwrap(), 2);
+        assert!(super::expected_block_size(10, 4, 3).is_err());
+        assert!(super::expected_block_size(u64::MAX, u64::MAX, 2).is_err());
     }
 }

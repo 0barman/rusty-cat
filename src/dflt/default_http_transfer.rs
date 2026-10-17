@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use reqwest::header::{CONTENT_ENCODING, CONTENT_LENGTH, ETAG};
+use reqwest::header::CONTENT_LENGTH;
 use reqwest::{Client, Method};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -20,7 +20,10 @@ use super::default_http_transfer_chunks::{
     download_one_chunk, download_one_chunk_part_positioned, map_reqwest, upload_one_chunk,
     upload_one_chunk_part,
 };
-use super::download_generation_validator;
+use super::{
+    download_generation_validator, ensure_response_identity_encoding, require_single_header,
+    require_unambiguous_etag,
+};
 
 /// Creates default breakpoint protocol instances.
 pub(crate) fn default_breakpoint_arcs() -> (
@@ -76,6 +79,15 @@ pub(crate) fn build_internal_client(
 ) -> Result<reqwest::Client, reqwest::Error> {
     Client::builder()
         .timeout(http_timeout)
+        // Range validation must observe the representation that arrived on
+        // the wire. A downstream crate can enable reqwest's optional decoder
+        // features for this shared dependency; without these explicit
+        // overrides reqwest may then decode a compressed 206 response and
+        // remove Content-Encoding before our fail-closed checks see it.
+        .no_gzip()
+        .no_brotli()
+        .no_zstd()
+        .no_deflate()
         // Fail fast on an unreachable peer while leaving the total budget for
         // slow chunk bodies; see `DEFAULT_CONNECT_TIMEOUT_CAP`.
         .connect_timeout(http_timeout.min(DEFAULT_CONNECT_TIMEOUT_CAP))
@@ -300,6 +312,24 @@ async fn upload_prepare(
     upload_prepare_once(client, task, upload, local_offset).await
 }
 
+/// Runs an untrusted provider abort hook behind a Tokio task boundary so a
+/// panic becomes an ordinary cleanup error instead of unwinding the scheduler.
+async fn guarded_abort_upload(
+    client: &reqwest::Client,
+    task: &TransferTask,
+    upload: Arc<dyn BreakpointUpload + Send + Sync>,
+) -> Result<(), MeowError> {
+    let client = client.clone();
+    let task = task.clone();
+    match tokio::spawn(async move { upload.abort_upload(&client, &task).await }).await {
+        Ok(result) => result,
+        Err(error) => Err(MeowError::from_code(
+            InnerErrorCode::Unknown,
+            format!("abort_upload hook panicked: {error}"),
+        )),
+    }
+}
+
 async fn upload_prepare_once(
     client: &reqwest::Client,
     task: &TransferTask,
@@ -343,7 +373,15 @@ async fn upload_prepare_once(
         });
     }
     let server_off = info.next_byte.unwrap_or(0);
-    let next = local_offset.max(server_off).min(task.total_size());
+    let total = task.total_size();
+    if server_off > total {
+        task.require_upload_abort();
+        return Err(MeowError::from_code(
+            InnerErrorCode::InvalidRange,
+            format!("upload prepare next offset exceeds total: next={server_off} total={total}"),
+        ));
+    }
+    let next = local_offset.max(server_off).min(total);
     crate::meow_flow_log!(
         "upload_prepare",
         "prepared: server_next={} local_offset={} final_next={}",
@@ -366,6 +404,49 @@ fn download_is_parallel(
     task.direction() == Direction::Download
         && task.max_parts_in_flight() > 1
         && download.supports_parallel_parts()
+}
+
+/// Resolves the HEAD URL and headers together on Tokio's blocking pool.
+///
+/// Presigned downloads pair these two synchronous trait calls with
+/// thread-local snapshot state. Keeping them in one closure preserves that
+/// atomic pairing while preventing a blocking or panicking user refresher from
+/// occupying an async runtime worker.
+async fn build_download_head_request(
+    download: Arc<dyn BreakpointDownload + Send + Sync>,
+    task: &TransferTask,
+) -> Result<(String, reqwest::header::HeaderMap), MeowError> {
+    let task = task.clone();
+    tokio::task::spawn_blocking(move || {
+        let head_url = download.head_url(&task);
+        let mut head_headers = task.headers().clone();
+        download
+            .merge_head_headers(DownloadHeadCtx {
+                task: &task,
+                base: &mut head_headers,
+            })
+            .inspect_err(|e| {
+                crate::log::emit_lazy(|| {
+                    crate::log::Log::warn(
+                        "head",
+                        format!(
+                            "merge_head_headers failed: err={}",
+                            crate::log::redact_secrets(&e.to_string())
+                        ),
+                    )
+                    .with_key(task.file_name())
+                    .with_url(head_url.as_str())
+                });
+            })?;
+        Ok((head_url, head_headers))
+    })
+    .await
+    .map_err(|error| {
+        MeowError::from_code(
+            InnerErrorCode::InvalidTaskState,
+            format!("download HEAD request builder worker failed: {error}"),
+        )
+    })?
 }
 
 struct VerifiedDownloadGeneration {
@@ -530,6 +611,21 @@ fn is_azure_sas_auth_key(key: &str) -> bool {
     )
 }
 
+/// Returns whether form-style URL decoding would erase a distinction carried
+/// by the raw query bytes. These spellings must not use the legacy
+/// decode/re-encode identity because `+`/`%20`, an escaped delimiter and its
+/// literal form, or a bare name and `name=` can otherwise collide.
+fn has_ambiguous_raw_query_spelling(segment: &str) -> bool {
+    !segment.contains('=')
+        || segment.as_bytes().contains(&b'+')
+        || segment.as_bytes().contains(&b'%')
+}
+
+fn append_identity_field(output: &mut Vec<u8>, value: &[u8]) {
+    output.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    output.extend_from_slice(value);
+}
+
 /// Binds a validator and stable protocol context to the canonical resource URL.
 /// Only a fixed-size digest is returned: an unknown credential-looking query
 /// key, request header, tenant id, or ETag can therefore never be written to the
@@ -573,6 +669,13 @@ fn download_identity(url: &str, validator: &str, resume_context: &[u8]) -> Strin
                     || has_key("GoogleAccessId"));
             let azure_sas = has_key("sig")
                 && (has_key("sv") || has_key("se") || has_key("sp") || has_key("sr"));
+            let is_auth_key = |key: &str| {
+                (aws_v4 && is_aws_v4_auth_key(key))
+                    || (google_v4 && is_google_v4_auth_key(key))
+                    || (oss_v4 && is_oss_v4_auth_key(key))
+                    || (legacy && is_legacy_presigned_auth_key(key))
+                    || (azure_sas && is_azure_sas_auth_key(key))
+            };
             for (key, value) in &pairs {
                 if is_presigned_principal_key(key) {
                     auth_context.push((
@@ -581,28 +684,56 @@ fn download_identity(url: &str, validator: &str, resume_context: &[u8]) -> Strin
                     ));
                 }
             }
+            let raw_query = parsed.query().unwrap_or_default().to_owned();
+            let raw_segments = if raw_query.is_empty() {
+                Vec::new()
+            } else {
+                raw_query.split('&').collect::<Vec<_>>()
+            };
+            let query_segment_count_mismatch = raw_segments.len() != pairs.len();
+            let raw_semantic_segments = if !query_segment_count_mismatch {
+                raw_segments
+                    .iter()
+                    .zip(&pairs)
+                    .filter_map(|(raw, (key, _))| (!is_auth_key(key)).then_some(*raw))
+                    .collect::<Vec<_>>()
+            } else {
+                // A parser/segment cardinality disagreement is itself
+                // ambiguous. Bind the complete raw query rather than guessing
+                // which bytes describe the resource. It remains inside the
+                // final SHA-256 digest and is never persisted verbatim.
+                vec![raw_query.as_str()]
+            };
+            let preserve_raw_semantics = query_segment_count_mismatch
+                || raw_semantic_segments
+                    .iter()
+                    .any(|segment| has_ambiguous_raw_query_spelling(segment));
             let semantic_pairs: Vec<(String, String)> = pairs
                 .into_iter()
-                .filter(|(key, _)| {
-                    !((aws_v4 && is_aws_v4_auth_key(key))
-                        || (google_v4 && is_google_v4_auth_key(key))
-                        || (oss_v4 && is_oss_v4_auth_key(key))
-                        || (legacy && is_legacy_presigned_auth_key(key))
-                        || (azure_sas && is_azure_sas_auth_key(key)))
-                })
+                .filter(|(key, _)| !is_auth_key(key))
                 .collect();
             parsed.set_query(None);
+            parsed.set_fragment(None);
+            if preserve_raw_semantics {
+                let base = parsed.to_string();
+                let mut resource = b"rusty-cat/raw-semantic-query/v1\0".to_vec();
+                append_identity_field(&mut resource, base.as_bytes());
+                resource.extend_from_slice(&(raw_semantic_segments.len() as u64).to_be_bytes());
+                for segment in raw_semantic_segments {
+                    append_identity_field(&mut resource, segment.as_bytes());
+                }
+                return resource;
+            }
             if !semantic_pairs.is_empty() {
                 parsed.query_pairs_mut().extend_pairs(semantic_pairs);
             }
-            parsed.set_fragment(None);
-            parsed.to_string()
+            parsed.to_string().into_bytes()
         })
-        .unwrap_or_else(|_| url.split('#').next().unwrap_or(url).to_string());
+        .unwrap_or_else(|_| url.split('#').next().unwrap_or(url).as_bytes().to_vec());
     auth_context.sort();
     let mut hasher = Sha256::new();
     hasher.update(b"rusty-cat/download-identity/v2\0");
-    for value in [resource.as_bytes(), validator.as_bytes(), resume_context] {
+    for value in [resource.as_slice(), validator.as_bytes(), resume_context] {
         hasher.update((value.len() as u64).to_be_bytes());
         hasher.update(value);
     }
@@ -868,26 +999,7 @@ async fn download_prepare(
         return download_prepare_finish(task, &download, start, hinted, None).await;
     }
 
-    let head_url = download.head_url(task);
-    let mut head_headers = task.headers().clone();
-    download
-        .merge_head_headers(DownloadHeadCtx {
-            task,
-            base: &mut head_headers,
-        })
-        .inspect_err(|e| {
-            crate::log::emit_lazy(|| {
-                crate::log::Log::warn(
-                    "head",
-                    format!(
-                        "merge_head_headers failed: err={}",
-                        crate::log::redact_secrets(&e.to_string())
-                    ),
-                )
-                .with_key(task.file_name())
-                .with_url(head_url.as_str())
-            });
-        })?;
+    let (head_url, head_headers) = build_download_head_request(download.clone(), task).await?;
     let head_resp = client
         .request(Method::HEAD, &head_url)
         .headers(head_headers)
@@ -921,16 +1033,24 @@ async fn download_prepare(
         )
         .with_http_status(head_resp.status().as_u16()));
     }
-    let head_content_length = head_resp
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
+    // HEAD supplies the framing and representation metadata used to build the
+    // entire part grid. Reject ambiguity before parsing, presizing the target,
+    // or issuing any Range request.
+    let head_content_length = require_single_header(
+        head_resp.headers(),
+        CONTENT_LENGTH,
+        "download HEAD response",
+    )?
+    .unwrap_or("<missing>");
+    let head_etag = require_unambiguous_etag(head_resp.headers(), "download HEAD response")?
         .unwrap_or("<missing>");
-    let head_etag = head_resp
-        .headers()
-        .get(ETAG)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("<missing>");
+    // Preserve the established serial HEAD behavior. Parallel range grids have
+    // always rejected encoded HEAD metadata because the advertised length is
+    // used for positioned writes; apply the stricter singleton-aware check to
+    // that same path only.
+    if download_is_parallel(task, &download) {
+        ensure_response_identity_encoding(head_resp.headers(), "parallel download HEAD response")?;
+    }
     crate::meow_flow_log!(
         "download_prepare",
         "head metadata: url={} content_length={} etag={}",
@@ -953,17 +1073,7 @@ async fn download_prepare(
                 .with_url(head_url.as_str())
             });
         })?;
-    if download_is_parallel(task, &download) {
-        if let Some(encoding) = head_resp.headers().get(CONTENT_ENCODING) {
-            let encoding = encoding.to_str().unwrap_or("<invalid>");
-            if !encoding.eq_ignore_ascii_case("identity") {
-                return Err(MeowError::from_code(
-                    InnerErrorCode::InvalidRange,
-                    format!("parallel download requires identity content-encoding, got {encoding}"),
-                ));
-            }
-        }
-    }
+    task.freeze_resolved_download_total(total)?;
     let generation = if let Some(validator) = download_generation_validator(head_resp.headers()) {
         let identity = if allow_persisted_resume_identity {
             download
@@ -1047,7 +1157,7 @@ impl TransferTrait for DefaultHttpTransfer {
             return Ok(());
         }
         let client = self.client_for(task);
-        self.upload_arc(task).abort_upload(&client, task).await
+        guarded_abort_upload(&client, task, self.upload_arc(task)).await
     }
 
     /// Parallel parts are offered for uploads whose resolved protocol proves
@@ -1124,7 +1234,9 @@ impl TransferTrait for DefaultHttpTransfer {
                 if let Some(snapshot) = task.upload_file_snapshot() {
                     if let Err(error) = snapshot.validate_generation(true).await {
                         if task.begin_upload_abort() {
-                            if let Err(abort_error) = upload.abort_upload(&client, task).await {
+                            if let Err(abort_error) =
+                                guarded_abort_upload(&client, task, Arc::clone(&upload)).await
+                            {
                                 crate::meow_warn_log!(
                                     "upload_complete",
                                     "abort after source validation failure also failed: {}",
@@ -1159,6 +1271,330 @@ impl TransferTrait for DefaultHttpTransfer {
                 Ok(None)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod upload_protocol_tests {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+
+    use super::{build_download_head_request, upload_prepare_once, DefaultHttpTransfer};
+    use crate::down_pounce_builder::DownloadPounceBuilder;
+    use crate::download_trait::{BreakpointDownload, DownloadHeadCtx};
+    use crate::error::{InnerErrorCode, MeowError};
+    use crate::http_breakpoint::{
+        BreakpointDownloadHttpConfig, BreakpointUpload, DefaultStyleUpload, StandardRangeDownload,
+        UploadResumeInfo,
+    };
+    use crate::inner::inner_task::InnerTask;
+    use crate::transfer_executor_trait::TransferTrait;
+    use crate::transfer_task::TransferTask;
+    use crate::up_pounce_builder::UploadPounceBuilder;
+    use crate::upload_trait::{UploadChunkCtx, UploadPrepareCtx};
+
+    async fn upload_task(upload: Arc<dyn BreakpointUpload + Send + Sync>) -> TransferTask {
+        let pounce = UploadPounceBuilder::from_bytes("protocol-unit.bin", vec![0; 3], 3)
+            .with_url("https://protocol.invalid/unit")
+            .with_breakpoint_upload(upload)
+            .with_max_upload_prepare_retries(0)
+            .with_max_chunk_retries(0)
+            .build()
+            .expect("build upload task");
+        let inner = InnerTask::from_pounce(
+            pounce,
+            BreakpointDownloadHttpConfig::default(),
+            None,
+            Arc::new(DefaultStyleUpload::default()),
+            Arc::new(StandardRangeDownload) as Arc<dyn BreakpointDownload + Send + Sync>,
+        )
+        .await
+        .expect("normalize upload task");
+        TransferTask::from_inner(&inner)
+    }
+
+    async fn download_task(download: Arc<dyn BreakpointDownload + Send + Sync>) -> TransferTask {
+        let mut path = std::env::temp_dir();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        path.push(format!(
+            "rusty-cat-head-worker-{}-{nonce}.bin",
+            std::process::id()
+        ));
+        let pounce = DownloadPounceBuilder::new(
+            "head-worker.bin",
+            path,
+            1,
+            "https://protocol.invalid/head-worker",
+        )
+        .with_breakpoint_download(Arc::clone(&download))
+        .build();
+        let inner = InnerTask::from_pounce(
+            pounce,
+            BreakpointDownloadHttpConfig::default(),
+            None,
+            Arc::new(DefaultStyleUpload::default()),
+            download,
+        )
+        .await
+        .expect("normalize download task");
+        TransferTask::from_inner(&inner)
+    }
+
+    thread_local! {
+        static HEAD_ASYNC_CALLER_MARKER: Cell<bool> = const { Cell::new(false) };
+    }
+
+    struct HeadCallerMarkerGuard;
+
+    impl HeadCallerMarkerGuard {
+        fn enter() -> Self {
+            HEAD_ASYNC_CALLER_MARKER.with(|marker| marker.set(true));
+            Self
+        }
+    }
+
+    impl Drop for HeadCallerMarkerGuard {
+        fn drop(&mut self) {
+            HEAD_ASYNC_CALLER_MARKER.with(|marker| marker.set(false));
+        }
+    }
+
+    struct ErrorHeadHooks {
+        head_saw_async_caller: Arc<AtomicBool>,
+        merge_saw_async_caller: Arc<AtomicBool>,
+        head_thread: Mutex<Option<std::thread::ThreadId>>,
+        merge_used_head_thread: Arc<AtomicBool>,
+    }
+
+    impl BreakpointDownload for ErrorHeadHooks {
+        fn head_url(&self, _task: &TransferTask) -> String {
+            self.head_saw_async_caller
+                .store(HEAD_ASYNC_CALLER_MARKER.with(Cell::get), Ordering::SeqCst);
+            *self.head_thread.lock().expect("record HEAD hook thread") =
+                Some(std::thread::current().id());
+            "https://protocol.invalid/head-worker".to_owned()
+        }
+
+        fn merge_head_headers(&self, _ctx: DownloadHeadCtx<'_>) -> Result<(), MeowError> {
+            self.merge_saw_async_caller
+                .store(HEAD_ASYNC_CALLER_MARKER.with(Cell::get), Ordering::SeqCst);
+            self.merge_used_head_thread.store(
+                self.head_thread
+                    .lock()
+                    .expect("read HEAD hook thread")
+                    .is_some_and(|thread| thread == std::thread::current().id()),
+                Ordering::SeqCst,
+            );
+            Err(MeowError::from_code_str(
+                InnerErrorCode::InvalidRange,
+                "injected HEAD merge error",
+            ))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn head_hooks_run_off_async_caller_and_preserve_merge_error() {
+        let head_saw_async_caller = Arc::new(AtomicBool::new(false));
+        let merge_saw_async_caller = Arc::new(AtomicBool::new(false));
+        let merge_used_head_thread = Arc::new(AtomicBool::new(false));
+        let protocol: Arc<dyn BreakpointDownload + Send + Sync> = Arc::new(ErrorHeadHooks {
+            head_saw_async_caller: Arc::clone(&head_saw_async_caller),
+            merge_saw_async_caller: Arc::clone(&merge_saw_async_caller),
+            head_thread: Mutex::new(None),
+            merge_used_head_thread: Arc::clone(&merge_used_head_thread),
+        });
+        let task = download_task(protocol).await;
+        let transfer = DefaultHttpTransfer::new();
+        let _marker = HeadCallerMarkerGuard::enter();
+
+        let error = transfer
+            .prepare(&task, 0)
+            .await
+            .expect_err("injected HEAD merge error must be returned");
+
+        assert_eq!(error.code(), InnerErrorCode::InvalidRange as i32);
+        assert!(
+            !head_saw_async_caller.load(Ordering::SeqCst),
+            "head_url ran directly on the async caller instead of a blocking worker"
+        );
+        assert!(
+            !merge_saw_async_caller.load(Ordering::SeqCst),
+            "merge_head_headers ran directly on the async caller instead of the same blocking worker"
+        );
+        assert!(
+            merge_used_head_thread.load(Ordering::SeqCst),
+            "head_url and merge_head_headers must stay paired on one worker"
+        );
+    }
+
+    struct NormalHeadHooks {
+        head_thread: Mutex<Option<std::thread::ThreadId>>,
+        head_saw_async_caller: Arc<AtomicBool>,
+        merge_saw_async_caller: Arc<AtomicBool>,
+        merge_used_head_thread: Arc<AtomicBool>,
+    }
+
+    impl BreakpointDownload for NormalHeadHooks {
+        fn head_url(&self, _task: &TransferTask) -> String {
+            self.head_saw_async_caller
+                .store(HEAD_ASYNC_CALLER_MARKER.with(Cell::get), Ordering::SeqCst);
+            *self.head_thread.lock().expect("record normal HEAD thread") =
+                Some(std::thread::current().id());
+            "https://protocol.invalid/normal-head".to_owned()
+        }
+
+        fn merge_head_headers(&self, ctx: DownloadHeadCtx<'_>) -> Result<(), MeowError> {
+            self.merge_saw_async_caller
+                .store(HEAD_ASYNC_CALLER_MARKER.with(Cell::get), Ordering::SeqCst);
+            self.merge_used_head_thread.store(
+                self.head_thread
+                    .lock()
+                    .expect("read normal HEAD thread")
+                    .is_some_and(|thread| thread == std::thread::current().id()),
+                Ordering::SeqCst,
+            );
+            ctx.base.insert(
+                "x-head-worker-proof",
+                reqwest::header::HeaderValue::from_static("paired"),
+            );
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn head_request_builder_keeps_normal_hooks_paired_off_thread() {
+        let head_saw_async_caller = Arc::new(AtomicBool::new(false));
+        let merge_saw_async_caller = Arc::new(AtomicBool::new(false));
+        let merge_used_head_thread = Arc::new(AtomicBool::new(false));
+        let protocol: Arc<dyn BreakpointDownload + Send + Sync> = Arc::new(NormalHeadHooks {
+            head_thread: Mutex::new(None),
+            head_saw_async_caller: Arc::clone(&head_saw_async_caller),
+            merge_saw_async_caller: Arc::clone(&merge_saw_async_caller),
+            merge_used_head_thread: Arc::clone(&merge_used_head_thread),
+        });
+        let task = download_task(Arc::clone(&protocol)).await;
+        let _marker = HeadCallerMarkerGuard::enter();
+
+        let (url, headers) = build_download_head_request(protocol, &task)
+            .await
+            .expect("normal HEAD hooks succeed");
+
+        assert_eq!(url, "https://protocol.invalid/normal-head");
+        assert_eq!(
+            headers
+                .get("x-head-worker-proof")
+                .and_then(|value| value.to_str().ok()),
+            Some("paired")
+        );
+        assert!(!head_saw_async_caller.load(Ordering::SeqCst));
+        assert!(!merge_saw_async_caller.load(Ordering::SeqCst));
+        assert!(merge_used_head_thread.load(Ordering::SeqCst));
+    }
+
+    struct PanickingHeadHook;
+
+    impl BreakpointDownload for PanickingHeadHook {
+        fn head_url(&self, _task: &TransferTask) -> String {
+            panic!("injected HEAD hook panic")
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn head_request_builder_contains_hook_panic_as_error() {
+        let protocol: Arc<dyn BreakpointDownload + Send + Sync> = Arc::new(PanickingHeadHook);
+        let task = download_task(Arc::clone(&protocol)).await;
+
+        let error = build_download_head_request(protocol, &task)
+            .await
+            .expect_err("HEAD hook panic must be contained");
+
+        assert_eq!(error.code(), InnerErrorCode::InvalidTaskState as i32);
+        assert!(error
+            .to_string()
+            .contains("download HEAD request builder worker failed"));
+    }
+
+    struct PrepareAboveTotal;
+
+    #[async_trait]
+    impl BreakpointUpload for PrepareAboveTotal {
+        async fn prepare(&self, _ctx: UploadPrepareCtx<'_>) -> Result<UploadResumeInfo, MeowError> {
+            Ok(UploadResumeInfo {
+                completed_file_id: None,
+                next_byte: Some(4),
+                provider_upload_id: None,
+            })
+        }
+
+        async fn upload_chunk(
+            &self,
+            _ctx: UploadChunkCtx<'_>,
+        ) -> Result<UploadResumeInfo, MeowError> {
+            panic!("chunk must not run in prepare unit test")
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_rejects_server_offset_above_total_before_clamping() {
+        let upload: Arc<dyn BreakpointUpload + Send + Sync> = Arc::new(PrepareAboveTotal);
+        let task = upload_task(Arc::clone(&upload)).await;
+        let error = upload_prepare_once(&reqwest::Client::new(), &task, upload, 0)
+            .await
+            .expect_err("prepare offset above total must fail");
+
+        assert_eq!(error.code(), InnerErrorCode::InvalidRange as i32);
+        assert!(task.upload_abort_required());
+    }
+
+    struct PanickingAbort {
+        abort_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl BreakpointUpload for PanickingAbort {
+        async fn prepare(&self, _ctx: UploadPrepareCtx<'_>) -> Result<UploadResumeInfo, MeowError> {
+            Ok(UploadResumeInfo::default())
+        }
+
+        async fn upload_chunk(
+            &self,
+            _ctx: UploadChunkCtx<'_>,
+        ) -> Result<UploadResumeInfo, MeowError> {
+            Ok(UploadResumeInfo::default())
+        }
+
+        async fn abort_upload(
+            &self,
+            _client: &reqwest::Client,
+            _task: &TransferTask,
+        ) -> Result<(), MeowError> {
+            self.abort_calls.fetch_add(1, Ordering::SeqCst);
+            panic!("injected abort panic")
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_contains_abort_hook_panic_as_error() {
+        let abort_calls = Arc::new(AtomicUsize::new(0));
+        let task = upload_task(Arc::new(PanickingAbort {
+            abort_calls: Arc::clone(&abort_calls),
+        }))
+        .await;
+        let transfer = DefaultHttpTransfer::new();
+
+        let error = transfer
+            .cancel(&task)
+            .await
+            .expect_err("abort panic must be contained");
+
+        assert_eq!(error.code(), InnerErrorCode::Unknown as i32);
+        assert_eq!(abort_calls.load(Ordering::SeqCst), 1);
     }
 }
 
@@ -1278,6 +1714,99 @@ mod identity_tests {
         let first = download_identity("https://example.test/object?a=1&a=2", "\"etag\"");
         let second = download_identity("https://example.test/object?a=2&a=1", "\"etag\"");
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn ordinary_query_keeps_the_legacy_v2_golden_identity() {
+        // Golden produced from the pre-hardening v2 framing:
+        // SHA-256(prefix + length-delimited URL, ETag and resume context).
+        assert_eq!(
+            download_identity(
+                "https://example.test/object?versionId=v1&mode=raw",
+                "\"etag\""
+            ),
+            "download-identity-v2-sha256=26814712101b9c9105dbcb0e5955489833548866df26ed3f44a791331099a48f"
+        );
+    }
+
+    #[test]
+    fn ambiguous_raw_query_spellings_do_not_share_checkpoint_identity() {
+        for (first, second) in [
+            ("kind=literal+plus", "kind=literal%20plus"),
+            ("key=%2F", "key=/"),
+            ("flag", "flag="),
+            ("value=a%26b", "value=a&b"),
+        ] {
+            assert_ne!(
+                download_identity(&format!("https://example.test/object?{first}"), "\"etag\""),
+                download_identity(&format!("https://example.test/object?{second}"), "\"etag\""),
+                "distinct raw query forms {first:?} and {second:?} must not collide"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_query_segments_do_not_share_checkpoint_identity() -> Result<(), String> {
+        for (first, second) in [
+            ("a=1&&b=2", "a=1&b=2"),
+            ("a=1&", "a=1"),
+            ("&a=1", "a=1"),
+            ("a=1&&", "a=1&"),
+            ("a=1&&sig=old&sv=1", "a=1&sig=new&sv=1"),
+            ("&&", "&"),
+            ("a=&a=1&&b=", "a=&a=1&b="),
+        ] {
+            let first_identity =
+                download_identity(&format!("https://example.test/object?{first}"), "\"etag\"");
+            let second_identity =
+                download_identity(&format!("https://example.test/object?{second}"), "\"etag\"");
+            if first_identity == second_identity {
+                return Err(format!(
+                    "empty query segments collide: {first:?} and {second:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn empty_query_segments_partition_arbitrary_resource_values(
+            first in "[A-Za-z0-9]{0,24}",
+            second in "[A-Za-z0-9]{0,24}",
+            empty_count in 1usize..16,
+        ) {
+            let ordinary = format!("https://example.test/object?a={first}&b={second}");
+            let separators = "&".repeat(empty_count);
+            for separated in [
+                format!("https://example.test/object?a={first}&{separators}b={second}"),
+                format!("{ordinary}{separators}"),
+                format!("https://example.test/object?{separators}a={first}&b={second}"),
+            ] {
+                if download_identity(&ordinary, "\"etag\"")
+                    == download_identity(&separated, "\"etag\"")
+                {
+                    return Err(proptest::test_runner::TestCaseError::fail(format!(
+                        "query segment boundary was lost: {ordinary:?} vs {separated:?}"
+                    )));
+                }
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn literal_plus_and_percent20_are_distinct_for_arbitrary_safe_context(
+            prefix in "[A-Za-z0-9]{0,24}",
+            suffix in "[A-Za-z0-9]{0,24}",
+        ) {
+            let literal_plus = format!("https://example.test/object?q={prefix}+{suffix}");
+            let encoded_space = format!("https://example.test/object?q={prefix}%20{suffix}");
+            proptest::prop_assert_ne!(
+                download_identity(&literal_plus, "\"etag\""),
+                download_identity(&encoded_space, "\"etag\"")
+            );
+        }
     }
 
     #[test]

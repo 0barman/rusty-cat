@@ -68,7 +68,10 @@ pub(crate) fn apply_signed_headers(
     let url = Url::parse(task_url).map_err(|e| {
         MeowError::from_code(
             InnerErrorCode::ParameterEmpty,
-            format!("invalid azure blob url: {task_url} ({e})"),
+            format!(
+                "invalid azure blob url: {} ({e})",
+                crate::log::sanitize_url(task_url)
+            ),
         )
     })?;
     insert_header(base, HEADER_MS_VERSION, MS_VERSION)?;

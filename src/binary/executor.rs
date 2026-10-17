@@ -13,6 +13,7 @@ use crate::binary::download::{build_client, download_with_retry};
 use crate::binary::{BinaryDownloadConfig, BinaryDownloadOutput, BinaryTask};
 use crate::error::{InnerErrorCode, MeowError};
 use crate::ids::TaskId;
+use crate::inner::cb_dispatcher::{CallbackDispatcherOwner, CallbackDispatcherThreadMarker};
 use crate::meow_config::MeowConfig;
 
 pub(crate) const BINARY_MAX_CONCURRENCY: usize = 2;
@@ -48,12 +49,16 @@ impl std::fmt::Debug for BinaryExecutor {
 }
 
 impl BinaryExecutor {
-    pub(crate) fn new(meow_config: &MeowConfig) -> Result<Self, MeowError> {
-        Self::new_inner(meow_config, None)
+    pub(crate) fn new(
+        meow_config: &MeowConfig,
+        callback_owner: CallbackDispatcherOwner,
+    ) -> Result<Self, MeowError> {
+        Self::new_inner(meow_config, callback_owner, None)
     }
 
     fn new_inner(
         meow_config: &MeowConfig,
+        callback_owner: CallbackDispatcherOwner,
         fault_hooks: Option<Arc<BinaryFaultHooks>>,
     ) -> Result<Self, MeowError> {
         let config = meow_config
@@ -83,8 +88,12 @@ impl BinaryExecutor {
         let (cmd_tx, cmd_rx) = mpsc::channel(BINARY_COMMAND_CAPACITY);
         let (worker_tx, worker_rx) = mpsc::unbounded_channel();
         let (callback_done_tx, callback_done_rx) = mpsc::unbounded_channel();
-        let callback_dispatcher =
-            start_callback_dispatcher(callback_done_tx.clone(), 0, fault_hooks.as_ref())?;
+        let callback_dispatcher = start_callback_dispatcher(
+            callback_done_tx.clone(),
+            callback_owner.clone(),
+            0,
+            fault_hooks.as_ref(),
+        )?;
         let registry = Arc::new(Mutex::new(HashSet::new()));
         let worker_registry = Arc::clone(&registry);
         let body_slots = Arc::new(Semaphore::new(BINARY_MAX_CONCURRENCY));
@@ -100,6 +109,7 @@ impl BinaryExecutor {
                     callback_done_rx,
                     callback_done_tx,
                     callback_dispatcher,
+                    callback_owner,
                     registry: worker_registry,
                     body_slots,
                     client,
@@ -138,7 +148,11 @@ impl BinaryExecutor {
         meow_config: &MeowConfig,
         fault_hooks: Arc<BinaryFaultHooks>,
     ) -> Result<Self, MeowError> {
-        Self::new_inner(meow_config, Some(fault_hooks))
+        Self::new_inner(
+            meow_config,
+            CallbackDispatcherOwner::new(),
+            Some(fault_hooks),
+        )
     }
 
     pub(crate) fn try_enqueue(
@@ -470,6 +484,7 @@ struct SchedulerResources {
     callback_done_rx: mpsc::UnboundedReceiver<TaskId>,
     callback_done_tx: mpsc::UnboundedSender<TaskId>,
     callback_dispatcher: CallbackDispatcher,
+    callback_owner: CallbackDispatcherOwner,
     registry: Arc<Mutex<HashSet<TaskId>>>,
     body_slots: Arc<Semaphore>,
     client: reqwest::Client,
@@ -498,6 +513,7 @@ async fn run_scheduler(resources: SchedulerResources) {
         mut callback_done_rx,
         callback_done_tx,
         callback_dispatcher,
+        callback_owner,
         registry,
         body_slots,
         client,
@@ -560,6 +576,7 @@ async fn run_scheduler(resources: SchedulerResources) {
         if dispatcher.is_none() && dispatcher_restart_requested {
             match start_callback_dispatcher(
                 callback_done_tx.clone(),
+                callback_owner.clone(),
                 next_dispatcher_generation,
                 fault_hooks.as_ref(),
             ) {
@@ -906,6 +923,7 @@ fn map_worker_join_result(
 
 fn start_callback_dispatcher(
     done_tx: mpsc::UnboundedSender<TaskId>,
+    owner: CallbackDispatcherOwner,
     generation: usize,
     fault_hooks: Option<&Arc<BinaryFaultHooks>>,
 ) -> Result<CallbackDispatcher, MeowError> {
@@ -922,6 +940,7 @@ fn start_callback_dispatcher(
     let join = std::thread::Builder::new()
         .name("rusty-cat-binary-callback".to_owned())
         .spawn(move || {
+            let _thread_marker = CallbackDispatcherThreadMarker::enter(&owner);
             if thread_hooks
                 .as_ref()
                 .is_some_and(|hooks| hooks.take_dispatcher_ready_failure())
@@ -1215,7 +1234,8 @@ mod tests {
             error.code(),
             InnerErrorCode::RuntimeCreationFailedError as i32
         );
-        let executor = BinaryExecutor::new(&test_config()).expect("subsequent startup succeeds");
+        let executor = BinaryExecutor::new(&test_config(), CallbackDispatcherOwner::new())
+            .expect("subsequent startup succeeds");
         drop(executor);
     }
 
@@ -1229,7 +1249,8 @@ mod tests {
             error.code(),
             InnerErrorCode::RuntimeCreationFailedError as i32
         );
-        let executor = BinaryExecutor::new(&test_config()).expect("subsequent startup succeeds");
+        let executor = BinaryExecutor::new(&test_config(), CallbackDispatcherOwner::new())
+            .expect("subsequent startup succeeds");
         drop(executor);
     }
 
@@ -1243,7 +1264,8 @@ mod tests {
             error.code(),
             InnerErrorCode::RuntimeCreationFailedError as i32
         );
-        let executor = BinaryExecutor::new(&test_config()).expect("subsequent startup succeeds");
+        let executor = BinaryExecutor::new(&test_config(), CallbackDispatcherOwner::new())
+            .expect("subsequent startup succeeds");
         drop(executor);
     }
 }

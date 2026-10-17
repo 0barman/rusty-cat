@@ -606,7 +606,7 @@ fn digest_open_file_range(
 impl DownloadProgress {
     /// Part index for a chunk-aligned start offset.
     fn index_of(&self, offset: u64) -> Option<usize> {
-        if offset % self.chunk != 0 {
+        if !offset.is_multiple_of(self.chunk) {
             return None;
         }
         let idx = offset / self.chunk;

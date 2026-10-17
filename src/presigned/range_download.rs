@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
 
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, RANGE};
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_LENGTH, RANGE};
 
 use crate::download_trait::{BreakpointDownload, DownloadHeadCtx, DownloadRangeGetCtx};
 use crate::error::{InnerErrorCode, MeowError};
@@ -10,6 +10,11 @@ use crate::TransferTask;
 
 use super::time::now_unix_secs;
 use super::{PresignedDownloadUrlRefresher, PresignedRangeDownloadPlan};
+
+type PendingHeadSnapshot = (
+    Weak<StdMutex<()>>,
+    Result<Arc<PresignedRangeDownloadPlan>, MeowError>,
+);
 
 thread_local! {
     // A stack, rather than one current key, also detects indirect recursion
@@ -21,6 +26,11 @@ thread_local! {
     // paired with the just-built headers on that thread so a concurrent plan
     // refresh cannot mix two credential generations.
     static PENDING_RANGE_URL: RefCell<Option<(Weak<StdMutex<()>>, String)>> = const { RefCell::new(None) };
+    // HEAD follows the opposite public-hook order (URL first, then headers).
+    // Keep the complete freshness result between those consecutive calls so an
+    // error prevents I/O and a successful request never combines two signing
+    // generations.
+    static PENDING_HEAD_SNAPSHOT: RefCell<Option<PendingHeadSnapshot>> = const { RefCell::new(None) };
 }
 
 #[derive(Debug)]
@@ -119,9 +129,44 @@ impl PresignedRangeDownload {
         })
     }
 
-    fn ensure_fresh_snapshot(&self) -> Result<Arc<PresignedRangeDownloadPlan>, MeowError> {
+    fn ensure_task_active(task: Option<&TransferTask>) -> Result<(), MeowError> {
+        if task.is_some_and(TransferTask::stop_requested) {
+            return Err(MeowError::from_code_str(
+                InnerErrorCode::TaskCanceled,
+                "presigned range download stopped during URL refresh",
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_task_total_matches_snapshot(
+        task: Option<&TransferTask>,
+        plan: &PresignedRangeDownloadPlan,
+    ) -> Result<(), MeowError> {
+        let Some(expected) = task.and_then(TransferTask::resolved_download_total) else {
+            return Ok(());
+        };
+        let Some(observed) = plan.total_size else {
+            return Ok(());
+        };
+        if expected == observed {
+            return Ok(());
+        }
+        Err(MeowError::from_code(
+            InnerErrorCode::InvalidTaskState,
+            format!("presigned range total_size mismatch: expected={expected} observed={observed}"),
+        ))
+    }
+
+    fn ensure_fresh_snapshot(
+        &self,
+        task: Option<&TransferTask>,
+    ) -> Result<Arc<PresignedRangeDownloadPlan>, MeowError> {
+        Self::ensure_task_active(task)?;
         let plan = self.plan_snapshot()?;
+        Self::ensure_task_total_matches_snapshot(task, &plan)?;
         if !Self::should_refresh_plan(&plan)? {
+            Self::ensure_task_active(task)?;
             return Ok(plan);
         }
 
@@ -139,6 +184,7 @@ impl PresignedRangeDownload {
                     "presigned range URL expired and no refresher is configured",
                 ));
             }
+            Self::ensure_task_active(task)?;
             return Ok(plan);
         };
 
@@ -159,8 +205,11 @@ impl PresignedRangeDownload {
                 "presigned range refresh lock poisoned",
             )
         })?;
+        Self::ensure_task_active(task)?;
         let plan = self.plan_snapshot()?;
+        Self::ensure_task_total_matches_snapshot(task, &plan)?;
         if !Self::should_refresh_plan(&plan)? {
+            Self::ensure_task_active(task)?;
             return Ok(plan);
         }
 
@@ -186,18 +235,32 @@ impl PresignedRangeDownload {
                 .with_url(plan.range_url.as_str())
             });
         })?;
-        if let (Some(old), Some(new)) = (plan.total_size, refreshed.total_size) {
-            if old != new {
+        Self::ensure_task_active(task)?;
+        if Self::is_plan_expired(&refreshed)? {
+            return Err(MeowError::from_code_str(
+                InnerErrorCode::InvalidTaskState,
+                "refreshed presigned range URL is already expired",
+            ));
+        }
+        let expected_total = task
+            .and_then(TransferTask::resolved_download_total)
+            .or(plan.total_size);
+        if let (Some(expected), Some(observed)) = (expected_total, refreshed.total_size) {
+            if expected != observed {
                 crate::log::emit_lazy(|| {
                     crate::log::Log::error(
                         "range_get",
-                        format!("refreshed range total_size mismatch: old={old} new={new}"),
+                        format!(
+                            "refreshed range total_size mismatch: expected={expected} observed={observed}"
+                        ),
                     )
                     .with_url(plan.range_url.as_str())
                 });
                 return Err(MeowError::from_code(
                     InnerErrorCode::InvalidTaskState,
-                    format!("refreshed range total_size mismatch: old={old} new={new}"),
+                    format!(
+                        "refreshed range total_size mismatch: expected={expected} observed={observed}"
+                    ),
                 ));
             }
         }
@@ -211,16 +274,18 @@ impl PresignedRangeDownload {
                 "presigned range download plan lock poisoned",
             )
         })?;
+        Self::ensure_task_active(task)?;
         *guard = Arc::clone(&refreshed);
         Ok(refreshed)
     }
 
-    fn request_from_fresh_snapshot(
+    fn request_from_fresh_snapshot_for_task(
         &self,
+        task: Option<&TransferTask>,
         range_value: &str,
         mut base: HeaderMap,
     ) -> Result<(String, HeaderMap), MeowError> {
-        let plan = self.ensure_fresh_snapshot()?;
+        let plan = self.ensure_fresh_snapshot(task)?;
         base.insert(
             RANGE,
             HeaderValue::from_str(range_value).map_err(|e| {
@@ -239,7 +304,39 @@ impl PresignedRangeDownload {
             );
         }
         Self::merge_headers(&mut base, &plan.range_headers);
+        Self::ensure_task_active(task)?;
         Ok((plan.range_url.clone(), base))
+    }
+
+    #[cfg(test)]
+    fn request_from_fresh_snapshot(
+        &self,
+        range_value: &str,
+        base: HeaderMap,
+    ) -> Result<(String, HeaderMap), MeowError> {
+        self.request_from_fresh_snapshot_for_task(None, range_value, base)
+    }
+
+    fn remember_head_snapshot(&self, snapshot: Result<Arc<PresignedRangeDownloadPlan>, MeowError>) {
+        let key = Arc::downgrade(&self.refresh_gate);
+        PENDING_HEAD_SNAPSHOT.with(|pending| {
+            *pending.borrow_mut() = Some((key, snapshot));
+        });
+    }
+
+    fn take_remembered_head_snapshot(
+        &self,
+    ) -> Option<Result<Arc<PresignedRangeDownloadPlan>, MeowError>> {
+        let key = Arc::downgrade(&self.refresh_gate);
+        PENDING_HEAD_SNAPSHOT.with(|pending| {
+            let mut pending = pending.borrow_mut();
+            match pending.as_ref() {
+                Some((pending_key, _)) if Weak::ptr_eq(pending_key, &key) => {
+                    pending.take().map(|(_, snapshot)| snapshot)
+                }
+                _ => None,
+            }
+        })
     }
 
     fn remember_range_url(&self, range_url: String) {
@@ -264,7 +361,7 @@ impl PresignedRangeDownload {
 
     #[cfg(test)]
     pub(crate) fn ensure_fresh_plan(&self) -> Result<PresignedRangeDownloadPlan, MeowError> {
-        self.ensure_fresh_snapshot()
+        self.ensure_fresh_snapshot(None)
             .map(|plan| plan.as_ref().clone())
     }
 }
@@ -275,10 +372,18 @@ impl BreakpointDownload for PresignedRangeDownload {
     }
 
     fn head_url(&self, task: &TransferTask) -> String {
-        self.plan_snapshot()
-            .ok()
-            .and_then(|plan| plan.head_url.clone())
-            .unwrap_or_else(|| task.url().to_string())
+        let snapshot = self.ensure_fresh_snapshot(Some(task));
+        let url = match &snapshot {
+            Ok(plan) => match &plan.head_url {
+                Some(url) => url.clone(),
+                None => plan.range_url.clone(),
+            },
+            // The paired merge_head_headers call returns the saved error
+            // before any request can use this fallback URL.
+            Err(_) => task.url().to_owned(),
+        };
+        self.remember_head_snapshot(snapshot);
+        url
     }
 
     fn range_url(&self, _task: &TransferTask) -> String {
@@ -290,17 +395,53 @@ impl BreakpointDownload for PresignedRangeDownload {
     }
 
     fn merge_head_headers(&self, ctx: DownloadHeadCtx<'_>) -> Result<(), MeowError> {
-        let plan = self.plan()?;
+        let plan = match self.take_remembered_head_snapshot() {
+            Some(snapshot) => snapshot?,
+            None => self.ensure_fresh_snapshot(Some(ctx.task))?,
+        };
         Self::merge_headers(ctx.base, &plan.head_headers);
+        Self::ensure_task_active(Some(ctx.task))?;
         Ok(())
     }
 
     fn merge_range_get_headers(&self, ctx: DownloadRangeGetCtx<'_>) -> Result<(), MeowError> {
-        let (range_url, headers) =
-            self.request_from_fresh_snapshot(ctx.range_value, ctx.base.clone())?;
+        let (range_url, headers) = self.request_from_fresh_snapshot_for_task(
+            Some(ctx.task),
+            ctx.range_value,
+            ctx.base.clone(),
+        )?;
         *ctx.base = headers;
         self.remember_range_url(range_url);
         Ok(())
+    }
+
+    fn total_size_from_head(&self, headers: &HeaderMap) -> Result<u64, MeowError> {
+        let total = crate::dflt::require_single_header(
+            headers,
+            CONTENT_LENGTH,
+            "presigned download HEAD response",
+        )?
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|total| *total > 0)
+        .ok_or_else(|| {
+            MeowError::from_code_str(
+                InnerErrorCode::MissingOrInvalidContentLengthFromHead,
+                "missing or invalid content-length from HEAD",
+            )
+        })?;
+
+        let current = self.plan_snapshot()?;
+        if let Some(expected) = current.total_size {
+            if expected != total {
+                return Err(MeowError::from_code(
+                    InnerErrorCode::InvalidTaskState,
+                    format!(
+                        "presigned HEAD total_size mismatch: expected={expected} observed={total}"
+                    ),
+                ));
+            }
+        }
+        Ok(total)
     }
 }
 
@@ -467,5 +608,104 @@ mod tests {
         drop(second);
         drop(first);
         ActiveRefreshGuard::enter(11).expect("guards must clean up their stack on drop");
+    }
+
+    #[test]
+    fn successful_head_total_does_not_mutate_the_reusable_public_plan() {
+        use reqwest::header::{HeaderMap, HeaderValue, CONTENT_LENGTH};
+
+        let download = PresignedRangeDownload::new(PresignedRangeDownloadPlan::new(
+            "https://example.com/object",
+        ));
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("42"));
+
+        let total = BreakpointDownload::total_size_from_head(&download, &headers)
+            .expect("valid HEAD total");
+
+        assert_eq!(total, 42);
+        assert_eq!(download.plan().expect("unchanged plan").total_size, None);
+    }
+
+    #[test]
+    fn duplicate_head_content_length_is_rejected_before_freezing_total() {
+        use reqwest::header::{HeaderMap, HeaderValue, CONTENT_LENGTH};
+
+        let download = PresignedRangeDownload::new(PresignedRangeDownloadPlan::new(
+            "https://example.com/object",
+        ));
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("42"));
+        headers.append(CONTENT_LENGTH, HeaderValue::from_static("42"));
+
+        let error = BreakpointDownload::total_size_from_head(&download, &headers)
+            .expect_err("ambiguous HEAD framing must fail");
+
+        assert_eq!(error.code(), InnerErrorCode::InvalidRange as i32);
+        assert_eq!(download.plan().expect("unchanged plan").total_size, None);
+    }
+
+    struct ReviewHeadRefresher;
+
+    impl PresignedDownloadUrlRefresher for ReviewHeadRefresher {
+        fn refresh_range_download(
+            &self,
+            plan: &PresignedRangeDownloadPlan,
+        ) -> Result<PresignedRangeDownloadPlan, MeowError> {
+            let mut fresh = plan.clone().with_range_expires_at_unix_secs(u64::MAX);
+            fresh.range_url = "https://fresh.example/object".to_owned();
+            fresh
+                .head_headers
+                .insert("x-generation", HeaderValue::from_static("fresh"));
+            Ok(fresh)
+        }
+    }
+
+    #[tokio::test]
+    async fn review_head_url_and_headers_use_one_fresh_plan_with_optional_override(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for explicit in [false, true] {
+            let mut plan = PresignedRangeDownloadPlan::new("https://stale.example/object")
+                .with_range_expires_at_unix_secs(0);
+            if explicit {
+                plan.head_url = Some("https://head.example/metadata".to_owned());
+            }
+            let download =
+                PresignedRangeDownload::new(plan).with_url_refresher(Arc::new(ReviewHeadRefresher));
+            let pounce = crate::down_pounce_builder::DownloadPounceBuilder::new(
+                "review-head.bin",
+                std::env::temp_dir().join("review-head-unit.bin"),
+                5,
+                "https://identity.example/object",
+            )
+            .build();
+            let (upload, range) = crate::dflt::default_http_transfer::default_breakpoint_arcs();
+            let inner = crate::inner::inner_task::InnerTask::from_pounce(
+                pounce,
+                crate::http_breakpoint::BreakpointDownloadHttpConfig::default(),
+                None,
+                upload,
+                range,
+            )
+            .await?;
+            let task = TransferTask::from_inner(&inner);
+            let actual = download.head_url(&task);
+            let mut headers = HeaderMap::new();
+            download.merge_head_headers(DownloadHeadCtx {
+                task: &task,
+                base: &mut headers,
+            })?;
+            let expected = if explicit {
+                "https://head.example/metadata"
+            } else {
+                "https://fresh.example/object"
+            };
+            if actual != expected
+                || headers.get("x-generation") != Some(&HeaderValue::from_static("fresh"))
+            {
+                return Err(format!("HEAD snapshot mismatch: expected={expected} actual={actual} headers={headers:?}").into());
+            }
+        }
+        Ok(())
     }
 }
