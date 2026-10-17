@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 1) 清空 Cargo 构建缓存（target）及集成测试在系统临时目录留下的下载/上传文件
-# 2) 由 Rust 编译器检查 lib 与 tests，并禁止真实的 unsafe 代码
-# 3) 一次性运行 tests/ 目录的全部集成测试（cargo test --tests）
+# 2) 由 Rust 编译器检查 lib 与独立集成测试包，并禁止真实的 unsafe 代码
+# 3) 运行 lib 单元测试及 ../rusty-cat-integration-tests/tests/ 下全部集成测试
 #
 # 用法：在任意目录执行
 #   bash /path/to/rusty-cat/scripts/full-verify.sh
@@ -30,10 +30,12 @@ if [[ -n "${TMPDIR:-}" ]]; then
 fi
 clean_temp_dir "/tmp"
 
-echo "==> [2/3] 编译检查 lib 与 tests，并禁止 unsafe Rust 代码…"
-cargo check --lib --tests --all-features --locked
+echo "==> [2/3] 编译检查 lib 与独立集成测试包，并禁止 unsafe Rust 代码…"
+cargo check -p rusty-cat --lib --tests --all-features --locked
+cargo check -p rusty-cat-integration-tests --tests --all-features --locked
 
-echo "==> [3/3] 运行 tests/ 下全部集成测试（cargo test --tests）…"
-cargo test --tests
+echo "==> [3/3] 运行 lib 单元测试与独立集成测试包…"
+cargo test -p rusty-cat --lib
+cargo test -p rusty-cat-integration-tests --tests
 
 echo "==> 全部完成。"
