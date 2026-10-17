@@ -1,6 +1,6 @@
 [package]
 name = "rusty-cat"
-version = "0.3.7"
+version = "0.3.8"
 edition = "2021"
 rust-version = "1.89"
 description = "Async HTTP client for resumable file upload and download."
