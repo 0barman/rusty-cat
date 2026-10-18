@@ -102,12 +102,21 @@ your server to look up resume progress.
 `category` lets you tag uploads for server-side routing. It defaults to empty. To
 set it, attach a configured `DefaultStyleUpload` explicitly:
 
+Use the [quick-start dependencies](../README.md#quick-start), including rustls
+with the ring feature. The example installs it at startup; see
+[TLS provider setup](migration-0.4.0.md#choose-a-tls-provider) for other choices.
+
 ```rust,no_run
 use std::sync::Arc;
 use rusty_cat::api::{DefaultStyleUpload, MeowClient, MeowConfig, UploadPounceBuilder};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // Reuse the existing provider if another component installed one first.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     let client = MeowClient::new(MeowConfig::default());
 
     let task = UploadPounceBuilder::new("clip.mp4", "./clip.mp4", 4 * 1024 * 1024)

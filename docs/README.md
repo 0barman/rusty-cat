@@ -6,18 +6,21 @@ wire contracts, provider setup, restart behavior, and operational limits.
 
 ## Start here
 
-1. Read [Task lifecycle](task-lifecycle.md) before enqueueing production work.
-2. Choose the built-in [default HTTP upload protocol](default-http-upload-protocol.md),
+1. Configure the application's [TLS crypto provider](migration-0.4.0.md#choose-a-tls-provider).
+   Existing users should read the [0.3.6 to 0.4.0 migration guide](migration-0.4.0.md).
+2. Read [Task lifecycle](task-lifecycle.md) before enqueueing production work.
+3. Choose the built-in [default HTTP upload protocol](default-http-upload-protocol.md),
    a [cloud provider feature](provider-feature-flags.md), or a
    [custom protocol](custom-protocols.md).
-3. Add [progress, status, and observability](progress-status-observability.md).
-4. If transfers must survive process restarts, follow
+4. Add [progress, status, and observability](progress-status-observability.md).
+5. If transfers must survive process restarts, follow
    [Resume after restart](resume-after-restart.md).
 
 ## Core guides
 
 | Guide | Use it for |
 |---|---|
+| [0.3.6 to 0.4.0 migration](migration-0.4.0.md) | Reqwest 0.13, explicit TLS crypto provider selection, custom clients, and error 119 |
 | [Task lifecycle](task-lifecycle.md) | Enqueue vs wait, callbacks, pause/resume/cancel, shutdown, backpressure |
 | [Concurrent chunk transfer](concurrent-chunk-transfer.md) | Intra-file concurrency, limits, validator requirements, download sidecars |
 | [Resume after restart](resume-after-restart.md) | Persistence and the exact recovery guarantees of each protocol |

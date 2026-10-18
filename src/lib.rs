@@ -6,11 +6,38 @@
 //! For beginners, start from [`api`] or directly use [`meow_client::MeowClient`]
 //! and [`meow_config::MeowConfig`].
 //!
+//! # Application-selected TLS provider
+//!
+//! The SDK does not select or install a Rustls crypto provider. Before using an
+//! internally constructed HTTP client, the application must enable its chosen
+//! provider and install it once during startup. For example, an application
+//! choosing ring can depend on
+//! `rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }`:
+//!
+//! ```
+//! use rusty_cat::api::{MeowClient, MeowConfig};
+//!
+//! rustls::crypto::ring::default_provider()
+//!     .install_default()
+//!     .expect("install the application's TLS provider once at startup");
+//! let client = MeowClient::new(MeowConfig::default());
+//! let _http = client.http_client()?;
+//! # Ok::<(), rusty_cat::api::MeowError>(())
+//! ```
+//!
+//! Missing a provider returns `HttpClientBuildFailed` (119) when an internal
+//! client is needed. An injected, already configured Reqwest client can serve
+//! ordinary transfers without a global provider; Binary downloads use their
+//! own isolated client and still require the application's global provider.
+//!
 //! # Quick example
 //!
 //! ```no_run
 //! use rusty_cat::api::{MeowClient, MeowConfig, UploadPounceBuilder};
 //!
+//! rustls::crypto::ring::default_provider()
+//!     .install_default()
+//!     .expect("install the application's TLS provider once at startup");
 //! let config = MeowConfig::builder()
 //!     .max_upload_concurrency(2)
 //!     .max_download_concurrency(2)
@@ -77,6 +104,9 @@ mod provider_body;
 #[cfg(any(feature = "aliyun-oss-direct", feature = "azure-blob-direct"))]
 mod provider_xml;
 pub(crate) mod target_lease;
+#[cfg(test)]
+mod test_support;
+mod tls_provider;
 pub mod transfer_executor_trait;
 pub mod transfer_snapshot;
 pub mod transfer_status;

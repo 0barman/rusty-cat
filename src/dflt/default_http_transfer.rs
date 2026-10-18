@@ -76,7 +76,8 @@ const DEFAULT_CONNECT_TIMEOUT_CAP: Duration = Duration::from_secs(10);
 pub(crate) fn build_internal_client(
     http_timeout: Duration,
     tcp_keepalive: Duration,
-) -> Result<reqwest::Client, reqwest::Error> {
+) -> Result<reqwest::Client, MeowError> {
+    crate::tls_provider::ensure_crypto_provider()?;
     Client::builder()
         .timeout(http_timeout)
         // Range validation must observe the representation that arrived on
@@ -99,12 +100,23 @@ pub(crate) fn build_internal_client(
         .pool_max_idle_per_host(DEFAULT_POOL_MAX_IDLE_PER_HOST)
         .pool_idle_timeout(Some(DEFAULT_POOL_IDLE_TIMEOUT))
         .build()
+        .map_err(|error| {
+            MeowError::from_source(
+                InnerErrorCode::HttpClientBuildFailed,
+                format!(
+                    "build reqwest client failed (timeout={:?}, keepalive={:?})",
+                    http_timeout, tcp_keepalive
+                ),
+                error,
+            )
+        })
 }
 
 /// Built-in HTTP transfer backend based on `reqwest` and async file I/O.
 pub struct DefaultHttpTransfer {
-    /// Default shared HTTP client.
-    client: reqwest::Client,
+    /// Default shared HTTP client, or the error retained by an infallible
+    /// constructor until an operation needs this client.
+    client: Result<reqwest::Client, MeowError>,
     /// Fallback upload protocol when task does not provide one.
     fallback_upload: Arc<dyn BreakpointUpload + Send + Sync>,
     /// Fallback download protocol when task does not provide one.
@@ -132,6 +144,12 @@ impl DefaultHttpTransfer {
 
     /// Creates built-in backend with explicit timeout and keepalive values.
     ///
+    /// If client construction fails, operations that need the default client
+    /// return the stored error. A task's injected client still takes precedence.
+    /// Use [`Self::try_with_http_timeouts`] to receive construction errors
+    /// immediately. Install the application's TLS crypto provider before
+    /// constructing a backend that uses an internal client.
+    ///
     /// # Range guidance
     ///
     /// - `http_timeout`: recommended `1s..=120s`
@@ -150,19 +168,9 @@ impl DefaultHttpTransfer {
     /// let _ = backend;
     /// ```
     pub fn with_http_timeouts(http_timeout: Duration, tcp_keepalive: Duration) -> Self {
-        // Keep non-fallible constructor for compatibility.
-        // Prefer `try_with_http_timeouts` in new code for explicit errors.
-        let client = match build_internal_client(http_timeout, tcp_keepalive) {
-            Ok(c) => c,
-            Err(e) => {
-                crate::meow_warn_log!(
-                    "http_client",
-                    "with_http_timeouts build failed, fallback to Client::new(): {}",
-                    crate::log::redact_secrets(&e.to_string())
-                );
-                Client::new()
-            }
-        };
+        // Preserve the constructor signature without falling back to a client
+        // that may panic or silently discard the configured transport policy.
+        let client = build_internal_client(http_timeout, tcp_keepalive);
         Self {
             client,
             fallback_upload: Arc::new(DefaultStyleUpload::default()),
@@ -195,18 +203,9 @@ impl DefaultHttpTransfer {
         http_timeout: Duration,
         tcp_keepalive: Duration,
     ) -> Result<Self, MeowError> {
-        let client = build_internal_client(http_timeout, tcp_keepalive).map_err(|e| {
-            MeowError::from_source(
-                InnerErrorCode::HttpClientBuildFailed,
-                format!(
-                    "build reqwest client failed (timeout={:?}, keepalive={:?})",
-                    http_timeout, tcp_keepalive
-                ),
-                e,
-            )
-        })?;
+        let client = build_internal_client(http_timeout, tcp_keepalive)?;
         Ok(Self {
-            client,
+            client: Ok(client),
             fallback_upload: Arc::new(DefaultStyleUpload::default()),
             fallback_download: Arc::new(StandardRangeDownload),
             client_defaults_are_known: true,
@@ -230,7 +229,7 @@ impl DefaultHttpTransfer {
     /// ```
     pub fn with_client(client: reqwest::Client) -> Self {
         Self {
-            client,
+            client: Ok(client),
             fallback_upload: Arc::new(DefaultStyleUpload::default()),
             fallback_download: Arc::new(StandardRangeDownload),
             client_defaults_are_known: false,
@@ -262,7 +261,7 @@ impl DefaultHttpTransfer {
         download: Arc<dyn BreakpointDownload + Send + Sync>,
     ) -> Self {
         Self {
-            client,
+            client: Ok(client),
             fallback_upload: upload,
             fallback_download: download,
             client_defaults_are_known: false,
@@ -270,10 +269,11 @@ impl DefaultHttpTransfer {
     }
 
     /// Selects HTTP client for a task.
-    fn client_for(&self, task: &TransferTask) -> reqwest::Client {
-        task.http_client_ref()
-            .cloned()
-            .unwrap_or_else(|| self.client.clone())
+    fn client_for(&self, task: &TransferTask) -> Result<reqwest::Client, MeowError> {
+        match task.http_client_ref() {
+            Some(client) => Ok(client.clone()),
+            None => self.client.clone(),
+        }
     }
 
     /// Selects upload protocol implementation for a task.
@@ -1101,7 +1101,7 @@ impl TransferTrait for DefaultHttpTransfer {
         task: &TransferTask,
         local_offset: u64,
     ) -> Result<PrepareOutcome, MeowError> {
-        let client = self.client_for(task);
+        let client = self.client_for(task)?;
         match task.direction() {
             Direction::Upload => {
                 upload_prepare(&client, task, self.upload_arc(task), local_offset).await
@@ -1129,7 +1129,7 @@ impl TransferTrait for DefaultHttpTransfer {
         chunk_size: u64,
         remote_total_size: u64,
     ) -> Result<ChunkOutcome, MeowError> {
-        let client = self.client_for(task);
+        let client = self.client_for(task)?;
         match task.direction() {
             Direction::Upload => {
                 upload_one_chunk(&client, task, self.upload_arc(task), offset, chunk_size).await
@@ -1153,10 +1153,10 @@ impl TransferTrait for DefaultHttpTransfer {
         if task.direction() != Direction::Upload {
             return Ok(());
         }
+        let client = self.client_for(task)?;
         if !task.begin_upload_abort() {
             return Ok(());
         }
-        let client = self.client_for(task);
         guarded_abort_upload(&client, task, self.upload_arc(task)).await
     }
 
@@ -1178,7 +1178,7 @@ impl TransferTrait for DefaultHttpTransfer {
         chunk_size: u64,
         remote_total_size: u64,
     ) -> Result<ChunkOutcome, MeowError> {
-        let client = self.client_for(task);
+        let client = self.client_for(task)?;
         match task.direction() {
             Direction::Upload => {
                 upload_one_chunk_part(&client, task, self.upload_arc(task), offset, chunk_size)
@@ -1229,7 +1229,7 @@ impl TransferTrait for DefaultHttpTransfer {
     async fn complete(&self, task: &TransferTask) -> Result<Option<String>, MeowError> {
         match task.direction() {
             Direction::Upload => {
-                let client = self.client_for(task);
+                let client = self.client_for(task)?;
                 let upload = self.upload_arc(task);
                 if let Some(snapshot) = task.upload_file_snapshot() {
                     if let Err(error) = snapshot.validate_generation(true).await {
@@ -1297,6 +1297,13 @@ mod upload_protocol_tests {
     use crate::upload_trait::{UploadChunkCtx, UploadPrepareCtx};
 
     async fn upload_task(upload: Arc<dyn BreakpointUpload + Send + Sync>) -> TransferTask {
+        upload_task_with_client(upload, None).await
+    }
+
+    async fn upload_task_with_client(
+        upload: Arc<dyn BreakpointUpload + Send + Sync>,
+        client: Option<reqwest::Client>,
+    ) -> TransferTask {
         let pounce = UploadPounceBuilder::from_bytes("protocol-unit.bin", vec![0; 3], 3)
             .with_url("https://protocol.invalid/unit")
             .with_breakpoint_upload(upload)
@@ -1307,7 +1314,7 @@ mod upload_protocol_tests {
         let inner = InnerTask::from_pounce(
             pounce,
             BreakpointDownloadHttpConfig::default(),
-            None,
+            client,
             Arc::new(DefaultStyleUpload::default()),
             Arc::new(StandardRangeDownload) as Arc<dyn BreakpointDownload + Send + Sync>,
         )
@@ -1400,6 +1407,7 @@ mod upload_protocol_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn head_hooks_run_off_async_caller_and_preserve_merge_error() {
+        crate::test_support::init_tls_provider();
         let head_saw_async_caller = Arc::new(AtomicBool::new(false));
         let merge_saw_async_caller = Arc::new(AtomicBool::new(false));
         let merge_used_head_thread = Arc::new(AtomicBool::new(false));
@@ -1542,6 +1550,7 @@ mod upload_protocol_tests {
 
     #[tokio::test]
     async fn prepare_rejects_server_offset_above_total_before_clamping() {
+        crate::test_support::init_tls_provider();
         let upload: Arc<dyn BreakpointUpload + Send + Sync> = Arc::new(PrepareAboveTotal);
         let task = upload_task(Arc::clone(&upload)).await;
         let error = upload_prepare_once(&reqwest::Client::new(), &task, upload, 0)
@@ -1581,6 +1590,7 @@ mod upload_protocol_tests {
 
     #[tokio::test]
     async fn cancel_contains_abort_hook_panic_as_error() {
+        crate::test_support::init_tls_provider();
         let abort_calls = Arc::new(AtomicUsize::new(0));
         let task = upload_task(Arc::new(PanickingAbort {
             abort_calls: Arc::clone(&abort_calls),
@@ -1595,6 +1605,69 @@ mod upload_protocol_tests {
 
         assert_eq!(error.code(), InnerErrorCode::Unknown as i32);
         assert_eq!(abort_calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn backend_with_retained_build_error() -> DefaultHttpTransfer {
+        DefaultHttpTransfer {
+            client: Err(MeowError::from_code_str(
+                InnerErrorCode::HttpClientBuildFailed,
+                "retained HTTP client build error",
+            )),
+            fallback_upload: Arc::new(DefaultStyleUpload::default()),
+            fallback_download: Arc::new(StandardRangeDownload),
+            client_defaults_are_known: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_build_error_reaches_operations_without_consuming_upload_abort() {
+        let transfer = backend_with_retained_build_error();
+        let task = upload_task(Arc::new(DefaultStyleUpload::default())).await;
+
+        let errors = [
+            transfer.prepare(&task, 0).await.expect_err("prepare error"),
+            transfer
+                .transfer_chunk(&task, 0, 3, 3)
+                .await
+                .expect_err("chunk error"),
+            transfer
+                .transfer_chunk_part(&task, 0, 3, 3)
+                .await
+                .expect_err("parallel chunk error"),
+            transfer.complete(&task).await.expect_err("complete error"),
+            transfer.cancel(&task).await.expect_err("cancel error"),
+        ];
+        for error in errors {
+            assert_eq!(error.code(), InnerErrorCode::HttpClientBuildFailed as i32);
+            assert_eq!(error.msg(), "retained HTTP client build error");
+        }
+        assert!(
+            task.begin_upload_abort(),
+            "failing to obtain a client must not mark remote abort as attempted"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_injected_client_overrides_a_retained_backend_build_error() {
+        crate::test_support::init_tls_provider();
+        let transfer = backend_with_retained_build_error();
+        let task = upload_task_with_client(
+            Arc::new(DefaultStyleUpload::default()),
+            Some(reqwest::Client::new()),
+        )
+        .await;
+
+        assert_eq!(
+            transfer
+                .complete(&task)
+                .await
+                .expect("complete hook uses the injected client"),
+            None
+        );
+        transfer
+            .cancel(&task)
+            .await
+            .expect("abort hook uses the injected client");
     }
 }
 
@@ -1939,6 +2012,7 @@ mod identity_tests {
 
     #[test]
     fn injected_http_client_defaults_are_not_assumed_identity_safe() {
+        crate::test_support::init_tls_provider();
         let injected = super::DefaultHttpTransfer::with_client(reqwest::Client::new());
         let internal = super::DefaultHttpTransfer::try_with_http_timeouts(
             std::time::Duration::from_secs(5),

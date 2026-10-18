@@ -200,10 +200,13 @@ impl MeowConfigBuilder {
         self
     }
 
-    /// Injects a custom HTTP client for all transfer requests.
+    /// Injects a custom HTTP client for ordinary file upload/download requests.
     ///
     /// Use this when you need custom proxy, TLS, default headers, middleware,
     /// or observability behavior.
+    /// A client with an explicitly configured TLS provider can be used without
+    /// installing a global provider. Binary tasks use a separate internal client
+    /// and still require an application-installed global TLS provider.
     ///
     /// # Usage rules
     ///
@@ -218,6 +221,11 @@ impl MeowConfigBuilder {
     /// ```no_run
     /// use rusty_cat::api::MeowConfig;
     ///
+    /// // The application selects its TLS provider before creating clients.
+    /// if rustls::crypto::CryptoProvider::get_default().is_none() {
+    ///     rustls::crypto::ring::default_provider().install_default()
+    ///         .expect("install the application's TLS provider once");
+    /// }
     /// let client = reqwest::Client::new();
     /// let config = MeowConfig::builder().http_client(client).build()?;
     /// let _ = config;

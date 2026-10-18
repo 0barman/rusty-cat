@@ -24,9 +24,14 @@ The client receives only temporary URLs and metadata. `rusty-cat` does not persi
 
 ```toml
 [dependencies]
-rusty-cat = { version = "0.3.6", features = ["aliyun-oss-presigned"] }
+rusty-cat = { version = "0.4.0", features = ["aliyun-oss-presigned"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
 ```
+
+The examples choose ring at application startup and preserve an already
+installed provider. See [TLS provider setup](migration-0.4.0.md#choose-a-tls-provider)
+for AWS-LC or a host-supplied provider; cloud features do not choose TLS cryptography.
 
 Run the configured signed-download scenario from the repository root:
 
@@ -69,6 +74,11 @@ use rusty_cat::api::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // Reuse the existing provider if another component installed one first.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     let chunk_size = 1024 * 1024;
     let total_size = 5 * chunk_size;
 
@@ -158,6 +168,11 @@ use rusty_cat::api::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // Reuse the existing provider if another component installed one first.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     let download_url = "https://oss.example.com/object?signature=...";
     let total_size = 5 * 1024 * 1024;
 

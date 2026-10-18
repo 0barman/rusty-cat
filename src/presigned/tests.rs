@@ -449,6 +449,7 @@ fn bound_plan_three_5b_parts() -> PresignedMultipartUploadPlan {
 
 #[tokio::test]
 async fn prepare_rejects_invalid_resumed_manifest_before_transfer() {
+    crate::test_support::init_tls_provider();
     let mut duplicate_conflict = uploaded(1, 0, 5);
     duplicate_conflict.provider_part_id = Some("provider-1".to_owned());
     let mut duplicate_conflict_other = duplicate_conflict.clone();
@@ -646,6 +647,7 @@ async fn review_normalized_upload_task(
 #[tokio::test]
 async fn review_replacing_resumed_manifest_resets_validation_and_keeps_latest_parts(
 ) -> Result<(), Box<dyn std::error::Error>> {
+    crate::test_support::init_tls_provider();
     let cases = [
         (Vec::new(), Vec::new()),
         (vec![uploaded(1, 0, 5)], vec![uploaded(1, 0, 5)]),
@@ -689,6 +691,7 @@ async fn review_replacing_resumed_manifest_resets_validation_and_keeps_latest_pa
 #[tokio::test]
 async fn review_invalid_replacement_overwrites_valid_manifest_and_fails_prepare(
 ) -> Result<(), Box<dyn std::error::Error>> {
+    crate::test_support::init_tls_provider();
     let protocol = Arc::new(
         PresignedMultipartUpload::new(plan_three_5b_parts())
             .with_resumed_parts(vec![uploaded(1, 0, 5)])

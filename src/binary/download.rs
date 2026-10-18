@@ -20,6 +20,7 @@ pub(crate) fn build_client(
     keepalive: Duration,
     redirect_limit: usize,
 ) -> Result<reqwest::Client, MeowError> {
+    crate::tls_provider::ensure_crypto_provider()?;
     let policy = Policy::custom(move |attempt| {
         let next = attempt.url();
         if let Some(message) = reject_redirect(attempt.previous(), next, redirect_limit) {
