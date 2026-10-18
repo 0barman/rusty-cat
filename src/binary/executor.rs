@@ -1146,6 +1146,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatcher_exit_between_jobs_restarts_without_losing_callbacks() {
+        crate::test_support::init_tls_provider();
         let hooks = Arc::new(BinaryFaultHooks::default());
         hooks.dispatcher_exit_after_jobs.store(2, Ordering::SeqCst);
         let executor = BinaryExecutor::new_with_fault_hooks(&test_config(), Arc::clone(&hooks))
@@ -1181,6 +1182,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_dispatcher_replacement_keeps_jobs_for_close_retry() {
+        crate::test_support::init_tls_provider();
         let hooks = Arc::new(BinaryFaultHooks::default());
         hooks.dispatcher_exit_after_jobs.store(1, Ordering::SeqCst);
         hooks
@@ -1226,6 +1228,7 @@ mod tests {
 
     #[test]
     fn scheduler_ready_failure_does_not_publish_a_live_executor() {
+        crate::test_support::init_tls_provider();
         let hooks = Arc::new(BinaryFaultHooks::default());
         hooks.scheduler_ready_failures.store(1, Ordering::SeqCst);
         let error = BinaryExecutor::new_with_fault_hooks(&test_config(), hooks)
@@ -1241,6 +1244,7 @@ mod tests {
 
     #[test]
     fn dispatcher_start_failure_does_not_publish_a_live_executor() {
+        crate::test_support::init_tls_provider();
         let hooks = Arc::new(BinaryFaultHooks::default());
         hooks.dispatcher_start_failures.store(1, Ordering::SeqCst);
         let error = BinaryExecutor::new_with_fault_hooks(&test_config(), hooks)
@@ -1256,6 +1260,7 @@ mod tests {
 
     #[test]
     fn dispatcher_ready_failure_does_not_publish_a_live_executor() {
+        crate::test_support::init_tls_provider();
         let hooks = Arc::new(BinaryFaultHooks::default());
         hooks.dispatcher_ready_failures.store(1, Ordering::SeqCst);
         let error = BinaryExecutor::new_with_fault_hooks(&test_config(), hooks)

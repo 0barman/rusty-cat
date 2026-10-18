@@ -6,6 +6,10 @@ This document maps `rusty-cat` tests to public behavior, critical safety boundar
 
 The matrix intentionally omits credentials, account and storage-space identifiers, service endpoints, object keys, signed URLs, tokens, raw validators, and content digests. Live-provider results are a verification snapshot dated 2026-08-27. They may depend on external service availability, temporary authorization, and network conditions; they are not a guarantee that a third-party service will remain available.
 
+This dated snapshot does not certify the 0.4.0 TLS-provider migration. Run the
+[0.4.0 consumer checks](migration-0.4.0.md#verify-the-application-migration)
+against the intended application and provider before release.
+
 The **Latest verification** column records the last actual run of each scenario in the 2026-08-27 verification session; it does not mean that every live service was rerun after every later code change. The final revision reran both workspaces' default automated suites and the live `azure-direct` acceptance scenario.
 
 ## Verification snapshot

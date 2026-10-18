@@ -45,9 +45,21 @@ type TerminalMsg = Result<(TaskId, Option<String>), MeowError>;
 /// `MeowClient` owns runtime state and provides high-level operations:
 /// enqueue, bounded binary GET, pause, resume, cancel, snapshot, and close.
 ///
+/// The application must choose and install a Rustls crypto provider before
+/// this client builds an internal HTTP client; see the [crate-level TLS
+/// setup](crate#application-selected-tls-provider). Missing initialization is
+/// reported as `HttpClientBuildFailed` (119), without installing a provider or
+/// panicking. Construction itself is lazy and does not require a provider.
+///
+/// An already configured client injected through
+/// [`MeowConfigBuilder::http_client`](crate::api::MeowConfigBuilder::http_client)
+/// is used directly for ordinary transfers and [`Self::http_client`], so those
+/// paths do not require a global provider. Binary downloads always build their
+/// own isolated HTTP client and still require the global provider.
+///
 /// # Usage pattern
 ///
-/// 1. Create [`MeowConfig`].
+/// 1. Install the application's TLS crypto provider and create [`MeowConfig`].
 /// 2. Construct `MeowClient::new(config)`.
 /// 3. Build tasks with upload/download builders.
 /// 4. Call [`Self::try_enqueue`] or [`Self::enqueue_and_wait`].
@@ -111,6 +123,9 @@ type TerminalMsg = Result<(TaskId, Option<String>), MeowError>;
 /// use std::sync::Arc;
 /// use rusty_cat::api::{MeowClient, MeowConfig};
 ///
+/// rustls::crypto::ring::default_provider()
+///     .install_default()
+///     .expect("install the application's TLS provider once at startup");
 /// let client = Arc::new(MeowClient::new(MeowConfig::default()));
 /// let client_for_task = Arc::clone(&client);
 /// tokio::spawn(async move {
@@ -170,6 +185,9 @@ impl MeowClient {
     /// Creates a new client with the provided configuration.
     ///
     /// The internal executor is initialized lazily on first task operation.
+    /// This constructor does not build an HTTP client or require a TLS crypto
+    /// provider; initialize the application's provider before an operation
+    /// needs an internal HTTP client.
     ///
     /// # Examples
     ///
@@ -204,14 +222,18 @@ impl MeowClient {
     ///
     /// # Errors
     ///
-    /// Returns [`MeowError`] with `HttpClientBuildFailed` when client creation
-    /// fails.
+    /// Returns [`MeowError`] with `HttpClientBuildFailed` (119) when client
+    /// creation fails, including when no global Rustls crypto provider has
+    /// been installed. An injected client is returned without this check.
     ///
     /// # Examples
     ///
     /// ```no_run
     /// use rusty_cat::api::{MeowClient, MeowConfig};
     ///
+    /// rustls::crypto::ring::default_provider()
+    ///     .install_default()
+    ///     .expect("install the application's TLS provider once at startup");
     /// let client = MeowClient::new(MeowConfig::default());
     /// let http = client.http_client()?;
     /// let _ = http;
@@ -224,19 +246,7 @@ impl MeowClient {
         // Build through the shared helper so this client carries the exact same
         // transport policy (connect timeout + idle connection pool) as the
         // transfer backend, rather than reqwest's bare defaults.
-        build_internal_client(self.config.http_timeout(), self.config.tcp_keepalive()).map_err(
-            |e| {
-                MeowError::from_source(
-                    InnerErrorCode::HttpClientBuildFailed,
-                    format!(
-                        "build reqwest client failed (timeout={:?}, keepalive={:?})",
-                        self.config.http_timeout(),
-                        self.config.tcp_keepalive()
-                    ),
-                    e,
-                )
-            },
-        )
+        build_internal_client(self.config.http_timeout(), self.config.tcp_keepalive())
     }
 
     /// Returns the Pounce executor while the caller holds `binary_lifecycle`.
@@ -262,10 +272,13 @@ impl MeowClient {
             return Ok(Arc::clone(exec));
         }
 
-        let default_http_transfer = DefaultHttpTransfer::try_with_http_timeouts(
-            self.config.http_timeout(),
-            self.config.tcp_keepalive(),
-        )?;
+        let default_http_transfer = match self.config.http_client_ref() {
+            Some(client) => DefaultHttpTransfer::with_client(client.clone()),
+            None => DefaultHttpTransfer::try_with_http_timeouts(
+                self.config.http_timeout(),
+                self.config.tcp_keepalive(),
+            )?,
+        };
         crate::meow_key_log!(
             "executor",
             "initializing DefaultHttpTransfer (timeout={:?}, tcp_keepalive={:?})",
@@ -1414,6 +1427,13 @@ impl MeowClient {
     ///
     /// At most two binary HTTP requests run concurrently. At most 1024 accepted
     /// tasks may be queued, active, or waiting for their callback to return.
+    ///
+    /// # Errors
+    ///
+    /// If no global Rustls crypto provider has been installed, returns
+    /// `HttpClientBuildFailed` (119) before starting the executor. A Pounce
+    /// client injected through `MeowConfig` does not satisfy this requirement:
+    /// Binary uses a separate HTTP client to preserve its transport isolation.
     pub fn try_enqueue_binary_task<CCB>(
         &self,
         task: BinaryTask,
@@ -1524,6 +1544,7 @@ mod close_tests {
 
     #[tokio::test]
     async fn binary_callback_dispatcher_marks_the_owning_client() {
+        crate::test_support::init_tls_provider();
         use std::io::Write as _;
 
         let listener =

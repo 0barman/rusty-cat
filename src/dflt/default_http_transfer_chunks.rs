@@ -1231,6 +1231,7 @@ mod tests {
 
     #[tokio::test]
     async fn mapped_reqwest_error_preserves_type_without_secret_url() {
+        crate::test_support::init_tls_provider();
         const SECRET: &str = "RC_SECRET_REQWEST_CANARY";
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
         let address = listener.local_addr().expect("reserved port address");
@@ -1568,6 +1569,7 @@ mod tests {
 
         #[tokio::test]
         async fn serial_ack_rejects_nonprogress_backward_gap_and_above_total() {
+            crate::test_support::init_tls_provider();
             for (offset, next, label) in [
                 (0, 0, "non-progress"),
                 (4, 2, "backward"),
@@ -1590,6 +1592,7 @@ mod tests {
 
         #[tokio::test]
         async fn serial_ack_accepts_none_partial_progress_and_exact_end() {
+            crate::test_support::init_tls_provider();
             for (next, expected, label) in [
                 (None, 4, "none"),
                 (Some(2), 2, "partial"),

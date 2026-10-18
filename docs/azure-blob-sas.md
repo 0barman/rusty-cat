@@ -24,9 +24,14 @@ For upload, the SAS token generally needs write (`w`) permission, and create (`c
 
 ```toml
 [dependencies]
-rusty-cat = { version = "0.3.6", features = ["azure-blob-sas"] }
+rusty-cat = { version = "0.4.0", features = ["azure-blob-sas"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
 ```
+
+The examples choose ring at application startup and preserve an already
+installed provider. See [TLS provider setup](migration-0.4.0.md#choose-a-tls-provider)
+for AWS-LC or a host-supplied provider; cloud features do not choose TLS cryptography.
 
 Run the backend-issued presigned/SAS flow from the repository root:
 
@@ -71,6 +76,11 @@ use rusty_cat::azure_blob_sas as azure;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // Reuse the existing provider if another component installed one first.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     let blob_sas_url = "https://account.blob.core.windows.net/container/blob.bin?sv=...&sig=...";
     let chunk_size = 1024 * 1024;
     let total_size = 5 * chunk_size;
@@ -141,6 +151,11 @@ use rusty_cat::api::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // Reuse the existing provider if another component installed one first.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     let download_sas_url = "https://account.blob.core.windows.net/container/blob.bin?sv=...&sig=...";
     let total_size = 5 * 1024 * 1024;
 

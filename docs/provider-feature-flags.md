@@ -24,7 +24,12 @@ Use direct features for trusted backend services, internal CLIs, or controlled w
 | `aliyun-oss-presigned` | Aliyun OSS | A trusted backend creates short-lived OSS presigned URLs. The SDK does not generate Aliyun signatures in this feature. | `AliOssPresignedMultipartUpload`, `AliOssPresignedRangeDownload`, provider-neutral presigned primitives | `presigned` |
 | `azure-blob-sas` | Azure Blob Storage | A trusted backend creates SAS URLs/tokens. The SDK does not generate Azure Shared Key signatures or Entra ID tokens in this feature. | `AzureBlobSasMultipartUpload`, `AzureBlobSasRangeDownload`, block/SAS helper functions, provider-neutral presigned primitives | `presigned`, `base64` |
 
-The crate has no default provider features. Enable only the provider and credential model your application needs.
+The crate has no default cloud-provider features. Enable only the provider and credential model your application needs.
+
+Cloud-provider features are separate from the TLS crypto provider. In 0.4.0,
+every cloud flow uses application-selected TLS cryptography; follow
+[TLS provider setup](migration-0.4.0.md#choose-a-tls-provider) before starting
+transfers. Enabling `all` or a cloud feature does not select ring or AWS-LC.
 
 ## Direct features
 

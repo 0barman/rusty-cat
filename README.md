@@ -25,22 +25,27 @@ restart recovery.
 | Item | Value |
 |---|---|
 | Crate | `rusty-cat` |
-| Version | `0.3.6` |
+| Version | `0.4.0` |
 | Rust edition | 2021 |
 | MSRV | Rust 1.89 stable |
 | Runtime | Tokio-based async runtime hosted by an internal scheduler thread |
-| HTTP stack | `reqwest` 0.13.5 with the `rustls` feature |
+| HTTP stack | `reqwest` 0.13.5 with `rustls-no-provider`; the application selects the TLS crypto provider |
 | Platforms | Release targets are native Linux, macOS, and Windows; Android and iOS remain compile-gated and experimental at runtime. See the verification boundary below. |
 | License | MIT |
 | Repository | <https://github.com/0barman/rusty-cat> |
 
-See the [0.3.6 release notes](docs/release-0.3.6.md) for the Windows stable-Rust
-compatibility fix and the local-file consistency changes.
+Start with the [0.3.6 to 0.4.0 migration guide](docs/migration-0.4.0.md) for
+the Reqwest upgrade and application-owned TLS setup. The historical
+[0.3.6 release notes](docs/release-0.3.6.md) describe the Windows stable-Rust
+compatibility fix and local-file consistency changes introduced in that release.
 
 Consumers that inject a `reqwest::Client` or pass a `reqwest::multipart::Form`
 through the public protocol API must use reqwest 0.13 in their own dependencies.
-The `rustls` feature enables AWS-LC as the default crypto provider and uses
-`rustls-platform-verifier` for platform/system certificate verification.
+The SDK does not select ring or AWS-LC. Install your application's chosen rustls
+crypto provider before the SDK builds an HTTP client, including for plain HTTP
+URLs. An already installed process provider is reused. Missing initialization
+returns `HttpClientBuildFailed` (119). Certificate verification still uses
+`rustls-platform-verifier` and the platform/system trust configuration.
 
 On Android, the host application must include the verifier's Kotlin component
 and initialize `rustls-platform-verifier` with its JVM/context before networking
@@ -58,7 +63,7 @@ Android runtime support remains experimental.
 
 These rows define publication gates, not evidence that a particular checkout
 has already passed them. Native Windows and mobile-target results must be linked
-from the release CI before `0.3.6` is published; local cross-compilation is not a
+from the release CI before `0.4.0` is published; local cross-compilation is not a
 substitute for those results.
 
 `rust-version = "1.89"` is part of the package manifest. Consumers do not need
@@ -186,15 +191,21 @@ Add the crate:
 
 ```toml
 [dependencies]
-rusty-cat = "0.3.6"
+rusty-cat = "0.4.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
 ```
 
-For OSS providers, enable only what you need. Keeping the feature list small reduces optional dependencies and makes it clearer which cloud integrations your application actually uses:
+The example below chooses ring and installs it at startup. If your application
+already installed a provider, keep that choice. For AWS-LC and custom TLS client
+configuration, see [TLS provider setup](docs/migration-0.4.0.md#choose-a-tls-provider).
+
+For OSS providers, replace the `rusty-cat` dependency above with the features you
+need, retaining the Tokio and rustls dependencies and startup initialization:
 
 ```toml
 [dependencies]
-rusty-cat = { version = "0.3.6", features = ["aliyun-oss-direct"] }
+rusty-cat = { version = "0.4.0", features = ["aliyun-oss-direct"] }
 ```
 
 | Feature | Purpose |
@@ -225,6 +236,11 @@ use rusty_cat::api::{DownloadPounceBuilder, Log, MeowClient, MeowConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // Keep another component's choice if it installs a provider first.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     let config = MeowConfig::builder()
         .max_upload_concurrency(2)
         .max_download_concurrency(2)
@@ -290,7 +306,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 | Function | Use it when | Important notes |
 |---|---|---|
 | `MeowClient::new(config)` | Create the SDK entry point. | The executor starts lazily on the first task operation. `MeowClient` is not `Clone` because it owns scheduler state; wrap it in `Arc<MeowClient>` when multiple async tasks or threads need shared access. |
-| `http_client()` | Need a `reqwest::Client` aligned with SDK config. | Returns the injected custom client when one was configured; otherwise builds a client from `http_timeout` and `tcp_keepalive`. This is useful when protocol code outside the executor must make compatible HTTP calls. |
+| `http_client()` | Need a `reqwest::Client` aligned with SDK config. | Returns the injected custom client when one was configured; otherwise builds a client from `http_timeout`, `tcp_keepalive`, and the installed crypto provider. Missing provider initialization returns error 119. |
 | `register_global_progress_listener(listener)` | Observe all task progress records. | Returns a `GlobalProgressListenerId`. Use this for UI-wide progress aggregation, persistence queues, or monitoring. Keep callback work fast. |
 | `unregister_global_progress_listener(id)` | Remove one global listener. | Returns `Ok(false)` when the ID does not exist, so cleanup code can call it safely. |
 | `clear_global_listener()` | Remove every global progress listener. | Useful during shutdown, integration-test cleanup, or application logout flows. |
@@ -319,7 +335,7 @@ Start with `MeowConfig::default()` for a safe baseline or use `MeowConfig::build
 | `max_upload_concurrency` | `2` | `>= 1` | Maximum upload groups processed concurrently. |
 | `max_download_concurrency` | `2` | `>= 1` | Maximum download groups processed concurrently. |
 | `breakpoint_download_http.range_accept` | `application/octet-stream` | Valid header value | Default `Accept` header for range download chunks. |
-| `http_client` | `None` | Reusable `reqwest::Client` | Optional custom HTTP client for proxy, TLS, default headers, or observability. |
+| `http_client` | `None` | Reusable `reqwest::Client` | Optional custom HTTP client for ordinary file transfers; Binary downloads use their own client. |
 | `http_timeout` | `5s` | Positive duration | Per-request timeout for internally built HTTP clients. |
 | `tcp_keepalive` | `30s` | Positive duration | TCP keepalive for internally built HTTP clients. |
 | `command_queue_capacity` | `128` | `>= 1` | Queue for enqueue, pause, resume, cancel, snapshot, and close commands. |
@@ -331,7 +347,7 @@ Start with `MeowConfig::default()` for a safe baseline or use `MeowConfig::build
 | `MeowConfig::builder()` | Creates a builder initialized with defaults. |
 | `max_upload_concurrency(n)` / `max_upload_concurrency()` | Sets/reads upload concurrency. Recommended range: `1..=64`. |
 | `max_download_concurrency(n)` / `max_download_concurrency()` | Sets/reads download concurrency. Recommended range: `1..=64`. |
-| `http_client(client)` | Injects a custom `reqwest::Client` for proxy, TLS, headers, or observability. |
+| `http_client(client)` | Injects a custom `reqwest::Client` for ordinary file transfers. Its TLS provider may be configured independently; Binary downloads still require an installed process provider. |
 | `http_timeout(duration)` / `http_timeout()` | Sets/reads HTTP timeout. Typical range: `3s..=60s`. |
 | `tcp_keepalive(duration)` / `tcp_keepalive()` | Sets/reads TCP keepalive. Typical range: `15s..=120s`. |
 | `command_queue_capacity(n)` / `command_queue_capacity()` | Sets/reads control queue capacity. |
@@ -462,6 +478,7 @@ The codes you will most often branch on:
 | `111` | `CommandSendFailed` | The command queue is full (fail-fast back-pressure). Retry with backoff or raise `command_queue_capacity`. |
 | `116` | `ChecksumMismatch` | Local bytes no longer match the upload content snapshot or a committed download-part digest. |
 | `117` | `InvalidTaskState` | The operation is invalid in the task's current state (for example resuming a task that is not paused). |
+| `119` | `HttpClientBuildFailed` | An internal HTTP client could not be built, including when the application has not installed a TLS crypto provider. |
 | `120` | `TaskCanceled` | The task was canceled before reaching `Complete`. |
 | `121` | `DiskFull` | The local disk ran out of space while writing a download. |
 | `122` | `LocalFileRemoved` | The local path disappeared or changed length/type while required by the transfer. A same-length byte-content mismatch is reported as `ChecksumMismatch`; an identical-content replacement can pass where the OS permits it, while Windows rejects active download-target replacement through its sharing mode. |

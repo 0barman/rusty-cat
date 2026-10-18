@@ -9,11 +9,20 @@ contract.
 Use `enqueue_and_wait` when the current operation should not continue until the
 transfer reaches `Complete`, `Failed`, or `Canceled`:
 
+Use the [quick-start dependencies](../README.md#quick-start), including rustls
+with the ring feature. The example installs it at startup; see
+[TLS provider setup](migration-0.4.0.md#choose-a-tls-provider) for other choices.
+
 ```rust,no_run
 use rusty_cat::api::{DownloadPounceBuilder, MeowClient, MeowConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), rusty_cat::api::MeowError> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // Reuse the existing provider if another component installed one first.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     let client = MeowClient::new(MeowConfig::default());
     let task = DownloadPounceBuilder::new(
         "artifact.bin",

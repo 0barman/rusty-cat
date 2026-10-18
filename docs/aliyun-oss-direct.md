@@ -28,9 +28,14 @@ For untrusted desktop/mobile clients, prefer a backend-generated presigned URL f
 
 ```toml
 [dependencies]
-rusty-cat = { version = "0.3.6", features = ["aliyun-oss-direct"] }
+rusty-cat = { version = "0.4.0", features = ["aliyun-oss-direct"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
 ```
+
+The examples choose ring at application startup and preserve an already
+installed provider. See [TLS provider setup](migration-0.4.0.md#choose-a-tls-provider)
+for AWS-LC or a host-supplied provider; cloud features do not choose TLS cryptography.
 
 For an isolated live-test configuration, set these environment overrides in the
 process that launches test-app:
@@ -78,6 +83,11 @@ use rusty_cat::api::{MeowClient, MeowConfig, UploadPounceBuilder};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // Reuse the existing provider if another component installed one first.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     let bucket = "my-bucket";
     let access_key_id = std::env::var("ALIYUN_ACCESS_KEY_ID")?;
     let access_key_secret = std::env::var("ALIYUN_ACCESS_KEY_SECRET")?;
@@ -139,6 +149,11 @@ use rusty_cat::api::{DownloadPounceBuilder, MeowClient, MeowConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // Reuse the existing provider if another component installed one first.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     let bucket = "my-bucket";
     let access_key_id = std::env::var("ALIYUN_ACCESS_KEY_ID")?;
     let access_key_secret = std::env::var("ALIYUN_ACCESS_KEY_SECRET")?;
